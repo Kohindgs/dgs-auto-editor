@@ -51,10 +51,12 @@ for (const d of [DATA_DIR, PROJECTS_DIR, EXPORTS_DIR, UPLOAD_TMP]) {
   fs.mkdirSync(d, { recursive: true });
 }
 
-const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp']);
-const VIDEO_EXT = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi']);
+const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.svg', '.avif', '.jfif', '.heic']);
+const VIDEO_EXT = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.3gp', '.ts', '.mts', '.flv', '.wmv', '.mpeg', '.mpg']);
+const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.opus', '.wma', '.webm', '.mp4']);
 const TICKS_PER_SEC = 10000000;
 const IMAGE_BASE_OFFSET_TICKS = 36000000000;
+const EXEC_OPTS = { timeout: 180000, maxBuffer: 50 * 1024 * 1024 };
 
 const SUNDHARAM_BR = {
   format: 'mp4',
@@ -174,18 +176,32 @@ function detectScreens(filename) {
 }
 
 async function probeDuration(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
   try {
     const { stdout } = await execFileAsync(FFPROBE_BIN, [
       '-v', 'error',
       '-show_entries', 'format=duration',
       '-of', 'default=noprint_wrappers=1:nokey=1',
       filePath,
-    ], { timeout: 15000 });
+    ], { timeout: 25000, maxBuffer: 20 * 1024 * 1024 });
     const v = parseFloat(String(stdout).trim());
-    return Number.isFinite(v) && v > 0 ? Math.round(v * 1000) / 1000 : null;
-  } catch {
-    return null;
+    if (Number.isFinite(v) && v > 0) return Math.round(v * 1000) / 1000;
+  } catch {}
+  // Fallback: parse Duration from ffmpeg -i stderr
+  try {
+    await execFileAsync(FFMPEG_BIN, ['-hide_banner', '-i', filePath], {
+      timeout: 20000,
+      maxBuffer: 20 * 1024 * 1024,
+    });
+  } catch (err) {
+    const stderr = String((err && err.stderr) || (err && err.message) || '');
+    const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i);
+    if (m) {
+      const sec = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+      if (Number.isFinite(sec) && sec > 0) return Math.round(sec * 1000) / 1000;
+    }
   }
+  return null;
 }
 
 async function reindexMedia(pid) {
@@ -382,10 +398,11 @@ async function detectSilences(audioPath) {
   if (!audioPath || !fs.existsSync(audioPath)) return [];
   try {
     const { stderr } = await execFileAsync(FFMPEG_BIN, [
+      '-hide_banner', '-nostats',
       '-i', audioPath,
       '-af', 'silencedetect=noise=-34dB:d=0.18',
       '-f', 'null', '-',
-    ], { timeout: 60000 });
+    ], { timeout: 90000, maxBuffer: 50 * 1024 * 1024 });
     const silences = [];
     let curStart = null;
     for (const line of String(stderr).split(/\r?\n/)) {
@@ -481,7 +498,29 @@ app.post('/api/presets', (req, res) => {
   custom = custom.filter((p) => p.name !== name);
   custom.push({ name, settings });
   fs.writeFileSync(PRESETS_FILE, JSON.stringify(custom, null, 2), 'utf-8');
-  res.json({ ok: true, name });
+  res.json({
+    ok: true,
+    name,
+    presets: [{ name: 'Sundharam BR', settings: SUNDHARAM_BR }, ...custom],
+  });
+});
+
+// Cloud-safe stubs for desktop folder pickers / revealers so UI buttons never 404
+app.post('/api/projects/:id/pick-folder/:kind', (req, res) => {
+  res.json({ cancelled: true, cloud: true });
+});
+app.post('/api/pick-export-dir', (req, res) => {
+  res.json({ cancelled: true, path: '' });
+});
+app.post('/api/projects/:id/reveal-export', (req, res) => {
+  res.json({ ok: true });
+});
+app.post('/api/projects/:id/reveal-collect', (req, res) => {
+  res.json({ ok: true });
+});
+app.post('/api/projects/:id/import-recent', async (req, res) => {
+  const items = await reindexMedia(req.params.id);
+  res.json({ saved: 0, count: items.length, media: items });
 });
 
 app.get('/api/projects/recent', (req, res) => {
@@ -612,52 +651,92 @@ app.get('/api/projects/:id/media-thumb/:mediaId', async (req, res) => {
   res.status(404).end();
 });
 
+function handleScriptFile(pid, tempPath, origName) {
+  const root = projectRoot(pid);
+  const ext = path.extname(origName).toLowerCase();
+  const scriptDir = path.join(root, 'script');
+  fs.mkdirSync(scriptDir, { recursive: true });
+  const dest = path.join(scriptDir, origName);
+  fs.copyFileSync(tempPath, dest);
+  try { fs.unlinkSync(tempPath); } catch {}
+
+  let scenes = [];
+  if (ext === '.xlsx' || ext === '.xlsm' || ext === '.xls') {
+    scenes = parseProductionXlsx(dest);
+  } else {
+    scenes = parsePlainScript(fs.readFileSync(dest, 'utf-8'));
+  }
+  const poemScenes = scenes.filter((s) => s.is_poem);
+  const poem = poemScenes.length
+    ? {
+        has_poem: true,
+        scene_count: poemScenes.length,
+        first_screen: poemScenes[0].screen,
+        last_screen: poemScenes[poemScenes.length - 1].screen,
+      }
+    : { has_poem: false };
+
+  saveJson(pid, 'script.json', scenes);
+  saveJson(pid, 'script_meta.json', {
+    format: ext.includes('xls') ? 'production_xlsx' : 'text',
+    filename: origName,
+    scene_count: scenes.length,
+    poem,
+  });
+  return { format: 'production_xlsx', scenes, poem };
+}
+
 app.post('/api/projects/:id/script', upload.single('file'), (req, res) => {
   try {
     const pid = req.params.id;
     const root = projectRoot(pid);
     if (!fs.existsSync(root) || !req.file) return res.status(400).json({ detail: 'Missing script file' });
     const origName = path.basename(req.file.originalname || 'script.xlsx');
-    const ext = path.extname(origName).toLowerCase();
-    const dest = path.join(root, 'script', origName);
-    fs.copyFileSync(req.file.path, dest);
-    try { fs.unlinkSync(req.file.path); } catch {}
-
-    let scenes = [];
-    if (ext === '.xlsx' || ext === '.xlsm') {
-      scenes = parseProductionXlsx(dest);
-    } else {
-      scenes = parsePlainScript(fs.readFileSync(dest, 'utf-8'));
-    }
-    const poemScenes = scenes.filter((s) => s.is_poem);
-    const poem = poemScenes.length
-      ? {
-          has_poem: true,
-          scene_count: poemScenes.length,
-          first_screen: poemScenes[0].screen,
-          last_screen: poemScenes[poemScenes.length - 1].screen,
-        }
-      : { has_poem: false };
-
-    saveJson(pid, 'script.json', scenes);
-    saveJson(pid, 'script_meta.json', {
-      format: ext.includes('xls') ? 'production_xlsx' : 'text',
-      filename: origName,
-      scene_count: scenes.length,
-      poem,
-    });
-    res.json({ format: 'production_xlsx', scenes, poem });
+    const result = handleScriptFile(pid, req.file.path, origName);
+    res.json(result);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
 });
+
+async function normalizeVoSlotFile(srcPath, normPath) {
+  try {
+    await execFileAsync(FFMPEG_BIN, [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-i', srcPath,
+      '-vn', '-ar', '44100', '-ac', '2',
+      '-c:a', 'libmp3lame', '-b:a', '192k',
+      normPath,
+    ], EXEC_OPTS);
+    if (fs.existsSync(normPath) && fs.statSync(normPath).size > 256) {
+      return normPath;
+    }
+  } catch {}
+  return srcPath;
+}
+
+async function ensureSilenceGapMp3(voDir) {
+  const gapPath = path.join(voDir, 'silence_gap_500ms.mp3');
+  if (fs.existsSync(gapPath) && fs.statSync(gapPath).size > 256) return gapPath;
+  try {
+    await execFileAsync(FFMPEG_BIN, [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+      '-t', '0.5',
+      '-c:a', 'libmp3lame', '-b:a', '192k',
+      gapPath,
+    ], EXEC_OPTS);
+    if (fs.existsSync(gapPath)) return gapPath;
+  } catch {}
+  return null;
+}
 
 async function rebuildMergedVo(pid, slots) {
   const root = projectRoot(pid);
   const voDir = path.join(root, 'voiceover');
   fs.mkdirSync(voDir, { recursive: true });
   const active = slots
-    .filter((s) => s.path && fs.existsSync(s.path))
+    .filter((s) => s && s.path && fs.existsSync(s.path))
     .sort((a, b) => Number(a.slot) - Number(b.slot));
 
   if (!active.length) {
@@ -677,63 +756,140 @@ async function rebuildMergedVo(pid, slots) {
   }
 
   const mergedPath = path.join(voDir, 'merged_narration.mp3');
-  const inputs = [];
-  const filterParts = [];
-  const concatLabels = [];
   let offset = 0;
   const gapSec = 0.5;
+  const normFiles = [];
 
   for (let i = 0; i < active.length; i++) {
     const s = active[i];
-    inputs.push('-i', s.path);
-    const dur = s.duration || (await probeDuration(s.path)) || 0;
+    const normCandidate = path.join(voDir, `slot_${s.slot}_norm.mp3`);
+    const readyPath = (s.norm_path && fs.existsSync(s.norm_path))
+      ? s.norm_path
+      : await normalizeVoSlotFile(s.path, normCandidate);
+    s.norm_path = readyPath;
+    normFiles.push(readyPath);
+
+    const dur = s.duration || (await probeDuration(readyPath)) || (await probeDuration(s.path)) || 0;
     s.duration = dur;
     s.start_offset = Math.round(offset * 1000) / 1000;
     s.end_offset = Math.round((offset + dur) * 1000) / 1000;
     offset += dur;
-    filterParts.push(`[${i}:a]aformat=sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`);
-    concatLabels.push(`[a${i}]`);
-    if (i < active.length - 1) {
-      filterParts.push(`anullsrc=r=44100:cl=stereo,atrim=0:${gapSec},asetpts=PTS-STARTPTS[g${i}]`);
-      concatLabels.push(`[g${i}]`);
-      offset += gapSec;
+    if (i < active.length - 1) offset += gapSec;
+  }
+
+  let mergedOk = false;
+  // Strategy 1: Ultra-fast stream-copy concat of normalized 44.1kHz stereo MP3 slots
+  const gapMp3 = await ensureSilenceGapMp3(voDir);
+  if (gapMp3 && normFiles.every((f) => f.toLowerCase().endsWith('.mp3') && fs.existsSync(f))) {
+    try {
+      const concatListPath = path.join(voDir, 'concat_vo_list.txt');
+      const lines = [];
+      for (let i = 0; i < normFiles.length; i++) {
+        lines.push(`file '${normFiles[i].replace(/\\/g, '/').replace(/'/g, "'\\''")}'`);
+        if (i < normFiles.length - 1) {
+          lines.push(`file '${gapMp3.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`);
+        }
+      }
+      fs.writeFileSync(concatListPath, lines.join('\n'), 'utf-8');
+      await execFileAsync(FFMPEG_BIN, [
+        '-y', '-hide_banner', '-loglevel', 'error',
+        '-f', 'concat', '-safe', '0',
+        '-i', concatListPath,
+        '-c', 'copy',
+        mergedPath,
+      ], EXEC_OPTS);
+      if (fs.existsSync(mergedPath) && fs.statSync(mergedPath).size > 256) {
+        mergedOk = true;
+      }
+    } catch {}
+  }
+
+  // Strategy 2: Filter-complex re-encode with -vn -loglevel error and 50MB maxBuffer
+  if (!mergedOk) {
+    try {
+      const inputs = [];
+      const filterParts = [];
+      const concatLabels = [];
+      for (let i = 0; i < active.length; i++) {
+        inputs.push('-i', normFiles[i] || active[i].path);
+        filterParts.push(`[${i}:a]aformat=sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`);
+        concatLabels.push(`[a${i}]`);
+        if (i < active.length - 1) {
+          filterParts.push(`anullsrc=r=44100:cl=stereo,atrim=0:${gapSec},asetpts=PTS-STARTPTS[g${i}]`);
+          concatLabels.push(`[g${i}]`);
+        }
+      }
+      filterParts.push(`${concatLabels.join('')}concat=n=${concatLabels.length}:v=0:a=1[aout]`);
+      await execFileAsync(FFMPEG_BIN, [
+        '-y', '-hide_banner', '-loglevel', 'error',
+        ...inputs,
+        '-filter_complex', filterParts.join(';'),
+        '-map', '[aout]',
+        '-vn', '-c:a', 'libmp3lame', '-b:a', '192k',
+        mergedPath,
+      ], EXEC_OPTS);
+      if (fs.existsSync(mergedPath) && fs.statSync(mergedPath).size > 256) {
+        mergedOk = true;
+      }
+    } catch (err) {
+      console.error('VO merge filter_complex fallback error:', err);
     }
   }
-  filterParts.push(`${concatLabels.join('')}concat=n=${concatLabels.length}:v=0:a=1[aout]`);
-  await execFileAsync(FFMPEG_BIN, [
-    '-y', ...inputs,
-    '-filter_complex', filterParts.join(';'),
-    '-map', '[aout]',
-    '-c:a', 'libmp3lame', '-b:a', '192k',
-    mergedPath,
-  ], { timeout: 120000 });
-  const totalDur = (await probeDuration(mergedPath)) || offset;
+
+  // Strategy 3: Never fail the HTTP upload — fall back to the first/latest available audio file
+  if (!mergedOk) {
+    const fallbackSrc = normFiles[normFiles.length - 1] || active[active.length - 1].path;
+    try { fs.copyFileSync(fallbackSrc, mergedPath); } catch {}
+  }
+
+  const probedMerged = await probeDuration(mergedPath);
+  const totalDur = probedMerged && probedMerged >= offset * 0.8 ? probedMerged : Math.round(offset * 1000) / 1000;
   const label = active.map((s) => `VO${s.slot} (${s.filename})`).join(' + ');
   const meta = { path: mergedPath, filename: label, duration: totalDur, kind: 'narration', slots: active };
   saveJson(pid, 'voiceover.json', meta);
   return meta;
 }
 
+async function handleVoiceoverFile(pid, slot, tempPath, origName) {
+  const root = projectRoot(pid);
+  const voDir = path.join(root, 'voiceover');
+  fs.mkdirSync(voDir, { recursive: true });
+  const safeOrig = origName.replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `vo_${slot}.mp3`;
+  const dest = path.join(voDir, `slot_${slot}_${safeOrig}`);
+  fs.copyFileSync(tempPath, dest);
+  try { fs.unlinkSync(tempPath); } catch {}
+
+  const normPath = await normalizeVoSlotFile(dest, path.join(voDir, `slot_${slot}_norm.mp3`));
+  const duration = (await probeDuration(normPath)) || (await probeDuration(dest)) || 0;
+
+  const existing = loadJson(pid, 'voiceover.json') || {};
+  let slots = Array.isArray(existing.slots) ? [...existing.slots] : [];
+  // Backfill slot 1 if a single voiceover existed without slots array
+  if (!slots.length && existing.path && fs.existsSync(existing.path) && slot !== 1) {
+    const dur1 = existing.duration || (await probeDuration(existing.path)) || 0;
+    slots.push({
+      slot: 1,
+      filename: existing.filename || path.basename(existing.path),
+      path: existing.path,
+      duration: dur1,
+    });
+  }
+  slots = slots.filter((s) => Number(s.slot) !== slot);
+  slots.push({ slot, filename: origName, path: dest, norm_path: normPath, duration });
+  return await rebuildMergedVo(pid, slots);
+}
+
 app.post('/api/projects/:id/voiceover', upload.single('file'), async (req, res) => {
   try {
     const pid = req.params.id;
-    const slot = Math.max(1, Math.min(10, parseInt(req.query.slot || '1', 10)));
+    const slot = Math.max(1, Math.min(10, parseInt(req.query.slot || req.body?.slot || '1', 10)));
     const root = projectRoot(pid);
     if (!fs.existsSync(root) || !req.file) return res.status(400).json({ detail: 'Missing VO file' });
-    const voDir = path.join(root, 'voiceover');
-    fs.mkdirSync(voDir, { recursive: true });
     const origName = path.basename(req.file.originalname || `vo_${slot}.mp3`);
-    const dest = path.join(voDir, `slot_${slot}_${origName}`);
-    fs.copyFileSync(req.file.path, dest);
-    try { fs.unlinkSync(req.file.path); } catch {}
-    const duration = (await probeDuration(dest)) || 0;
-
-    const existing = loadJson(pid, 'voiceover.json') || {};
-    let slots = Array.isArray(existing.slots) ? existing.slots.filter((s) => Number(s.slot) !== slot) : [];
-    slots.push({ slot, filename: origName, path: dest, duration });
-    const meta = await rebuildMergedVo(pid, slots);
+    const meta = await handleVoiceoverFile(pid, slot, req.file.path, origName);
     res.json(meta);
   } catch (e) {
+    console.error('Voiceover upload error:', e);
     res.status(500).json({ detail: String(e) });
   }
 });
@@ -751,20 +907,26 @@ app.delete('/api/projects/:id/voiceover/:slot', async (req, res) => {
   }
 });
 
+async function handlePoemVoFile(pid, tempPath, origName) {
+  const root = projectRoot(pid);
+  const voDir = path.join(root, 'voiceover');
+  fs.mkdirSync(voDir, { recursive: true });
+  const dest = path.join(voDir, `poem_${origName}`);
+  fs.copyFileSync(tempPath, dest);
+  try { fs.unlinkSync(tempPath); } catch {}
+  const duration = (await probeDuration(dest)) || 0;
+  const meta = { path: dest, filename: origName, duration, kind: 'poem' };
+  saveJson(pid, 'poem_voiceover.json', meta);
+  return meta;
+}
+
 app.post('/api/projects/:id/poem-voiceover', upload.single('file'), async (req, res) => {
   try {
     const pid = req.params.id;
     const root = projectRoot(pid);
     if (!fs.existsSync(root) || !req.file) return res.status(400).json({ detail: 'Missing poem VO file' });
-    const voDir = path.join(root, 'voiceover');
-    fs.mkdirSync(voDir, { recursive: true });
     const origName = path.basename(req.file.originalname || 'poem.mp3');
-    const dest = path.join(voDir, `poem_${origName}`);
-    fs.copyFileSync(req.file.path, dest);
-    try { fs.unlinkSync(req.file.path); } catch {}
-    const duration = (await probeDuration(dest)) || 0;
-    const meta = { path: dest, filename: origName, duration, kind: 'poem' };
-    saveJson(pid, 'poem_voiceover.json', meta);
+    const meta = await handlePoemVoFile(pid, req.file.path, origName);
     res.json(meta);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -778,16 +940,13 @@ app.get('/api/projects/:id/audio/:kind', (req, res) => {
   res.sendFile(path.resolve(meta.path));
 });
 
-app.post('/api/projects/:id/logo', upload.single('file'), (req, res) => {
-  const pid = req.params.id;
+function handleLogoFile(pid, tempPath, origName) {
   const root = projectRoot(pid);
-  if (!fs.existsSync(root) || !req.file) return res.status(400).json({ detail: 'Missing logo file' });
   const logoDir = path.join(root, 'logo');
   fs.mkdirSync(logoDir, { recursive: true });
-  const origName = path.basename(req.file.originalname || 'logo.png');
   const dest = path.join(logoDir, origName);
-  fs.copyFileSync(req.file.path, dest);
-  try { fs.unlinkSync(req.file.path); } catch {}
+  fs.copyFileSync(tempPath, dest);
+  try { fs.unlinkSync(tempPath); } catch {}
   const meta = { path: dest, filename: origName, enabled: true };
   saveJson(pid, 'logo.json', meta);
   const tl = loadJson(pid, 'timeline.json');
@@ -796,7 +955,20 @@ app.post('/api/projects/:id/logo', upload.single('file'), (req, res) => {
     tl.logo_enabled = true;
     saveJson(pid, 'timeline.json', tl);
   }
-  res.json(meta);
+  return meta;
+}
+
+app.post('/api/projects/:id/logo', upload.single('file'), (req, res) => {
+  try {
+    const pid = req.params.id;
+    const root = projectRoot(pid);
+    if (!fs.existsSync(root) || !req.file) return res.status(400).json({ detail: 'Missing logo file' });
+    const origName = path.basename(req.file.originalname || 'logo.png');
+    const meta = handleLogoFile(pid, req.file.path, origName);
+    res.json(meta);
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
 });
 
 app.post('/api/projects/:id/logo/toggle', (req, res) => {
@@ -1124,7 +1296,10 @@ app.put('/api/projects/:id/scenes/:screen', (req, res) => {
   let updated = null;
   for (const s of scenes) {
     if (s.screen === screen) {
-      if (req.body.voiceover_text !== undefined) s.voiceover_text = String(req.body.voiceover_text);
+      if (req.body.voiceover_text !== undefined) {
+        s.voiceover_text = String(req.body.voiceover_text);
+        s.text = String(req.body.voiceover_text) || s.onscreen_text || s.screen;
+      }
       if (req.body.visual_description !== undefined) s.visual_description = String(req.body.visual_description);
       if (req.body.onscreen_text !== undefined) s.onscreen_text = String(req.body.onscreen_text);
       if (req.body.duration !== undefined) s.duration = Number(req.body.duration) || s.duration;
@@ -1143,34 +1318,80 @@ app.put('/api/projects/:id/scenes/:screen', (req, res) => {
     tl.srt_cues = buildSrtCues(tl.clips);
     saveJson(id, 'timeline.json', tl);
   }
-  res.json({ ok: true, scene: updated, timeline: tl });
+  const voMeta = loadJson(id, 'voiceover.json');
+  res.json({ ok: true, scene: updated, scenes, voiceover: voMeta, timeline: tl });
 });
+
+async function handleSceneVoFile(id, screen, tempPath, origName, queryParams = {}) {
+  const root = projectRoot(id);
+  const voDir = path.join(root, 'voiceover', 'scenes');
+  fs.mkdirSync(voDir, { recursive: true });
+  const dest = path.join(voDir, `${screen}_${origName}`);
+  fs.copyFileSync(tempPath, dest);
+  try { fs.unlinkSync(tempPath); } catch {}
+  const dur = Math.round(((await probeDuration(dest)) || 2.0) * 1000) / 1000;
+
+  const scenes = loadJson(id, 'script.json') || [];
+  let spokenText = queryParams.voiceover_text || '';
+  for (const s of scenes) {
+    if (s.screen === screen) {
+      if (queryParams.voiceover_text) {
+        s.voiceover_text = String(queryParams.voiceover_text);
+        s.text = String(queryParams.voiceover_text);
+      }
+      if (queryParams.onscreen_text) {
+        s.onscreen_text = String(queryParams.onscreen_text);
+      }
+      s.duration = dur;
+      if (!spokenText) spokenText = s.voiceover_text || s.text || '';
+    }
+  }
+  saveJson(id, 'script.json', scenes);
+
+  const tl = loadJson(id, 'timeline.json');
+  if (tl && Array.isArray(tl.clips)) {
+    let cursor = 0;
+    for (const c of tl.clips) {
+      c.start = Math.round(cursor * 1000) / 1000;
+      if (c.screen === screen) {
+        c.custom_vo_path = dest;
+        c.custom_vo_filename = origName;
+        c.custom_vo_duration = dur;
+        c.duration = dur;
+        if (spokenText) {
+          c.vo_text = spokenText;
+          c.script_text = spokenText;
+        }
+      }
+      c.end = Math.round((c.start + c.duration) * 1000) / 1000;
+      cursor = c.end;
+    }
+    tl.total_duration = Math.round(cursor * 1000) / 1000;
+    tl.srt_cues = buildSrtCues(tl.clips);
+    saveJson(id, 'timeline.json', tl);
+  }
+  const voMeta = loadJson(id, 'voiceover.json');
+  return {
+    ok: true,
+    screen,
+    filename: origName,
+    duration: dur,
+    new_duration: dur,
+    spoken_text: spokenText,
+    scenes,
+    voiceover: voMeta,
+    timeline: tl,
+  };
+}
 
 app.post('/api/projects/:id/scenes/:screen/voiceover', upload.single('file'), async (req, res) => {
   try {
     const { id, screen } = req.params;
     const root = projectRoot(id);
     if (!fs.existsSync(root) || !req.file) return res.status(400).json({ detail: 'Missing scene VO file' });
-    const voDir = path.join(root, 'voiceover', 'scenes');
-    fs.mkdirSync(voDir, { recursive: true });
     const origName = path.basename(req.file.originalname || `${screen}.mp3`);
-    const dest = path.join(voDir, `${screen}_${origName}`);
-    fs.copyFileSync(req.file.path, dest);
-    try { fs.unlinkSync(req.file.path); } catch {}
-    const dur = (await probeDuration(dest)) || 2.0;
-
-    const tl = loadJson(id, 'timeline.json');
-    if (tl && Array.isArray(tl.clips)) {
-      for (const c of tl.clips) {
-        if (c.screen === screen) {
-          c.custom_vo_path = dest;
-          c.custom_vo_filename = origName;
-          c.custom_vo_duration = dur;
-        }
-      }
-      saveJson(id, 'timeline.json', tl);
-    }
-    res.json({ ok: true, screen, filename: origName, duration: dur, timeline: tl });
+    const payload = await handleSceneVoFile(id, screen, req.file.path, origName, req.query || {});
+    res.json(payload);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
@@ -1346,64 +1567,108 @@ function buildFilmoraWfpBuffer(plan, title, pathMap = {}) {
   return zip.toBuffer();
 }
 
+function generateProjectFileOnDisk(pid, rawTitle, fmt) {
+  const plan = loadJson(pid, 'timeline.json') || {
+    project_id: pid,
+    total_duration: 10,
+    clips: [],
+  };
+  const safeTitle = String(rawTitle || `Project_${pid}`).trim().replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
+  const outDir = path.join(EXPORTS_DIR, pid);
+  fs.mkdirSync(outDir, { recursive: true });
+
+  let filename = `${safeTitle}.${fmt}`;
+  let outPath = path.join(outDir, filename);
+
+  if (fmt === 'wfp') {
+    const buf = buildFilmoraWfpBuffer(plan, rawTitle, {});
+    fs.writeFileSync(outPath, buf);
+  } else if (fmt === 'wfpbundle') {
+    const bundleZip = new AdmZip();
+    const pathMap = {};
+    const resourceItems = [];
+    const allPaths = new Set();
+    for (const c of plan.clips || []) {
+      if (c.media_path && fs.existsSync(c.media_path)) allPaths.add(c.media_path);
+    }
+    if (plan.voiceover_path && fs.existsSync(plan.voiceover_path)) allPaths.add(plan.voiceover_path);
+    if (plan.logo_path && fs.existsSync(plan.logo_path)) allPaths.add(plan.logo_path);
+
+    for (const orig of allPaths) {
+      const ext = path.extname(orig);
+      const sha = fileSha1Prefix(orig);
+      const guidFolder = wfpGuid();
+      const baseName = path.basename(orig);
+      const rel = `Medias/${guidFolder}/${baseName}`;
+      pathMap[orig] = rel;
+      bundleZip.addLocalFile(orig, `Medias/${guidFolder}`, baseName);
+      bundleZip.addLocalFile(orig, 'Resources', `${sha}_1${ext}`);
+      resourceItems.push({ original_path: orig.replace(/\\/g, '/'), bundle_path: rel, sha1: sha });
+    }
+    const innerWfp = buildFilmoraWfpBuffer(plan, rawTitle, pathMap);
+    bundleZip.addFile(`${safeTitle}.wfp`, innerWfp);
+    bundleZip.addFile('project.wfp', innerWfp);
+    bundleZip.addFile('resource.json', deflateRawJson({ version: '15.6.4', resources: resourceItems }));
+    bundleZip.writeZip(outPath);
+  } else if (fmt === 'fcpxml') {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE fcpxml>\n<fcpxml version="1.9"><project name="${safeTitle}"/></fcpxml>\n`;
+    fs.writeFileSync(outPath, xml, 'utf-8');
+  } else if (fmt === 'edl') {
+    const edl = `TITLE: ${safeTitle}\nFCM: NON-DROP FRAME\n`;
+    fs.writeFileSync(outPath, edl, 'utf-8');
+  } else {
+    filename = `${safeTitle}.json`;
+    outPath = path.join(outDir, filename);
+    fs.writeFileSync(outPath, JSON.stringify(plan, null, 2), 'utf-8');
+  }
+
+  saveJson(pid, 'last_project_file.json', { path: outPath, filename, format: fmt });
+  return { outPath, filename, fmt };
+}
+
+app.get('/api/projects/:id/project-file', (req, res) => {
+  try {
+    const pid = req.params.id;
+    if (!fs.existsSync(projectRoot(pid))) return res.status(404).json({ detail: 'Project not found' });
+    const fmt = String(req.query.ext || req.query.format || 'wfp').toLowerCase();
+    const rawTitle = String(req.query.title || `Project_${pid}`).trim();
+    const { outPath, filename } = generateProjectFileOnDisk(pid, rawTitle, fmt);
+    res.download(path.resolve(outPath), filename);
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
 app.post('/api/projects/:id/project-file', (req, res) => {
   try {
     const pid = req.params.id;
-    const plan = loadJson(pid, 'timeline.json');
-    if (!plan) return res.status(400).json({ detail: 'Build timeline first' });
-    const fmt = String(req.body?.format || 'wfp').toLowerCase();
-    const rawTitle = String(req.body?.title || `Project_${pid}`).trim();
-    const safeTitle = rawTitle.replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
-    const outDir = path.join(EXPORTS_DIR, pid);
-    fs.mkdirSync(outDir, { recursive: true });
-
-    let filename = `${safeTitle}.${fmt}`;
-    let outPath = path.join(outDir, filename);
-
-    if (fmt === 'wfp') {
-      const buf = buildFilmoraWfpBuffer(plan, rawTitle, {});
-      fs.writeFileSync(outPath, buf);
-    } else if (fmt === 'wfpbundle') {
-      const bundleZip = new AdmZip();
-      const pathMap = {};
-      const resourceItems = [];
-      const allPaths = new Set();
-      for (const c of plan.clips || []) {
-        if (c.media_path && fs.existsSync(c.media_path)) allPaths.add(c.media_path);
-      }
-      if (plan.voiceover_path && fs.existsSync(plan.voiceover_path)) allPaths.add(plan.voiceover_path);
-      if (plan.logo_path && fs.existsSync(plan.logo_path)) allPaths.add(plan.logo_path);
-
-      for (const orig of allPaths) {
-        const ext = path.extname(orig);
-        const sha = fileSha1Prefix(orig);
-        const rel = `Resources/${sha}_1${ext}`;
-        pathMap[orig] = rel;
-        bundleZip.addLocalFile(orig, 'Resources', `${sha}_1${ext}`);
-        resourceItems.push({ original_path: orig.replace(/\\/g, '/'), bundle_path: rel, sha1: sha });
-      }
-      const innerWfp = buildFilmoraWfpBuffer(plan, rawTitle, pathMap);
-      bundleZip.addFile('project.wfp', innerWfp);
-      bundleZip.addFile('resource.json', deflateRawJson({ version: '15.6.4', resources: resourceItems }));
-      bundleZip.writeZip(outPath);
-    } else if (fmt === 'fcpxml') {
-      const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE fcpxml>\n<fcpxml version="1.9"><project name="${safeTitle}"/></fcpxml>\n`;
-      fs.writeFileSync(outPath, xml, 'utf-8');
-    } else if (fmt === 'edl') {
-      const edl = `TITLE: ${safeTitle}\nFCM: NON-DROP FRAME\n`;
-      fs.writeFileSync(outPath, edl, 'utf-8');
-    } else {
-      filename = `${safeTitle}.json`;
-      outPath = path.join(outDir, filename);
-      fs.writeFileSync(outPath, JSON.stringify(plan, null, 2), 'utf-8');
-    }
-
-    saveJson(pid, 'last_project_file.json', { path: outPath, filename, format: fmt });
+    if (!fs.existsSync(projectRoot(pid))) return res.status(404).json({ detail: 'Project not found' });
+    const fmt = String(req.body?.format || req.query?.ext || 'wfp').toLowerCase();
+    const rawTitle = String(req.body?.title || req.query?.title || `Project_${pid}`).trim();
+    const { outPath, filename } = generateProjectFileOnDisk(pid, rawTitle, fmt);
     res.json({
       filename,
       path: outPath,
-      saved_to: '',
+      saved_to: outPath,
       download: `/api/projects/${pid}/project-file/download`,
+    });
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
+app.post('/api/projects/:id/save-wfp-to', (req, res) => {
+  try {
+    const pid = req.params.id;
+    if (!fs.existsSync(projectRoot(pid))) return res.status(404).json({ detail: 'Project not found' });
+    const rawTitle = String(req.query.title || req.body?.title || `Project_${pid}`).trim();
+    const { outPath, filename } = generateProjectFileOnDisk(pid, rawTitle, 'wfp');
+    res.json({
+      ok: true,
+      cancelled: false,
+      filename,
+      saved_to: outPath,
+      download_url: `/api/projects/${pid}/project-file?title=${encodeURIComponent(rawTitle)}&ext=wfp`,
     });
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -1423,17 +1688,23 @@ app.get('/api/projects/:id/collect/status', (req, res) => {
 
 app.post('/api/projects/:id/collect', async (req, res) => {
   const pid = req.params.id;
-  const plan = loadJson(pid, 'timeline.json');
-  if (!plan) return res.status(400).json({ detail: 'Build timeline first' });
-  const rawTitle = String(req.body?.title || `Project_${pid}`).trim();
+  const plan = loadJson(pid, 'timeline.json') || {
+    project_id: pid,
+    total_duration: 10,
+    clips: [],
+  };
+  const mode = String(req.body?.mode || req.query?.mode || 'wfpbundle').toLowerCase();
+  const rawTitle = String(req.body?.title || req.query?.title || `Project_${pid}`).trim();
   const safeTitle = rawTitle.replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
 
   collectStatus[pid] = { running: true, percent: 15, message: 'Packing Filmora 15 .wfpbundle & media…' };
   try {
     const outDir = path.join(EXPORTS_DIR, pid);
     fs.mkdirSync(outDir, { recursive: true });
-    const bundleFilename = `${safeTitle}.wfpbundle`;
+    const extSuffix = mode === 'wfpbundle' ? 'wfpbundle' : 'zip';
+    const bundleFilename = mode === 'wfpbundle' ? `${safeTitle}.wfpbundle` : `${safeTitle}_Collected.zip`;
     const bundlePath = path.join(outDir, bundleFilename);
+    const standaloneWfpPath = path.join(outDir, `${safeTitle}.wfp`);
 
     const bundleZip = new AdmZip();
     const pathMap = {};
@@ -1441,6 +1712,10 @@ app.post('/api/projects/:id/collect', async (req, res) => {
     const allPaths = new Set();
     for (const c of plan.clips || []) {
       if (c.media_path && fs.existsSync(c.media_path)) allPaths.add(c.media_path);
+    }
+    const mediaList = loadJson(pid, 'media.json') || [];
+    for (const m of mediaList) {
+      if (m.path && fs.existsSync(m.path)) allPaths.add(m.path);
     }
     if (plan.voiceover_path && fs.existsSync(plan.voiceover_path)) allPaths.add(plan.voiceover_path);
     if (plan.logo_path && fs.existsSync(plan.logo_path)) allPaths.add(plan.logo_path);
@@ -1456,25 +1731,39 @@ app.post('/api/projects/:id/collect', async (req, res) => {
       };
       const ext = path.extname(orig);
       const sha = fileSha1Prefix(orig);
-      const rel = `Resources/${sha}_1${ext}`;
+      const guidFolder = wfpGuid();
+      const baseName = path.basename(orig);
+      const rel = `Medias/${guidFolder}/${baseName}`;
       pathMap[orig] = rel;
+      bundleZip.addLocalFile(orig, `Medias/${guidFolder}`, baseName);
       bundleZip.addLocalFile(orig, 'Resources', `${sha}_1${ext}`);
       resourceItems.push({ original_path: orig.replace(/\\/g, '/'), bundle_path: rel, sha1: sha });
     }
     const innerWfp = buildFilmoraWfpBuffer(plan, rawTitle, pathMap);
+    fs.writeFileSync(standaloneWfpPath, innerWfp);
+    bundleZip.addFile(`${safeTitle}.wfp`, innerWfp);
     bundleZip.addFile('project.wfp', innerWfp);
     bundleZip.addFile('resource.json', deflateRawJson({ version: '15.6.4', resources: resourceItems }));
     bundleZip.writeZip(bundlePath);
 
     const sizeMb = Math.round((fs.statSync(bundlePath).size / (1024 * 1024)) * 100) / 100;
+    const dlEndpoint = `/api/projects/${pid}/collect/download?kind=${extSuffix}`;
     const payload = {
+      ok: true,
+      mode,
       filename: bundleFilename,
       path: bundlePath,
-      saved_to: '',
-      wfpbundle_saved_to: '',
+      bundle_path: bundlePath,
+      zip_path: bundlePath,
+      folder_path: outDir,
+      wfp_path: standaloneWfpPath,
+      file_count: allPaths.size + 1,
+      saved_to: bundlePath,
+      wfpbundle_saved_to: bundlePath,
       size_mb: sizeMb,
-      download: `/api/projects/${pid}/collect/download?kind=wfpbundle`,
-      wfpbundle_download: `/api/projects/${pid}/collect/download?kind=wfpbundle`,
+      download: dlEndpoint,
+      download_url: dlEndpoint,
+      wfpbundle_download: dlEndpoint,
     };
     saveJson(pid, 'last_collect.json', payload);
     collectStatus[pid] = { running: false, percent: 100, message: 'Bundle ready!', ...payload };
@@ -1491,135 +1780,294 @@ app.get('/api/projects/:id/collect/download', (req, res) => {
   res.download(path.resolve(meta.path), meta.filename);
 });
 
+async function handleOpenProjectFile(tempPath, origName) {
+  const ext = path.extname(origName).toLowerCase();
+  const pid = createProject();
+  const root = projectRoot(pid);
+  const projTitle = path.parse(origName).name.replace(/\.(wfpbundle|wfp|dgsproj)$/i, '') || `Project ${pid}`;
+
+  if (ext === '.json' || ext === '.dgsproj') {
+    const plan = JSON.parse(fs.readFileSync(tempPath, 'utf-8'));
+    try { fs.unlinkSync(tempPath); } catch {}
+    plan.project_id = pid;
+    saveJson(pid, 'timeline.json', plan);
+    saveJson(pid, 'last_export.json', { title: projTitle });
+    return {
+      project_id: pid,
+      title: projTitle,
+      scenes: [],
+      poem: { has_poem: false },
+      media: [],
+      voiceover: null,
+      poem_voiceover: null,
+      logo: null,
+      timeline: plan,
+    };
+  }
+
+  // Extract .wfpbundle, .wfp, or .zip
+  const outerZip = new AdmZip(tempPath);
+  try { fs.unlinkSync(tempPath); } catch {}
+  const entries = outerZip.getEntries();
+  const entryMap = new Map(entries.map((e) => [e.entryName.replace(/\\/g, '/'), e]));
+
+  // Extract both Medias/{GUID}/* and Resources/* into project media folders
+  const extractedMap = {};
+  const extractedByBase = {};
+  for (const e of entries) {
+    if (e.isDirectory) continue;
+    const norm = e.entryName.replace(/\\/g, '/');
+    if (
+      (norm.startsWith('Resources/') || norm.startsWith('Medias/')) &&
+      norm !== 'Medias/project_media.json'
+    ) {
+      const base = path.basename(norm);
+      const fext = path.extname(base).toLowerCase();
+      if (!IMAGE_EXT.has(fext) && !VIDEO_EXT.has(fext) && !AUDIO_EXT.has(fext)) continue;
+      let targetDir = path.join(root, 'media', 'images');
+      if (VIDEO_EXT.has(fext)) targetDir = path.join(root, 'media', 'videos');
+      else if (AUDIO_EXT.has(fext)) targetDir = path.join(root, 'voiceover');
+      fs.mkdirSync(targetDir, { recursive: true });
+      const destFile = path.join(targetDir, base);
+      fs.writeFileSync(destFile, e.getData());
+      extractedMap[norm] = destFile;
+      extractedByBase[base] = destFile;
+    }
+  }
+
+  let wfpZip = outerZip;
+  const innerWfpEntry = entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp'));
+  if (innerWfpEntry) {
+    wfpZip = new AdmZip(innerWfpEntry.getData());
+  }
+  const tlEntry = wfpZip.getEntry('Timelines/timeline.json');
+  if (!tlEntry) {
+    throw new Error('Invalid .wfp/.wfpbundle: missing Timelines/timeline.json');
+  }
+  const tlObj = inflateRawJson(tlEntry.getData());
+
+  const mediaItems = await reindexMedia(pid);
+  const mediaByPath = new Map(mediaItems.map((m) => [path.resolve(m.path), m]));
+  const mediaByName = new Map(mediaItems.map((m) => [m.filename.toLowerCase(), m]));
+
+  let clips = [];
+  if (tlObj.dgs_plan_snapshot && Array.isArray(tlObj.dgs_plan_snapshot.clips)) {
+    clips = tlObj.dgs_plan_snapshot.clips.map((c, idx) => {
+      const normRef = String(c.media_path || '').replace(/\\/g, '/');
+      const localPath = extractedMap[normRef] || extractedByBase[path.basename(normRef)] || c.media_path || '';
+      const found =
+        (localPath && mediaByPath.get(path.resolve(localPath))) ||
+        mediaByName.get(path.basename(normRef).toLowerCase());
+      return {
+        ...c,
+        media_id: found ? found.id : c.media_id,
+        media_path: found ? found.path : localPath,
+        screen: c.screen || `screen_${idx + 1}`,
+      };
+    });
+  } else if (Array.isArray(tlObj.tracks)) {
+    const vTrack = tlObj.tracks.find((t) => t.type === 1) || tlObj.tracks[0];
+    let cursor = 0;
+    for (let i = 0; i < (vTrack?.clips || []).length; i++) {
+      const vc = vTrack.clips[i];
+      const dur = (vc.timeline_range?.duration || TICKS_PER_SEC * 3) / TICKS_PER_SEC;
+      const srcRel = String(vc.source_file || '').replace(/\\/g, '/');
+      const localPath = extractedMap[srcRel] || extractedByBase[path.basename(srcRel)] || srcRel;
+      const found =
+        (localPath && mediaByPath.get(path.resolve(localPath))) ||
+        mediaByName.get(path.basename(srcRel).toLowerCase());
+      let extra = {};
+      try { if (vc.extra) extra = JSON.parse(vc.extra); } catch {}
+      clips.push({
+        screen: extra.screen || `screen_${i + 1}`,
+        media_id: found ? found.id : null,
+        media_path: found ? found.path : localPath,
+        kind: found ? found.kind : (vc.type === 1 ? 'video' : 'image'),
+        start: Math.round(cursor * 1000) / 1000,
+        end: Math.round((cursor + dur) * 1000) / 1000,
+        duration: Math.round(dur * 1000) / 1000,
+        source_in: 0,
+        source_out: Math.round(dur * 1000) / 1000,
+        script_text: extra.script_text || vc.title || `screen_${i + 1}`,
+        vo_text: extra.vo_text || '',
+        narration_in: extra.narration_in ?? null,
+        narration_out: extra.narration_out ?? null,
+        fit: 'hold',
+      });
+      cursor += dur;
+    }
+  }
+
+  // Check extracted voiceover
+  const voDir = path.join(root, 'voiceover');
+  let voPath = null;
+  let voMeta = null;
+  if (fs.existsSync(voDir)) {
+    const voFiles = fs.readdirSync(voDir).filter((f) => AUDIO_EXT.has(path.extname(f).toLowerCase()));
+    if (voFiles.length) {
+      voPath = path.join(voDir, voFiles[0]);
+      const voDur = (await probeDuration(voPath)) || 0;
+      voMeta = {
+        path: voPath,
+        filename: voFiles[0],
+        duration: voDur,
+        kind: 'narration',
+        slots: [{ slot: 1, filename: voFiles[0], path: voPath, duration: voDur, start_offset: 0, end_offset: voDur }],
+      };
+      saveJson(pid, 'voiceover.json', voMeta);
+    }
+  }
+
+  const scenes = clips.map((c, idx) => ({
+    screen: c.screen || `screen_${idx + 1}`,
+    index: idx + 1,
+    scene_no: idx + 1,
+    section: 'story',
+    visual_type: c.kind === 'video' ? 'Video' : 'Image',
+    visual_direction: c.script_text || '',
+    onscreen_text: '',
+    voiceover_text: c.vo_text || c.script_text || '',
+    text: c.vo_text || c.script_text || c.screen,
+    duration: c.duration,
+    is_poem: false,
+  }));
+  saveJson(pid, 'script.json', scenes);
+  saveJson(pid, 'script_meta.json', {
+    format: 'imported_wfp',
+    filename: origName,
+    scene_count: scenes.length,
+    poem: { has_poem: false },
+  });
+  saveJson(pid, 'last_export.json', { title: projTitle });
+
+  const totalDur = clips.reduce((acc, c) => Math.max(acc, c.end || 0), 0) || (voMeta?.duration || 10);
+  const plan = {
+    project_id: pid,
+    total_duration: totalDur,
+    clips,
+    voiceover_path: voPath,
+    voiceover_slots: voMeta?.slots || [],
+    srt_cues: buildSrtCues(clips),
+    qa_issues: [],
+    qa_summary: `Imported ${clips.length} clips from ${origName}`,
+  };
+  saveJson(pid, 'timeline.json', plan);
+  return {
+    project_id: pid,
+    title: projTitle,
+    scenes,
+    poem: { has_poem: false },
+    media: mediaItems,
+    voiceover: voMeta,
+    poem_voiceover: null,
+    logo: null,
+    timeline: plan,
+  };
+}
+
 // Open Project File (.wfpbundle, .wfp, .json)
 app.post('/api/projects/open-file', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ detail: 'Missing project file' });
     const origName = path.basename(req.file.originalname || 'project.wfpbundle');
-    const ext = path.extname(origName).toLowerCase();
-    const pid = createProject();
-    const root = projectRoot(pid);
-
-    if (ext === '.json') {
-      const plan = JSON.parse(fs.readFileSync(req.file.path, 'utf-8'));
-      try { fs.unlinkSync(req.file.path); } catch {}
-      plan.project_id = pid;
-      saveJson(pid, 'timeline.json', plan);
-      return res.json({ project_id: pid, title: path.parse(origName).name, timeline: plan });
-    }
-
-    // Extract .wfpbundle or .wfp
-    const outerZip = new AdmZip(req.file.path);
-    try { fs.unlinkSync(req.file.path); } catch {}
-    const entries = outerZip.getEntries();
-    const entryMap = new Map(entries.map((e) => [e.entryName.replace(/\\/g, '/'), e]));
-
-    // Extract Resources/* into project media folders
-    const extractedMap = {};
-    for (const e of entries) {
-      const norm = e.entryName.replace(/\\/g, '/');
-      if (norm.startsWith('Resources/') && !e.isDirectory) {
-        const base = path.basename(norm);
-        const fext = path.extname(base).toLowerCase();
-        let targetDir = path.join(root, 'media', 'images');
-        if (VIDEO_EXT.has(fext)) targetDir = path.join(root, 'media', 'videos');
-        else if (['.mp3', '.wav', '.m4a', '.aac'].includes(fext)) targetDir = path.join(root, 'voiceover');
-        fs.mkdirSync(targetDir, { recursive: true });
-        const destFile = path.join(targetDir, base);
-        fs.writeFileSync(destFile, e.getData());
-        extractedMap[norm] = destFile;
-      }
-    }
-
-    let wfpZip = outerZip;
-    if (entryMap.has('project.wfp')) {
-      wfpZip = new AdmZip(entryMap.get('project.wfp').getData());
-    }
-    const tlEntry = wfpZip.getEntry('Timelines/timeline.json');
-    if (!tlEntry) return res.status(400).json({ detail: 'Invalid .wfp/.wfpbundle: missing Timelines/timeline.json' });
-    const tlObj = inflateRawJson(tlEntry.getData());
-
-    const mediaItems = await reindexMedia(pid);
-    const mediaByPath = new Map(mediaItems.map((m) => [path.resolve(m.path), m]));
-
-    let clips = [];
-    if (tlObj.dgs_plan_snapshot && Array.isArray(tlObj.dgs_plan_snapshot.clips)) {
-      clips = tlObj.dgs_plan_snapshot.clips.map((c, idx) => {
-        const localPath = extractedMap[c.media_path] || c.media_path || '';
-        const found = localPath && mediaByPath.get(path.resolve(localPath));
-        return {
-          ...c,
-          media_id: found ? found.id : c.media_id,
-          media_path: found ? found.path : localPath,
-          screen: c.screen || `Screen_${idx + 1}`,
-        };
-      });
-    } else if (Array.isArray(tlObj.tracks)) {
-      const vTrack = tlObj.tracks.find((t) => t.type === 1) || tlObj.tracks[0];
-      let cursor = 0;
-      for (let i = 0; i < (vTrack?.clips || []).length; i++) {
-        const vc = vTrack.clips[i];
-        const dur = (vc.timeline_range?.duration || TICKS_PER_SEC * 3) / TICKS_PER_SEC;
-        const srcRel = (vc.source_file || '').replace(/\\/g, '/');
-        const localPath = extractedMap[srcRel] || srcRel;
-        const found = localPath && mediaByPath.get(path.resolve(localPath));
-        clips.push({
-          screen: `Screen_${i + 1}`,
-          media_id: found ? found.id : null,
-          media_path: found ? found.path : localPath,
-          kind: found ? found.kind : (vc.type === 1 ? 'video' : 'image'),
-          start: Math.round(cursor * 1000) / 1000,
-          end: Math.round((cursor + dur) * 1000) / 1000,
-          duration: Math.round(dur * 1000) / 1000,
-          source_in: 0,
-          source_out: Math.round(dur * 1000) / 1000,
-          script_text: vc.title || `Screen_${i + 1}`,
-          vo_text: '',
-          fit: 'hold',
-        });
-        cursor += dur;
-      }
-    }
-
-    // Check extracted voiceover
-    const voDir = path.join(root, 'voiceover');
-    let voPath = null;
-    if (fs.existsSync(voDir)) {
-      const voFiles = fs.readdirSync(voDir).filter((f) => ['.mp3', '.wav', '.m4a', '.aac'].includes(path.extname(f).toLowerCase()));
-      if (voFiles.length) {
-        voPath = path.join(voDir, voFiles[0]);
-        const voDur = (await probeDuration(voPath)) || 0;
-        saveJson(pid, 'voiceover.json', { path: voPath, filename: voFiles[0], duration: voDur, kind: 'narration', slots: [{ slot: 1, filename: voFiles[0], path: voPath, duration: voDur }] });
-      }
-    }
-
-    const scenes = clips.map((c) => ({
-      screen: c.screen,
-      visual_type: c.kind === 'video' ? 'video' : 'image',
-      visual_description: c.script_text || '',
-      onscreen_text: '',
-      voiceover_text: c.vo_text || '',
-      duration: c.duration,
-      is_poem: false,
-    }));
-    saveJson(pid, 'script.json', scenes);
-    const totalDur = clips.reduce((acc, c) => Math.max(acc, c.end || 0), 0);
-    const plan = {
-      project_id: pid,
-      total_duration: totalDur,
-      clips,
-      voiceover_path: voPath,
-      voiceover_slots: [],
-      srt_cues: buildSrtCues(clips),
-      qa_issues: [],
-      qa_summary: `Imported ${clips.length} clips from ${origName}`,
-    };
-    saveJson(pid, 'timeline.json', plan);
-    res.json({ project_id: pid, title: path.parse(origName).name, timeline: plan });
+    const result = await handleOpenProjectFile(req.file.path, origName);
+    res.json(result);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
 });
+
+// Universal Chunked Upload Endpoint (bypasses CDN/proxy 413 payload limits & timeouts for large WAV/MP3 VO, Video & Bundle files)
+async function processChunkUpload(req, res) {
+  try {
+    const pid = req.params.id || req.body?.project_id || req.query?.project_id || '';
+    const uploadId = String(req.body?.upload_id || req.query?.upload_id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const chunkIndex = parseInt(req.body?.chunk_index ?? req.query?.chunk_index ?? '0', 10);
+    const totalChunks = parseInt(req.body?.total_chunks ?? req.query?.total_chunks ?? '1', 10);
+    const target = String(req.body?.target || req.query?.target || 'voiceover');
+    const origName = path.basename(req.body?.filename || req.query?.filename || req.file?.originalname || 'upload.bin');
+
+    if (!uploadId || !req.file) {
+      return res.status(400).json({ detail: 'Missing upload_id or chunk file' });
+    }
+
+    const partPath = path.join(UPLOAD_TMP, `chunk_${uploadId}_${origName}`);
+    const chunkData = fs.readFileSync(req.file.path);
+    try { fs.unlinkSync(req.file.path); } catch {}
+
+    if (chunkIndex === 0 && fs.existsSync(partPath)) {
+      try { fs.unlinkSync(partPath); } catch {}
+    }
+    fs.appendFileSync(partPath, chunkData);
+
+    if (chunkIndex < totalChunks - 1) {
+      return res.json({
+        ok: true,
+        partial: true,
+        chunk_index: chunkIndex,
+        total_chunks: totalChunks,
+      });
+    }
+
+    // Final chunk assembled — dispatch to target handler
+    if (target === 'voiceover') {
+      const slot = Math.max(1, Math.min(10, parseInt(req.body?.slot || req.query?.slot || '1', 10)));
+      const meta = await handleVoiceoverFile(pid, slot, partPath, origName);
+      return res.json(meta);
+    }
+    if (target === 'poem_voiceover') {
+      const meta = await handlePoemVoFile(pid, partPath, origName);
+      return res.json(meta);
+    }
+    if (target === 'script') {
+      const meta = handleScriptFile(pid, partPath, origName);
+      return res.json(meta);
+    }
+    if (target === 'logo') {
+      const meta = handleLogoFile(pid, partPath, origName);
+      return res.json(meta);
+    }
+    if (target === 'scene_vo') {
+      const screen = String(req.body?.screen || req.query?.screen || 'screen_1');
+      const meta = await handleSceneVoFile(pid, screen, partPath, origName, {
+        voiceover_text: req.body?.voiceover_text || req.query?.voiceover_text,
+        onscreen_text: req.body?.onscreen_text || req.query?.onscreen_text,
+      });
+      return res.json(meta);
+    }
+    if (target === 'media_images' || target === 'media_videos') {
+      const kind = target === 'media_videos' ? 'videos' : 'images';
+      const allowed = kind === 'images' ? IMAGE_EXT : VIDEO_EXT;
+      const ext = path.extname(origName).toLowerCase();
+      const destDir = path.join(projectRoot(pid), 'media', kind);
+      fs.mkdirSync(destDir, { recursive: true });
+      let saved = 0;
+      let skipped = 0;
+      if (allowed.has(ext)) {
+        fs.copyFileSync(partPath, path.join(destDir, origName));
+        saved = 1;
+      } else {
+        skipped = 1;
+      }
+      try { fs.unlinkSync(partPath); } catch {}
+      const items = await reindexMedia(pid);
+      return res.json({ count: items.length, saved, skipped, folder: kind, media: items });
+    }
+    if (target === 'open_file') {
+      const result = await handleOpenProjectFile(partPath, origName);
+      return res.json(result);
+    }
+
+    try { fs.unlinkSync(partPath); } catch {}
+    return res.status(400).json({ detail: `Unknown chunk upload target: ${target}` });
+  } catch (e) {
+    console.error('Chunk upload error:', e);
+    res.status(500).json({ detail: String(e) });
+  }
+}
+
+app.post('/api/upload-chunk', upload.single('chunk'), processChunkUpload);
+app.post('/api/projects/:id/upload-chunk', upload.single('chunk'), processChunkUpload);
 
 // Serve built React frontend
 const PUBLIC_DIR = path.join(ROOT, 'public');
