@@ -371,6 +371,7 @@ async function reindexMedia(pid) {
   const mediaDir = path.join(root, 'media');
   const existing = loadJson(pid, 'media.json') || [];
   const byPath = new Map(existing.map((m) => [m.path, m]));
+  const byNameKind = new Map(existing.map((m) => [`${m.kind}:${String(m.filename || '').toLowerCase()}`, m]));
   const files = [];
 
   function walk(dir) {
@@ -383,33 +384,55 @@ async function reindexMedia(pid) {
   }
   walk(mediaDir);
 
-  files.sort((a, b) => {
-    const sa = detectScreens(path.basename(a), path.basename(path.dirname(a)));
-    const sb = detectScreens(path.basename(b), path.basename(path.dirname(b)));
-    const na = sa.length ? parseInt(sa[0].replace('screen_', ''), 10) : 999999;
-    const nb = sb.length ? parseInt(sb[0].replace('screen_', ''), 10) : 999999;
-    if (na !== nb) return na - nb;
-    return naturalCompare(path.basename(a), path.basename(b));
-  });
-
   const items = [];
+  const seenNameKind = new Set();
   for (const f of files) {
     const ext = path.extname(f).toLowerCase();
     if (!IMAGE_EXT.has(ext) && !VIDEO_EXT.has(ext)) continue;
     const kind = IMAGE_EXT.has(ext) ? 'image' : 'video';
-    const prev = byPath.get(f);
-    const screens = detectScreens(path.basename(f), path.basename(path.dirname(f)));
+    const fname = path.basename(f);
+    const nk = `${kind}:${fname.toLowerCase()}`;
+    seenNameKind.add(nk);
+    const prev = byPath.get(f) || byNameKind.get(nk);
+    const screens = detectScreens(fname, path.basename(path.dirname(f)));
     const dur = kind === 'video' ? (prev?.duration ?? (await probeDuration(f))) : null;
     items.push({
       id: prev?.id || crypto.randomUUID(),
-      filename: path.basename(f),
+      filename: fname,
       path: f,
       kind,
       screen: screens[0] || null,
       screens,
       duration: dur,
+      local_only: false,
     });
   }
+
+  // Preserve any local-only metadata items registered directly from the user's browser
+  for (const m of existing) {
+    if (!m || !m.local_only) continue;
+    const nk = `${m.kind}:${String(m.filename || '').toLowerCase()}`;
+    if (seenNameKind.has(nk)) continue;
+    seenNameKind.add(nk);
+    const screens = Array.isArray(m.screens) && m.screens.length ? m.screens : detectScreens(m.filename);
+    items.push({
+      ...m,
+      id: m.id || crypto.randomUUID(),
+      screen: m.screen || screens[0] || null,
+      screens,
+      local_only: true,
+    });
+  }
+
+  items.sort((a, b) => {
+    const sa = Array.isArray(a.screens) && a.screens.length ? a.screens : detectScreens(a.filename);
+    const sb = Array.isArray(b.screens) && b.screens.length ? b.screens : detectScreens(b.filename);
+    const na = sa.length ? parseInt(sa[0].replace('screen_', ''), 10) : 999999;
+    const nb = sb.length ? parseInt(sb[0].replace('screen_', ''), 10) : 999999;
+    if (na !== nb) return na - nb;
+    return naturalCompare(a.filename, b.filename);
+  });
+
   saveJson(pid, 'media.json', items);
   return items;
 }
@@ -782,9 +805,9 @@ function mergeAdjacentSameMedia(clips) {
     const clip = clips[i];
     const prev = merged[merged.length - 1];
     const sameMedia = Boolean(clip.media_id && clip.media_id === prev.media_id);
+    const sameScreen = Boolean(clip.screen && prev.screen && normScreenId(clip.screen) === normScreenId(prev.screen));
     const contiguous = Math.abs(Number(clip.start) - Number(prev.end)) < 0.05;
-    const pauseHold = !(clip.vo_text || clip.script_text) && Boolean(prev.vo_text || prev.script_text);
-    if (sameMedia && contiguous && !pauseHold) {
+    if (sameMedia && sameScreen && contiguous) {
       prev.end = clip.end;
       prev.duration = Math.max(0.2, Math.round((Number(prev.end) - Number(prev.start)) * 1000) / 1000);
       if (prev.script_text && clip.script_text && !prev.script_text.includes(clip.script_text)) {
@@ -807,6 +830,12 @@ function mergeAdjacentSameMedia(clips) {
         prev.source_out = prev.duration;
       }
       continue;
+    }
+    // If two adjacent scenes share the same multi-scene video, advance source_in so the video plays continuously across scenes
+    if (sameMedia && !sameScreen && contiguous && clip.kind === 'video') {
+      const prevOut = Number(prev.source_out || prev.duration || 0);
+      clip.source_in = Math.round(prevOut * 1000) / 1000;
+      clip.source_out = Math.round((prevOut + Number(clip.duration || 0)) * 1000) / 1000;
     }
     merged.push({ ...clip });
   }
@@ -1036,7 +1065,27 @@ app.post('/api/projects/:id/import-recent', async (req, res) => {
   res.json({ saved: 0, count: items.length, media: items });
 });
 
+function getReqClient(req) {
+  const clientId = String(req.headers['x-client-id'] || req.query?.client_id || req.body?.client_id || '').trim();
+  const clientLabel = String(req.headers['x-client-label'] || req.query?.client_label || req.body?.client_label || '').trim();
+  return { client_id: clientId || null, client_label: clientLabel || null };
+}
+
+function touchProjectClient(pid, req) {
+  if (!pid || !fs.existsSync(projectRoot(pid))) return;
+  const { client_id, client_label } = getReqClient(req);
+  if (!client_id && !client_label) return;
+  const cur = loadJson(pid, 'client_meta.json') || {};
+  saveJson(pid, 'client_meta.json', {
+    ...cur,
+    client_id: client_id || cur.client_id || null,
+    client_label: client_label || cur.client_label || null,
+    updated_at: new Date().toISOString(),
+  });
+}
+
 app.get('/api/projects/recent', (req, res) => {
+  const { client_id: reqClientId } = getReqClient(req);
   const projects = [];
   if (fs.existsSync(PROJECTS_DIR)) {
     for (const ent of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
@@ -1050,6 +1099,7 @@ app.get('/api/projects/recent', (req, res) => {
       const tlRaw = loadJson(pid, 'timeline.json') || {};
       const mediaRaw = loadJson(pid, 'media.json') || [];
       const scenesRaw = loadJson(pid, 'script.json') || [];
+      const clientMeta = loadJson(pid, 'client_meta.json') || {};
       if (!scenesRaw.length && !mediaRaw.length && !voMeta.path && !(tlRaw.clips && tlRaw.clips.length)) continue;
       let mtime = fs.statSync(path.join(PROJECTS_DIR, pid)).mtimeMs;
       for (const f of fs.readdirSync(metaDir)) {
@@ -1067,15 +1117,22 @@ app.get('/api/projects/recent', (req, res) => {
         total_duration: Number(tlRaw.total_duration || voMeta.duration || 0),
         mtime: mtime / 1000,
         updated_at: new Date(mtime).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }),
+        client_id: clientMeta.client_id || null,
+        client_label: clientMeta.client_label || null,
+        is_this_pc: Boolean(reqClientId && clientMeta.client_id === reqClientId),
       });
     }
   }
-  projects.sort((a, b) => b.mtime - a.mtime);
+  projects.sort((a, b) => {
+    if (a.is_this_pc !== b.is_this_pc) return a.is_this_pc ? -1 : 1;
+    return b.mtime - a.mtime;
+  });
   res.json({ projects: projects.slice(0, 20), recent_paths: [] });
 });
 
 app.post('/api/projects', (req, res) => {
   const pid = createProject();
+  touchProjectClient(pid, req);
   res.json({ project_id: pid });
 });
 
@@ -1115,6 +1172,7 @@ app.get('/api/projects/:id/load', (req, res) => {
 app.post('/api/projects/:id/media/:kind', upload.array('files', 500), async (req, res) => {
   try {
     const pid = req.params.id;
+    touchProjectClient(pid, req);
     const kind = req.params.kind === 'videos' ? 'videos' : 'images';
     const root = projectRoot(pid);
     if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
@@ -1137,6 +1195,75 @@ app.post('/api/projects/:id/media/:kind', upload.array('files', 500), async (req
     }
     const items = await reindexMedia(pid);
     res.json({ count: items.length, saved, skipped, folder: kind, media: items });
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
+// Zero-upload Local-File Mode: registers local images/videos metadata without uploading file bytes to server
+app.post('/api/projects/:id/media-meta', async (req, res) => {
+  try {
+    const pid = req.params.id;
+    touchProjectClient(pid, req);
+    const root = projectRoot(pid);
+    if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
+    const kind = req.body?.kind === 'videos' ? 'videos' : 'images';
+    const allowed = kind === 'images' ? IMAGE_EXT : VIDEO_EXT;
+    const incoming = Array.isArray(req.body?.items) ? req.body.items : [];
+    const existing = loadJson(pid, 'media.json') || [];
+    const byKey = new Map(existing.map((m) => [`${m.kind}:${String(m.filename || '').toLowerCase()}`, m]));
+    let saved = 0;
+    let skipped = 0;
+    for (const raw of incoming) {
+      const origName = path.basename(String(raw?.filename || ''));
+      const ext = path.extname(origName).toLowerCase();
+      if (!origName || !allowed.has(ext)) {
+        skipped++;
+        continue;
+      }
+      const itemKind = IMAGE_EXT.has(ext) ? 'image' : 'video';
+      const nk = `${itemKind}:${origName.toLowerCase()}`;
+      const prev = byKey.get(nk);
+      const screens = detectScreens(origName, String(raw?.folder || ''));
+      const localPath = String(raw?.local_path || '').trim() || path.join(root, 'media', kind, origName);
+      byKey.set(nk, {
+        id: prev?.id || crypto.randomUUID(),
+        filename: origName,
+        path: localPath,
+        kind: itemKind,
+        screen: screens[0] || null,
+        screens,
+        duration: itemKind === 'video' ? (Number(raw?.duration) || prev?.duration || 5.0) : null,
+        size: Number(raw?.size || 0),
+        local_only: true,
+      });
+      saved++;
+    }
+    saveJson(pid, 'media.json', Array.from(byKey.values()));
+    const items = await reindexMedia(pid);
+    res.json({ count: items.length, saved, skipped, folder: kind, media: items });
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
+// Purge temporary physical media/VO/export files on server after render to keep server storage at 0 MB
+app.delete('/api/projects/:id/purge-server-media', (req, res) => {
+  try {
+    const pid = req.params.id;
+    const root = projectRoot(pid);
+    for (const sub of ['media/images', 'media/videos', 'voiceover', 'logo']) {
+      const d = path.join(root, sub);
+      if (fs.existsSync(d)) {
+        fs.rmSync(d, { recursive: true, force: true });
+        fs.mkdirSync(d, { recursive: true });
+      }
+    }
+    const expDir = path.join(EXPORTS_DIR, pid);
+    if (fs.existsSync(expDir)) {
+      fs.rmSync(expDir, { recursive: true, force: true });
+    }
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
@@ -1261,14 +1388,57 @@ async function rebuildMergedVo(pid, slots) {
   const voDir = path.join(root, 'voiceover');
   fs.mkdirSync(voDir, { recursive: true });
   const active = slots
-    .filter((s) => s && s.path && fs.existsSync(s.path))
+    .filter((s) => s && s.path && (fs.existsSync(s.path) || s.local_only))
     .sort((a, b) => Number(a.slot) - Number(b.slot));
 
   if (!active.length) {
-    const empty = { path: null, filename: '', duration: 0, kind: 'narration', slots: [] };
+    const empty = { path: null, filename: '', duration: 0, kind: 'narration', slots: [], silences: [] };
     saveJson(pid, 'voiceover.json', empty);
     return empty;
   }
+
+  // If any slots are local-only (registered from browser without uploading audio bytes), compute merged offsets & silences in pure JS
+  if (active.some((s) => s.local_only || !fs.existsSync(s.path))) {
+    let offset = 0;
+    const gapSec = 0.5;
+    const mergedSilences = [];
+    for (let i = 0; i < active.length; i++) {
+      const s = active[i];
+      const dur = Number(s.duration || 0);
+      s.start_offset = Math.round(offset * 1000) / 1000;
+      s.end_offset = Math.round((offset + dur) * 1000) / 1000;
+      for (const pair of s.silences || []) {
+        if (Array.isArray(pair) && pair.length >= 2) {
+          mergedSilences.push([
+            Math.round((s.start_offset + Number(pair[0])) * 1000) / 1000,
+            Math.round((s.start_offset + Number(pair[1])) * 1000) / 1000,
+          ]);
+        }
+      }
+      offset += dur;
+      if (i < active.length - 1) {
+        mergedSilences.push([
+          Math.round((offset - 0.02) * 1000) / 1000,
+          Math.round((offset + gapSec + 0.02) * 1000) / 1000,
+        ]);
+        offset += gapSec;
+      }
+    }
+    const totalDur = Math.round(offset * 1000) / 1000;
+    const label = active.length === 1 ? active[0].filename : active.map((s) => `VO${s.slot} (${s.filename})`).join(' + ');
+    const meta = {
+      path: active[0].path,
+      filename: label,
+      duration: totalDur,
+      kind: 'narration',
+      slots: active,
+      silences: mergedSilences,
+      local_only: true,
+    };
+    saveJson(pid, 'voiceover.json', meta);
+    return meta;
+  }
+
   if (active.length === 1) {
     const only = active[0];
     const dur = only.duration || (await probeDuration(only.path)) || 0;
@@ -1410,6 +1580,7 @@ async function handleVoiceoverFile(pid, slot, tempPath, origName) {
 app.post('/api/projects/:id/voiceover', upload.single('file'), async (req, res) => {
   try {
     const pid = req.params.id;
+    touchProjectClient(pid, req);
     const slot = Math.max(1, Math.min(10, parseInt(req.query.slot || req.body?.slot || '1', 10)));
     const root = projectRoot(pid);
     if (!fs.existsSync(root) || !req.file) return res.status(400).json({ detail: 'Missing VO file' });
@@ -1418,6 +1589,42 @@ app.post('/api/projects/:id/voiceover', upload.single('file'), async (req, res) 
     res.json(meta);
   } catch (e) {
     console.error('Voiceover upload error:', e);
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
+// Zero-upload Local-File Mode: registers VO slot duration & acoustic silence boundaries computed in browser
+app.post('/api/projects/:id/voiceover-meta', async (req, res) => {
+  try {
+    const pid = req.params.id;
+    touchProjectClient(pid, req);
+    const root = projectRoot(pid);
+    if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
+    const slot = Math.max(1, Math.min(10, parseInt(req.query.slot || req.body?.slot || '1', 10)));
+    const origName = path.basename(String(req.body?.filename || `vo_${slot}.mp3`));
+    const duration = Math.max(0.1, Number(req.body?.duration || 0));
+    const silences = Array.isArray(req.body?.silences) ? req.body.silences : [];
+    const localPath = String(req.body?.local_path || '').trim() || path.join(root, 'voiceover', `slot_${slot}_${origName}`);
+
+    const existing = loadJson(pid, 'voiceover.json') || {};
+    let slots = Array.isArray(existing.slots) ? [...existing.slots] : [];
+    slots = slots.filter((s) => Number(s.slot) !== slot);
+    slots.push({
+      slot,
+      filename: origName,
+      path: localPath,
+      duration: Math.round(duration * 1000) / 1000,
+      silences,
+      local_only: true,
+    });
+    const sm = loadJson(pid, 'script_meta.json');
+    if (sm && sm.imported_bundle) {
+      sm.imported_bundle = false;
+      saveJson(pid, 'script_meta.json', sm);
+    }
+    const meta = await rebuildMergedVo(pid, slots);
+    res.json(meta);
+  } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
 });
@@ -1466,6 +1673,29 @@ app.post('/api/projects/:id/poem-voiceover', upload.single('file'), async (req, 
   }
 });
 
+app.post('/api/projects/:id/poem-voiceover-meta', (req, res) => {
+  try {
+    const pid = req.params.id;
+    touchProjectClient(pid, req);
+    const root = projectRoot(pid);
+    if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
+    const origName = path.basename(String(req.body?.filename || 'poem.mp3'));
+    const duration = Math.max(0.1, Number(req.body?.duration || 0));
+    const localPath = String(req.body?.local_path || '').trim() || path.join(root, 'voiceover', `poem_${origName}`);
+    const meta = {
+      path: localPath,
+      filename: origName,
+      duration: Math.round(duration * 1000) / 1000,
+      kind: 'poem',
+      local_only: true,
+    };
+    saveJson(pid, 'poem_voiceover.json', meta);
+    res.json(meta);
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
 app.get('/api/projects/:id/audio/:kind', (req, res) => {
   const { id, kind } = req.params;
   const meta = loadJson(id, kind === 'poem' ? 'poem_voiceover.json' : 'voiceover.json');
@@ -1504,6 +1734,28 @@ app.post('/api/projects/:id/logo', upload.single('file'), (req, res) => {
   }
 });
 
+app.post('/api/projects/:id/logo-meta', (req, res) => {
+  try {
+    const pid = req.params.id;
+    touchProjectClient(pid, req);
+    const root = projectRoot(pid);
+    if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
+    const origName = path.basename(String(req.body?.filename || 'logo.png'));
+    const localPath = String(req.body?.local_path || '').trim() || path.join(root, 'logo', origName);
+    const meta = { path: localPath, filename: origName, enabled: true, local_only: true };
+    saveJson(pid, 'logo.json', meta);
+    const tl = loadJson(pid, 'timeline.json');
+    if (tl) {
+      tl.logo_path = localPath;
+      tl.logo_enabled = true;
+      saveJson(pid, 'timeline.json', tl);
+    }
+    res.json(meta);
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
 app.post('/api/projects/:id/logo/toggle', (req, res) => {
   const pid = req.params.id;
   const enabled = String(req.query.enabled) !== 'false';
@@ -1527,6 +1779,7 @@ app.get('/api/projects/:id/logo-file', (req, res) => {
 app.post('/api/projects/:id/build', async (req, res) => {
   try {
     const pid = req.params.id;
+    touchProjectClient(pid, req);
     const scenes = loadJson(pid, 'script.json') || [];
     // Refresh cleanVoText for production_xlsx scenes (e.g., "Read exact on-screen text")
     let changedVo = false;
@@ -1562,8 +1815,11 @@ app.post('/api/projects/:id/build', async (req, res) => {
           c.media_path = primary.path;
           c.kind = primary.kind;
           c.fit = primary.kind === 'video' ? 'trim' : 'hold';
-        } else if (c.media_path && !fs.existsSync(c.media_path)) {
-          c.fit = 'missing';
+        } else {
+          const matchedExisting = media.find((m) => m.id === c.media_id || m.path === c.media_path);
+          if (!matchedExisting && (!c.media_path || !fs.existsSync(c.media_path))) {
+            c.fit = 'missing';
+          }
         }
         if (s) {
           const isInst = isInstrumentalScene(s);
@@ -1582,7 +1838,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
 
       const qaIssues = [];
       for (const c of existingTl.clips) {
-        if (c.fit === 'missing' || !c.media_path || !fs.existsSync(c.media_path)) {
+        const matchedExisting = media.find((m) => m.id === c.media_id || m.path === c.media_path);
+        if (c.fit === 'missing' || !c.media_path || (!matchedExisting && !fs.existsSync(c.media_path))) {
           const mNum = String(c.screen || '').match(/(\d+)$/);
           const imgNo = mNum ? parseInt(mNum[1], 10) : null;
           const sSec = Math.max(0, Math.floor(Number(c.start || 0)));
@@ -1611,11 +1868,35 @@ app.post('/api/projects/:id/build', async (req, res) => {
       return res.json(existingTl);
     }
 
+    // Auto-heal voMeta.duration === 0 or missing silences if VO file exists on disk
+    if (voMeta.path && fs.existsSync(voMeta.path)) {
+      if (!voMeta.duration || Number(voMeta.duration) <= 0) {
+        const healedDur = await probeDuration(voMeta.path);
+        if (healedDur > 0) {
+          voMeta.duration = healedDur;
+          if (Array.isArray(voMeta.slots) && voMeta.slots.length === 1) {
+            voMeta.slots[0].duration = healedDur;
+            voMeta.slots[0].end_offset = Number(voMeta.slots[0].start_offset || 0) + healedDur;
+          }
+          saveJson(pid, 'voiceover.json', voMeta);
+        }
+      }
+      if (!Array.isArray(voMeta.silences) || !voMeta.silences.length) {
+        const detected = await detectSilences(voMeta.path);
+        if (detected.length) {
+          voMeta.silences = detected;
+          saveJson(pid, 'voiceover.json', voMeta);
+        }
+      }
+    }
+
     const voDur = Number(voMeta.duration || 0);
     const poemVoDur = Number(poemVoMeta.duration || 0);
-    const hasPoemVo = Boolean(poemVoMeta.path && fs.existsSync(poemVoMeta.path));
+    const hasPoemVo = Boolean((poemVoMeta.path && fs.existsSync(poemVoMeta.path)) || poemVoDur > 0);
     const indic = isIndicScript(scenes);
-    const silences = voMeta.path && fs.existsSync(voMeta.path) ? await detectSilences(voMeta.path) : [];
+    const silences = Array.isArray(voMeta.silences) && voMeta.silences.length
+      ? voMeta.silences
+      : [];
 
     // Separate scenes into spoken narration vs poem/instrumental so poem scenes do not eat narration VO
     // Note: For Marathi/Indic chapters without a separate Poem VO (!hasPoemVo), poem lyrics live inside the narration VO!
@@ -1729,8 +2010,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
 
       const dur = Math.round(clipDur * 1000) / 1000;
       const { video, image } = pickMediaForScreen(s.screen, media, s.visual_direction || s.visual_type);
-      const primary = video && image ? image : (image || video);
-      const extraVid = video && image ? video : null;
+      // Prefer the animated scene video over static slide image when both exist for the same scene,
+      // and NEVER append a separate unaligned 10s silent "Action Video" clip that interrupts VO playback!
+      const primary = video || image;
+      const extraVid = null;
       const capTxt = isInst ? '' : (s.voiceover_text || s.onscreen_text || '');
 
       if (!primary) {
@@ -1802,8 +2085,9 @@ app.post('/api/projects/:id/build', async (req, res) => {
         }
       }
 
-      // End-of-line question pause hold (e.g. "[4-Second Pause]") — holds visual without advancing narrCursor
-      const qPause = questionPauseSeconds(s);
+      // End-of-line question pause hold: only insert synthetic silent holds when NO voiceover recording is present.
+      // When a real VO recording is present (voDur > 1), the speaker's audio already contains the natural pauses!
+      const qPause = voDur > 1 ? 0 : questionPauseSeconds(s);
       if (qPause > 0) {
         const pDur = Math.round(qPause * 1000) / 1000;
         rawClips.push({
@@ -2471,6 +2755,95 @@ app.post('/api/projects/:id/scenes/:screen/voiceover', upload.single('file'), as
     const origName = path.basename(req.file.originalname || `${screen}.mp3`);
     const payload = await handleSceneVoFile(id, screen, req.file.path, origName, req.query || {});
     res.json(payload);
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
+// Zero-upload Local-File Mode: updates a scene's VO duration & ripples timeline without uploading audio bytes
+app.post('/api/projects/:id/scenes/:screen/voiceover-meta', (req, res) => {
+  try {
+    const { id, screen } = req.params;
+    const root = projectRoot(id);
+    if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
+    const origName = path.basename(String(req.body?.filename || `${screen}.mp3`));
+    const newDur = Math.max(0.2, Math.round(Number(req.body?.duration || 2.0) * 1000) / 1000);
+    const localPath = String(req.body?.local_path || '').trim() || path.join(root, 'voiceover', 'scenes', origName);
+
+    const scenes = loadJson(id, 'script.json') || [];
+    let spokenText = String(req.body?.voiceover_text || '').trim();
+    for (const s of scenes) {
+      if (s.screen === screen) {
+        if (spokenText) {
+          s.voiceover_text = spokenText;
+          s.voiceover_raw = spokenText;
+        }
+        if (req.body?.onscreen_text && String(req.body.onscreen_text).trim()) {
+          s.onscreen_text = String(req.body.onscreen_text).trim();
+        }
+        const combined = [s.onscreen_text, s.voiceover_text].filter(Boolean).join(' — ').trim();
+        if (combined) s.text = combined;
+        s.duration = newDur;
+        if (!spokenText) spokenText = s.voiceover_text || s.text || '';
+      }
+    }
+    saveJson(id, 'script.json', scenes);
+
+    const tl = loadJson(id, 'timeline.json');
+    const voMeta = loadJson(id, 'voiceover.json') || {};
+    if (tl && Array.isArray(tl.clips) && tl.clips.length) {
+      let clipIdx = tl.clips.findIndex((c) => c.screen === screen && c.narration_in != null && c.narration_out != null);
+      if (clipIdx < 0) clipIdx = tl.clips.findIndex((c) => c.screen === screen);
+      if (clipIdx >= 0) {
+        const clip = tl.clips[clipIdx];
+        const oldIn = clip.narration_in != null ? Number(clip.narration_in) : Number(clip.start || 0);
+        const oldOut = clip.narration_out != null ? Number(clip.narration_out) : (Number(clip.start || 0) + Number(clip.duration || 2.0));
+        const oldSpokenDur = Math.max(0.1, oldOut - oldIn);
+        const deltaNarr = Math.round((newDur - oldSpokenDur) * 1000) / 1000;
+        const oldClipDur = Number(clip.end || 0) - Number(clip.start || 0);
+        const extraHold = Math.max(0, oldClipDur - oldSpokenDur);
+        const newClipDur = Math.max(0.4, Math.round((newDur + extraHold) * 1000) / 1000);
+        const deltaTl = Math.round((newClipDur - oldClipDur) * 1000) / 1000;
+
+        clip.narration_in = Math.round(oldIn * 1000) / 1000;
+        clip.narration_out = Math.round((oldIn + newDur) * 1000) / 1000;
+        clip.end = Math.round((Number(clip.start || 0) + newClipDur) * 1000) / 1000;
+        clip.duration = newClipDur;
+        clip.custom_vo_path = localPath;
+        clip.custom_vo_filename = origName;
+        clip.custom_vo_duration = newDur;
+        if (spokenText) {
+          clip.vo_text = spokenText;
+          clip.caption_text = spokenText;
+          clip.script_text = spokenText;
+        }
+        for (let j = clipIdx + 1; j < tl.clips.length; j++) {
+          const nxt = tl.clips[j];
+          nxt.start = Math.round((Number(nxt.start || 0) + deltaTl) * 1000) / 1000;
+          nxt.end = Math.round((Number(nxt.end || 0) + deltaTl) * 1000) / 1000;
+          if (nxt.narration_in != null && Number(nxt.narration_in) >= oldOut - 0.08) {
+            nxt.narration_in = Math.round((Number(nxt.narration_in) + deltaNarr) * 1000) / 1000;
+          }
+          if (nxt.narration_out != null && Number(nxt.narration_out) >= oldOut - 0.08) {
+            nxt.narration_out = Math.round((Number(nxt.narration_out) + deltaNarr) * 1000) / 1000;
+          }
+        }
+        tl.total_duration = Math.round(Math.max(...tl.clips.map((c) => Number(c.end || 0))) * 1000) / 1000;
+        tl.srt_cues = buildSrtCues(tl.clips, tl);
+        saveJson(id, 'timeline.json', tl);
+      }
+    }
+    res.json({
+      ok: true,
+      screen,
+      filename: origName,
+      duration: newDur,
+      new_duration: newDur,
+      spoken_text: spokenText,
+      scenes,
+      voiceover: voMeta,
+      timeline: tl,
+    });
   } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
