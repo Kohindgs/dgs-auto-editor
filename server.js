@@ -146,6 +146,7 @@ function withMediaLock(fn) {
 // Container-safe FFmpeg runner: serializes media subprocesses, reaps sibling workers,
 // caps decoder/filtergraph/encoder threads to 1, and auto-retries on transient EAGAIN.
 async function runFfmpeg(rawArgs, customOpts = {}) {
+  const { skipReap = false, ...execOpts } = customOpts;
   return await withMediaLock(async () => {
     const args = ['-hide_banner', '-loglevel', 'error', '-filter_threads', '1', '-filter_complex_threads', '1'];
     for (let i = 0; i < rawArgs.length; i++) {
@@ -164,13 +165,15 @@ async function runFfmpeg(rawArgs, customOpts = {}) {
       }
     }
 
-    const reaped = reapExtraNodeWorkers(false);
-    if (reaped.length) await sleepMs(80);
+    if (!skipReap) {
+      const reaped = reapExtraNodeWorkers(false);
+      if (reaped.length) await sleepMs(80);
+    }
 
     let lastErr = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
       try {
-        return await execFileAsync(FFMPEG_BIN, args, { ...EXEC_OPTS, ...customOpts });
+        return await execFileAsync(FFMPEG_BIN, args, { ...EXEC_OPTS, ...execOpts });
       } catch (err) {
         lastErr = err;
         const msg = String((err && err.stderr) || (err && err.message) || '');
@@ -1589,6 +1592,11 @@ async function rebuildMergedVo(pid, slots) {
     only.end_offset = dur;
     const meta = { path: only.path, filename: only.filename, duration: dur, kind: 'narration', slots: active };
     saveJson(pid, 'voiceover.json', meta);
+    const tl = loadJson(pid, 'timeline.json');
+    if (tl && only.path && fs.existsSync(only.path)) {
+      tl.voiceover_path = only.path;
+      saveJson(pid, 'timeline.json', tl);
+    }
     return meta;
   }
 
@@ -1682,6 +1690,11 @@ async function rebuildMergedVo(pid, slots) {
   const label = active.map((s) => `VO${s.slot} (${s.filename})`).join(' + ');
   const meta = { path: mergedPath, filename: label, duration: totalDur, kind: 'narration', slots: active };
   saveJson(pid, 'voiceover.json', meta);
+  const tl = loadJson(pid, 'timeline.json');
+  if (tl && mergedPath && fs.existsSync(mergedPath)) {
+    tl.voiceover_path = mergedPath;
+    saveJson(pid, 'timeline.json', tl);
+  }
   return meta;
 }
 
@@ -1799,6 +1812,11 @@ async function handlePoemVoFile(pid, tempPath, origName) {
   const duration = (await probeDuration(dest)) || 0;
   const meta = { path: dest, filename: origName, duration, kind: 'poem' };
   saveJson(pid, 'poem_voiceover.json', meta);
+  const tl = loadJson(pid, 'timeline.json');
+  if (tl && dest && fs.existsSync(dest)) {
+    tl.poem_voiceover_path = dest;
+    saveJson(pid, 'timeline.json', tl);
+  }
   return meta;
 }
 
@@ -2427,22 +2445,70 @@ app.post('/api/projects/:id/build', async (req, res) => {
   }
 });
 
-app.put('/api/projects/:id/timeline', (req, res) => {
-  const pid = req.params.id;
-  const plan = req.body || {};
-  if (Array.isArray(plan.clips)) {
+async function healTimelinePaths(pid, plan) {
+  if (!plan) return plan;
+  const voMeta = loadJson(pid, 'voiceover.json') || {};
+  const poemVoMeta = loadJson(pid, 'poem_voiceover.json') || {};
+  const logoMeta = loadJson(pid, 'logo.json') || {};
+  const mediaItems = await reindexMedia(pid);
+
+  if (voMeta.path && !voMeta.local_only && fs.existsSync(voMeta.path)) {
+    plan.voiceover_path = voMeta.path;
+  }
+  if (poemVoMeta.path && !poemVoMeta.local_only && fs.existsSync(poemVoMeta.path)) {
+    plan.poem_voiceover_path = poemVoMeta.path;
+  }
+  if (logoMeta.path && !logoMeta.local_only && fs.existsSync(logoMeta.path)) {
+    plan.logo_path = logoMeta.path;
+    if (plan.logo_enabled === undefined) plan.logo_enabled = logoMeta.enabled !== false;
+  }
+
+  if (Array.isArray(plan.clips) && mediaItems.length) {
+    const byId = new Map(mediaItems.map((m) => [m.id, m]));
+    const byName = new Map(mediaItems.map((m) => [String(m.filename || '').toLowerCase(), m]));
     for (const c of plan.clips) {
-      c.duration = Math.max(0.2, Math.round((Number(c.end || 0) - Number(c.start || 0)) * 1000) / 1000);
-    }
-    if (plan.clips.length) {
-      plan.total_duration = Math.max(
-        Number(plan.total_duration || 0),
-        ...plan.clips.map((c) => Number(c.end || 0)),
-      );
+      if (!c.media_path || !fs.existsSync(c.media_path)) {
+        const baseName = path.basename(String(c.media_path || '')).toLowerCase();
+        const picked = pickMediaForScreen(c.screen, mediaItems, '');
+        const matched =
+          (c.media_id && byId.get(c.media_id)) ||
+          (baseName && byName.get(baseName)) ||
+          picked.video ||
+          picked.image ||
+          null;
+        if (matched && matched.path && fs.existsSync(matched.path)) {
+          c.media_id = matched.id;
+          c.media_path = matched.path;
+          c.kind = matched.kind;
+          if (c.fit === 'missing') c.fit = matched.kind === 'video' ? 'trim' : 'hold';
+        }
+      }
     }
   }
-  saveJson(pid, 'timeline.json', plan);
-  res.json(plan);
+  return plan;
+}
+
+app.put('/api/projects/:id/timeline', async (req, res) => {
+  try {
+    const pid = req.params.id;
+    const plan = req.body || {};
+    if (Array.isArray(plan.clips)) {
+      for (const c of plan.clips) {
+        c.duration = Math.max(0.2, Math.round((Number(c.end || 0) - Number(c.start || 0)) * 1000) / 1000);
+      }
+      if (plan.clips.length) {
+        plan.total_duration = Math.max(
+          Number(plan.total_duration || 0),
+          ...plan.clips.map((c) => Number(c.end || 0)),
+        );
+      }
+    }
+    await healTimelinePaths(pid, plan);
+    saveJson(pid, 'timeline.json', plan);
+    res.json(plan);
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
 });
 
 app.get('/api/projects/:id/srt/download', (req, res) => {
@@ -2476,25 +2542,94 @@ app.get('/api/projects/:id/export/status', (req, res) => {
   res.json(exportStatus[req.params.id] || { running: false, percent: 0, message: '' });
 });
 
-function buildVideoRateArgs(settings) {
+app.post('/api/projects/:id/export/cancel', (req, res) => {
+  const pid = req.params.id;
+  reapExtraNodeWorkers(true);
+  exportStatus[pid] = { running: false, cancelled: true, percent: 0, message: 'Export cancelled by user.' };
+  res.json({ ok: true, status: exportStatus[pid] });
+});
+
+function computeBitrateSummary(settings, totalDur = 0, actualSizeMb = null) {
+  const baseVideoKbps = Math.max(500, Number(settings.video_bitrate_kbps) || 20000);
+  const compActive = Boolean(settings.advanced_compression && settings.compression_mode !== 'none');
+  const compQuality = Math.max(10, Math.min(95, Number(settings.compression_quality) || 70));
+  const keepRatio = compActive ? Math.max(0.05, (100 - compQuality) / 100.0) : 1.0;
+  const targetVideoKbps = compActive
+    ? Math.max(400, Math.round(baseVideoKbps * keepRatio))
+    : baseVideoKbps;
+  const audioKbps = settings.export_video_only
+    ? 0
+    : settings.audio_encoder === 'pcm'
+      ? 1411
+      : Number(settings.audio_bitrate_kbps) || 320;
+  const targetTotalKbps = targetVideoKbps + audioKbps;
+  const actualTotalKbps =
+    actualSizeMb && totalDur > 0 ? Math.round((actualSizeMb * 8192) / totalDur) : null;
+  const actualVideoKbps =
+    actualTotalKbps != null ? Math.max(100, actualTotalKbps - audioKbps) : null;
+  let signalLevel = 'high';
+  let signalLabel = 'Studio Master HD';
+  if (targetVideoKbps >= 15000) {
+    signalLevel = 'master';
+    signalLabel = 'Broadcast / Master HD';
+  } else if (targetVideoKbps >= 5000) {
+    signalLevel = 'optimal';
+    signalLabel = 'Optimal Classroom & Web HD';
+  } else if (targetVideoKbps >= 2500) {
+    signalLevel = 'balanced';
+    signalLabel = 'Compact / Balanced Stream';
+  } else {
+    signalLevel = 'low';
+    signalLabel = 'High Compression / Low Bitrate';
+  }
+  return {
+    base_video_kbps: baseVideoKbps,
+    target_video_kbps: targetVideoKbps,
+    target_video_mbps: Math.round((targetVideoKbps / 1000) * 100) / 100,
+    audio_kbps: audioKbps,
+    target_total_kbps: targetTotalKbps,
+    target_total_mbps: Math.round((targetTotalKbps / 1000) * 100) / 100,
+    actual_total_kbps: actualTotalKbps,
+    actual_video_kbps: actualVideoKbps,
+    bitrate_mode: String(settings.bitrate_mode || 'vbr').toUpperCase(),
+    compression_active: compActive,
+    compression_quality: compQuality,
+    compression_mode: settings.compression_mode || 'by_quality',
+    signal_level: signalLevel,
+    signal_label: signalLabel,
+  };
+}
+
+function buildVideoRateArgs(settings, fps = 30) {
   const encMap = { h264: 'libx264', h265: 'libx265', mpeg4: 'mpeg4' };
   const vcodec = encMap[settings.encoder] || 'libx264';
-  const presetMap = { low: 'veryfast', medium: 'fast', high: 'medium' };
-  const x264Preset = presetMap[settings.quality_preset] || 'fast';
   const colorSpace = settings.color_space === 'bt601'
     ? ['-colorspace', 'smpte170m', '-color_primaries', 'smpte170m', '-color_trc', 'smpte170m']
     : ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'];
 
+  const gop = Math.max(24, Math.round((Number(fps) || 30) * 2));
+  const minGop = Math.max(12, Math.round(Number(fps) || 30));
+
   let base = ['-c:v', vcodec];
   if (vcodec === 'libx264') {
-    base.push('-preset', x264Preset, '-x264-params', 'threads=1:lookahead-threads=1:sync-lookahead=0:sliced-threads=1');
+    base.push(
+      '-preset', 'ultrafast',
+      '-tune', 'stillimage',
+      '-profile:v', 'high',
+      '-level', '4.1',
+      '-g', String(gop),
+      '-keyint_min', String(minGop),
+      '-sc_threshold', '0',
+      '-bf', '0',
+      '-x264-params', `threads=1:lookahead-threads=1:sync-lookahead=0:sliced-threads=1:ref=1:bframes=0:scenecut=0:repeat-headers=1:keyint=${gop}:min-keyint=${minGop}`,
+    );
   } else if (vcodec === 'libx265') {
-    base.push('-preset', x264Preset, '-x265-params', 'pools=none:frame-threads=1');
+    base.push('-preset', 'ultrafast', '-x265-params', 'pools=none:frame-threads=1:bframes=0:ref=1:repeat-headers=1');
   }
   base.push('-pix_fmt', 'yuv420p', ...colorSpace);
 
-  const q = Math.max(10, Math.min(90, Number(settings.compression_quality) || 70));
-  const keepRatio = (100 - q) / 100.0;
+  const q = Math.max(10, Math.min(95, Number(settings.compression_quality) || 70));
+  const keepRatio = Math.max(0.05, (100 - q) / 100.0);
   let effectiveKbps = Math.max(500, Number(settings.video_bitrate_kbps) || 20000);
 
   if (settings.advanced_compression && settings.compression_mode === 'by_quality') {
@@ -2506,6 +2641,13 @@ function buildVideoRateArgs(settings) {
     effectiveKbps = capKbps;
   } else if (settings.advanced_compression && settings.compression_mode === 'by_bitrate') {
     effectiveKbps = Math.max(300, Math.round(effectiveKbps * keepRatio));
+    if (vcodec === 'libx264' || vcodec === 'libx265') {
+      const crf = effectiveKbps >= 10000 ? 20 : effectiveKbps >= 5000 ? 23 : effectiveKbps >= 2500 ? 26 : 29;
+      return [...base, '-crf', String(crf), '-maxrate', `${effectiveKbps}k`, '-bufsize', `${effectiveKbps * 2}k`];
+    }
+  } else if (settings.bitrate_mode !== 'cbr' && (vcodec === 'libx264' || vcodec === 'libx265')) {
+    const baseCrf = settings.quality_preset === 'low' ? 26 : settings.quality_preset === 'medium' ? 22 : 19;
+    return [...base, '-crf', String(baseCrf), '-maxrate', `${effectiveKbps}k`, '-bufsize', `${effectiveKbps * 2}k`];
   }
 
   const br = `${effectiveKbps}k`;
@@ -2530,279 +2672,407 @@ function buildAudioEncodeArgs(settings) {
 
 app.post('/api/projects/:id/export', async (req, res) => {
   const pid = req.params.id;
-  const plan = loadJson(pid, 'timeline.json');
+  let plan = loadJson(pid, 'timeline.json');
   if (!plan || !plan.clips || !plan.clips.length) {
     return res.status(400).json({ detail: 'Build timeline before export' });
   }
+  plan = await healTimelinePaths(pid, plan);
+  saveJson(pid, 'timeline.json', plan);
+
+  if (exportStatus[pid] && exportStatus[pid].running) {
+    return res.json({
+      started: true,
+      running: true,
+      async: true,
+      ...exportStatus[pid],
+    });
+  }
+
   const settings = { ...SUNDHARAM_BR, ...(req.body?.settings || {}) };
   const rawTitle = String(req.body?.title || 'Export').trim();
   const safeTitle = rawTitle.replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
+  const totalTlDur = Math.max(1, Number(plan.total_duration || 10));
+  const initialBitrateInfo = computeBitrateSummary(settings, totalTlDur, null);
 
-  exportStatus[pid] = { running: true, percent: 4, message: 'Preparing server FFmpeg render…' };
-  try {
-    const [wStr, hStr] = String(settings.resolution || '1920x1080').toLowerCase().replace('*', 'x').split('x');
-    const width = parseInt(wStr, 10) || 1920;
-    const height = parseInt(hStr, 10) || 1080;
-    const fps = Number(settings.fps) || 30;
+  exportStatus[pid] = {
+    running: true,
+    percent: 4,
+    message: `Preparing FFmpeg render (${initialBitrateInfo.target_video_kbps} kbps ${initialBitrateInfo.bitrate_mode})…`,
+    bitrate_info: initialBitrateInfo,
+  };
 
-    const jobDir = path.join(EXPORTS_DIR, pid, `job_${Date.now()}`);
-    const partsDir = path.join(jobDir, 'parts');
-    fs.mkdirSync(partsDir, { recursive: true });
+  const runExportJob = async () => {
+    let jobDir = null;
+    try {
+      reapExtraNodeWorkers(false);
+      const [wStr, hStr] = String(settings.resolution || '1920x1080').toLowerCase().replace('*', 'x').split('x');
+      const width = parseInt(wStr, 10) || 1920;
+      const height = parseInt(hStr, 10) || 1080;
+      const fps = Number(settings.fps) || 30;
 
-    // Use zero-thread intermediate MPEG-4 (q=2) for temp scene parts & logo pass
-    const intermediateCodec = ['-c:v', 'mpeg4', '-q:v', '2', '-pix_fmt', 'yuv420p', '-an'];
+      jobDir = path.join(EXPORTS_DIR, pid, `job_${Date.now()}`);
+      const partsDir = path.join(jobDir, 'parts');
+      fs.mkdirSync(partsDir, { recursive: true });
 
-    const partFiles = [];
-    for (let i = 0; i < plan.clips.length; i++) {
-      const c = plan.clips[i];
-      const clipDur = Math.max(0.2, Number(c.duration) || (Number(c.end || 0) - Number(c.start || 0)) || 2.0);
-      exportStatus[pid] = {
-        running: true,
-        percent: 5 + Math.round((i / plan.clips.length) * 68),
-        message: `Rendering scene ${i + 1}/${plan.clips.length} (${c.screen})…`,
-      };
-      const outPart = path.join(partsDir, `part_${String(i).padStart(4, '0')}.mp4`);
-      const vfBase = `scale=${width}:${height}:force_original_aspect_ratio=decrease:threads=1,format=yuv420p,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${fps}`;
+      const vRateArgs = buildVideoRateArgs(settings, fps);
+      const vRateFallbackArgs = buildVideoRateArgs({ ...settings, encoder: 'mpeg4' }, fps);
+      let activeVRateArgs = vRateArgs;
+      const aEncArgs = buildAudioEncodeArgs(settings);
+      const ext = ['mp4', 'mov', 'mkv', 'avi', 'mp3', 'wav'].includes(String(settings.format || '').toLowerCase())
+        ? String(settings.format).toLowerCase()
+        : 'mp4';
+      const outPath = path.join(EXPORTS_DIR, pid, `${safeTitle}.${ext}`);
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      const movFlags = ext === 'mp4' || ext === 'mov' ? ['-movflags', '+faststart'] : [];
 
-      if (!c.media_path || !fs.existsSync(c.media_path) || c.fit === 'missing') {
-        await runFfmpeg([
-          '-y', '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:d=${clipDur}:r=${fps}`,
-          '-t', String(clipDur), ...intermediateCodec, outPart,
-        ]);
-      } else if (c.kind === 'image') {
-        await runFfmpeg([
-          '-y', '-loop', '1', '-framerate', '1', '-i', c.media_path,
-          '-t', String(clipDur), '-vf', vfBase,
-          ...intermediateCodec, outPart,
-        ]);
-      } else {
-        // Video clip: if source video is shorter than slot duration, freeze last frame with tpad
-        const srcIn = Number(c.source_in || 0);
-        const rawSrcDur = (c.source_out && Number(c.source_out) > srcIn)
-          ? (Number(c.source_out) - srcIn)
-          : ((await probeDuration(c.media_path)) || clipDur);
-        const playDur = Math.min(clipDur, Math.max(0.1, rawSrcDur));
-        const freeze = Math.max(0, clipDur - playDur);
-        const vfVideo = freeze > 0.05
-          ? `${vfBase},tpad=stop_mode=clone:stop_duration=${freeze.toFixed(3)}`
-          : vfBase;
-        await runFfmpeg([
-          '-y', '-ss', String(srcIn), '-i', c.media_path,
-          '-t', String(clipDur), '-vf', vfVideo,
-          ...intermediateCodec, outPart,
-        ]);
-      }
-      partFiles.push(outPart);
-    }
+      const hasVo = Boolean(plan.voiceover_path && fs.existsSync(plan.voiceover_path) && !settings.export_video_only);
+      const hasPoem = Boolean(
+        plan.poem_voiceover_path &&
+        fs.existsSync(plan.poem_voiceover_path) &&
+        plan.has_poem &&
+        !settings.export_video_only,
+      );
 
-    exportStatus[pid] = { running: true, percent: 76, message: 'Stitching video scenes…' };
-    const concatTxt = path.join(jobDir, 'concat.txt');
-    fs.writeFileSync(concatTxt, partFiles.map((p) => `file '${p.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n'), 'utf-8');
-    const silentMp4 = path.join(jobDir, 'silent.mp4');
-    await runFfmpeg([
-      '-y', '-f', 'concat', '-safe', '0', '-i', concatTxt, '-c', 'copy', silentMp4,
-    ]);
-
-    let videoSource = silentMp4;
-    if (plan.logo_path && plan.logo_enabled !== false && fs.existsSync(plan.logo_path)) {
-      exportStatus[pid] = { running: true, percent: 82, message: 'Applying client logo overlay…' };
-      const logoMp4 = path.join(jobDir, 'logo.mp4');
-      const logoW = Math.max(90, Math.round(width * 0.1));
-      const padX = Math.max(8, Math.round(width * 0.0078));
-      const padY = Math.max(10, Math.round(height * 0.0176));
-      await runFfmpeg([
-        '-y', '-i', silentMp4, '-i', plan.logo_path,
-        '-filter_complex', `[1:v]scale=${logoW}:-1:threads=1[lg];[0:v][lg]overlay=W-w-${padX}:${padY}:format=auto,format=yuv420p[vout]`,
-        '-map', '[vout]', ...intermediateCodec, logoMp4,
-      ]);
-      videoSource = logoMp4;
-    }
-
-    exportStatus[pid] = { running: true, percent: 88, message: 'Encoding & syncing audio tracks…' };
-    const vRateArgs = buildVideoRateArgs(settings);
-    const vRateFallbackArgs = buildVideoRateArgs({ ...settings, encoder: 'mpeg4' });
-    const aEncArgs = buildAudioEncodeArgs(settings);
-    const ext = ['mp4', 'mov', 'mkv', 'avi', 'mp3', 'wav'].includes(String(settings.format || '').toLowerCase())
-      ? String(settings.format).toLowerCase()
-      : 'mp4';
-    const outPath = path.join(EXPORTS_DIR, pid, `${safeTitle}.${ext}`);
-    fs.mkdirSync(path.dirname(outPath), { recursive: true });
-    const movFlags = ext === 'mp4' || ext === 'mov' ? ['-movflags', '+faststart'] : [];
-
-    const hasVo = Boolean(plan.voiceover_path && fs.existsSync(plan.voiceover_path) && !settings.export_video_only);
-    const hasPoem = Boolean(
-      plan.poem_voiceover_path &&
-      fs.existsSync(plan.poem_voiceover_path) &&
-      plan.has_poem &&
-      !settings.export_video_only,
-    );
-
-    if (ext === 'mp3' || ext === 'wav') {
-      const srcAudio = plan.voiceover_path || plan.poem_voiceover_path;
-      if (srcAudio && fs.existsSync(srcAudio)) {
-        await runFfmpeg(['-y', '-i', srcAudio, ...aEncArgs, outPath], { timeout: 600000 });
-      }
-    } else if (hasVo || hasPoem) {
-      // Step A: Build synchronized audio track in an audio-only (-vn) pass to minimize container threads
-      const narrRuns = [];
-      for (const c of plan.clips) {
-        if (c.narration_in == null || c.narration_out == null) continue;
-        const ni = Number(c.narration_in);
-        const no = Number(c.narration_out);
-        if (no <= ni + 0.05) continue;
-        const cs = Number(c.start || 0);
-        if (narrRuns.length) {
-          const prev = narrRuns[narrRuns.length - 1];
-          const prevTlEnd = prev[0] + (prev[2] - prev[1]);
-          if (Math.abs(cs - prevTlEnd) < 0.15 && Math.abs(ni - prev[2]) < 0.15) {
-            prev[2] = no;
-            continue;
-          }
+      if (ext === 'mp3' || ext === 'wav') {
+        const srcAudio = plan.voiceover_path || plan.poem_voiceover_path;
+        if (srcAudio && fs.existsSync(srcAudio)) {
+          await runFfmpeg(['-y', '-i', srcAudio, ...aEncArgs, outPath], { timeout: 600000, skipReap: true });
         }
-        narrRuns.push([cs, ni, no]);
-      }
+      } else {
+        // Pre-scale logo ONCE so it is composited on each scene without a second full-video re-encode pass
+        const useLogo = Boolean(
+          plan.logo_path &&
+          plan.logo_enabled !== false &&
+          settings.include_logo !== false &&
+          fs.existsSync(plan.logo_path),
+        );
+        const logoW = Math.max(90, Math.round(width * 0.1));
+        const padX = Math.max(8, Math.round(width * 0.0078));
+        const padY = Math.max(10, Math.round(height * 0.0176));
+        let logoScaledPath = null;
+        if (useLogo) {
+          const candidateLogo = path.join(jobDir, 'logo_scaled.png');
+          try {
+            await runFfmpeg(['-y', '-i', plan.logo_path, '-vf', `scale=${logoW}:-1`, candidateLogo], { skipReap: true });
+            if (fs.existsSync(candidateLogo)) logoScaledPath = candidateLogo;
+          } catch {}
+        }
 
-      const audioInputs = [];
-      const filterParts = [];
-      const mixLabels = [];
-      let nextAudioIdx = 0;
+        const partFiles = [];
+        const commonOutArgs = ['-r', String(fps), '-video_track_timescale', '90000', '-an'];
 
-      if (hasVo) {
-        const voIdx = nextAudioIdx++;
-        audioInputs.push('-i', plan.voiceover_path);
-        if (narrRuns.length) {
-          for (let rIdx = 0; rIdx < narrRuns.length; rIdx++) {
-            const [tlStart, voIn, voOut] = narrRuns[rIdx];
-            const delayMs = Math.max(0, Math.round(tlStart * 1000));
-            const lbl = `nr${rIdx}`;
+        const encodeSceneWithCodec = async (c, clipDur, outPart, codecArgs) => {
+          const totalFrames = Math.max(1, Math.round(clipDur * fps));
+          const loopCount = Math.max(0, totalFrames - 1);
+          const scalePad = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p`;
+
+          if (!c.media_path || !fs.existsSync(c.media_path) || c.fit === 'missing') {
+            if (logoScaledPath) {
+              const fg = `[0:v][1:v]overlay=W-w-${padX}:${padY}:format=auto,format=yuv420p,loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
+              await runFfmpeg([
+                '-y', '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:r=${fps}:d=0.04`,
+                '-i', logoScaledPath,
+                '-filter_complex', fg, '-map', '[vout]',
+                '-frames:v', String(totalFrames),
+                ...codecArgs, ...commonOutArgs, outPart,
+              ], { skipReap: true });
+            } else {
+              await runFfmpeg([
+                '-y', '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:r=${fps}:d=${clipDur.toFixed(3)}`,
+                '-frames:v', String(totalFrames),
+                ...codecArgs, ...commonOutArgs, outPart,
+              ], { skipReap: true });
+            }
+          } else if (c.kind === 'image') {
+            // Decode still image ONCE, scale/pad/logo 1 frame, then loop in memory for ultra-fast P_SKIP encoding
+            if (logoScaledPath) {
+              const fg = `[0:v]${scalePad}[bg];[bg][1:v]overlay=W-w-${padX}:${padY}:format=auto,format=yuv420p,loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
+              await runFfmpeg([
+                '-y', '-i', c.media_path, '-i', logoScaledPath,
+                '-filter_complex', fg, '-map', '[vout]',
+                '-frames:v', String(totalFrames),
+                ...codecArgs, ...commonOutArgs, outPart,
+              ], { skipReap: true });
+            } else {
+              const vfImg = `${scalePad},loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)`;
+              await runFfmpeg([
+                '-y', '-i', c.media_path,
+                '-vf', vfImg,
+                '-frames:v', String(totalFrames),
+                ...codecArgs, ...commonOutArgs, outPart,
+              ], { skipReap: true });
+            }
+          } else {
+            const srcIn = Number(c.source_in || 0);
+            const rawSrcDur = (c.source_out && Number(c.source_out) > srcIn)
+              ? (Number(c.source_out) - srcIn)
+              : ((await probeDuration(c.media_path)) || clipDur);
+            const playDur = Math.min(clipDur, Math.max(0.1, rawSrcDur));
+            const freeze = Math.max(0, clipDur - playDur);
+            const vfVidBase = freeze > 0.05
+              ? `${scalePad},fps=${fps},tpad=stop_mode=clone:stop_duration=${freeze.toFixed(3)}`
+              : `${scalePad},fps=${fps}`;
+            if (logoScaledPath) {
+              const fgVid = `[0:v]${vfVidBase}[bg];[bg][1:v]overlay=W-w-${padX}:${padY}:eof_action=repeat:format=auto,format=yuv420p[vout]`;
+              await runFfmpeg([
+                '-y', '-ss', String(srcIn), '-i', c.media_path, '-i', logoScaledPath,
+                '-t', String(clipDur), '-filter_complex', fgVid, '-map', '[vout]',
+                ...codecArgs, ...commonOutArgs, outPart,
+              ], { skipReap: true });
+            } else {
+              await runFfmpeg([
+                '-y', '-ss', String(srcIn), '-i', c.media_path,
+                '-t', String(clipDur), '-vf', vfVidBase,
+                ...codecArgs, ...commonOutArgs, outPart,
+              ], { skipReap: true });
+            }
+          }
+        };
+
+        for (let i = 0; i < plan.clips.length; i++) {
+          if (exportStatus[pid]?.cancelled) throw new Error('Export cancelled');
+          const c = plan.clips[i];
+          const clipDur = Math.max(0.2, Number(c.duration) || (Number(c.end || 0) - Number(c.start || 0)) || 2.0);
+          exportStatus[pid] = {
+            running: true,
+            percent: 5 + Math.round(((i + 1) / plan.clips.length) * 76),
+            message: `Rendering scene ${i + 1}/${plan.clips.length} (${c.screen} · ${initialBitrateInfo.target_video_kbps} kbps)…`,
+            bitrate_info: initialBitrateInfo,
+          };
+          const outPart = path.join(partsDir, `part_${String(i).padStart(4, '0')}.mp4`);
+          try {
+            await encodeSceneWithCodec(c, clipDur, outPart, activeVRateArgs);
+          } catch {
+            activeVRateArgs = vRateFallbackArgs;
+            await encodeSceneWithCodec(c, clipDur, outPart, activeVRateArgs);
+          }
+          partFiles.push(outPart);
+        }
+
+        const concatTxt = path.join(jobDir, 'concat.txt');
+        fs.writeFileSync(concatTxt, partFiles.map((p) => `file '${p.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n'), 'utf-8');
+
+        let mixedAudioPath = null;
+        if (hasVo || hasPoem) {
+          exportStatus[pid] = {
+            running: true,
+            percent: 86,
+            message: `Syncing & encoding audio (${initialBitrateInfo.audio_kbps} kbps)…`,
+            bitrate_info: initialBitrateInfo,
+          };
+          // Merge consecutive clips with continuous timeline-to-VO offset so a continuous VO is processed as 1 run
+          const narrRuns = [];
+          for (const c of plan.clips) {
+            if (c.narration_in == null || c.narration_out == null) continue;
+            const ni = Number(c.narration_in);
+            const no = Number(c.narration_out);
+            if (no <= ni + 0.05) continue;
+            const cs = Number(c.start || 0);
+            if (narrRuns.length) {
+              const prev = narrRuns[narrRuns.length - 1];
+              const prevOffset = prev[0] - prev[1];
+              const curOffset = cs - ni;
+              const prevTlEnd = prev[0] + (prev[2] - prev[1]);
+              if (ni >= prev[2] - 0.25 && Math.abs(curOffset - prevOffset) < 0.45 && (cs - prevTlEnd) < 4.5) {
+                prev[2] = Math.max(prev[2], no);
+                continue;
+              }
+            }
+            narrRuns.push([cs, ni, no]);
+          }
+
+          const audioInputs = [];
+          const filterParts = [];
+          const mixLabels = [];
+          let nextAudioIdx = 0;
+
+          if (hasVo) {
+            if (narrRuns.length <= 1) {
+              const voIdx = nextAudioIdx++;
+              audioInputs.push('-i', plan.voiceover_path);
+              if (narrRuns.length === 1) {
+                const [tlStart, voIn, voOut] = narrRuns[0];
+                const delayMs = Math.max(0, Math.round(tlStart * 1000));
+                if (delayMs > 20 || voIn > 0.05) {
+                  filterParts.push(
+                    `[${voIdx}:a]atrim=${voIn.toFixed(3)}:${voOut.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs},aformat=sample_rates=44100:channel_layouts=stereo[nr_main]`,
+                  );
+                } else {
+                  filterParts.push(
+                    `[${voIdx}:a]atrim=0:${Math.max(voOut, totalTlDur).toFixed(3)},asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo[nr_main]`,
+                  );
+                }
+              } else {
+                filterParts.push(`[${voIdx}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo[nr_main]`);
+              }
+              mixLabels.push('[nr_main]');
+            } else {
+              // Build sequential concat chain across narration runs using separate -ss/-t inputs so [0:a] is never split into 90 amix FIFOs
+              const concatLbls = [];
+              let cursor = 0;
+              let segIdx = 0;
+              const cappedRuns = narrRuns.slice(0, 24);
+              for (let rIdx = 0; rIdx < cappedRuns.length; rIdx++) {
+                const [tlStart, voIn, voOut] = cappedRuns[rIdx];
+                const segDur = Math.max(0.08, voOut - voIn);
+                if (tlStart > cursor + 0.04) {
+                  const gapDur = tlStart - cursor;
+                  const glbl = `ngap${segIdx++}`;
+                  filterParts.push(`anullsrc=r=44100:cl=stereo,atrim=0:${gapDur.toFixed(3)},asetpts=PTS-STARTPTS[${glbl}]`);
+                  concatLbls.push(`[${glbl}]`);
+                }
+                const inIdx = nextAudioIdx++;
+                audioInputs.push('-ss', voIn.toFixed(3), '-t', segDur.toFixed(3), '-i', plan.voiceover_path);
+                const slbl = `nseg${segIdx++}`;
+                filterParts.push(`[${inIdx}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo[${slbl}]`);
+                concatLbls.push(`[${slbl}]`);
+                cursor = Math.max(cursor, tlStart) + segDur;
+              }
+              filterParts.push(`${concatLbls.join('')}concat=n=${concatLbls.length}:v=0:a=1[nr_main]`);
+              mixLabels.push('[nr_main]');
+            }
+          }
+
+          if (hasPoem) {
+            const poemIdx = nextAudioIdx++;
+            audioInputs.push('-i', plan.poem_voiceover_path);
+            const pStart = Number(plan.poem_start_time || 0);
+            const pEnd = Number(plan.poem_end_time || 0);
+            const pDur = Math.max(0.5, pEnd - pStart);
+            const pDelayMs = Math.max(0, Math.round(pStart * 1000));
             filterParts.push(
-              `[${voIdx}:a]atrim=${voIn.toFixed(3)}:${voOut.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs}[${lbl}]`,
+              `[${poemIdx}:a]atrim=0:${pDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${pDelayMs}|${pDelayMs},aformat=sample_rates=44100:channel_layouts=stereo[poem]`,
             );
-            mixLabels.push(`[${lbl}]`);
+            mixLabels.push('[poem]');
+          }
+
+          let filterComplex = '';
+          if (mixLabels.length === 1) {
+            filterComplex = `${filterParts.join(';')};${mixLabels[0]}apad=whole_dur=${totalTlDur.toFixed(3)}[aout]`;
+          } else {
+            filterComplex = `${filterParts.join(';')};${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:dropout_transition=0,volume=${mixLabels.length},apad=whole_dur=${totalTlDur.toFixed(3)}[aout]`;
+          }
+
+          const audioExt = settings.audio_encoder === 'mp3' ? 'mp3' : settings.audio_encoder === 'pcm' ? 'wav' : 'm4a';
+          mixedAudioPath = path.join(jobDir, `mixed_audio.${audioExt}`);
+          await runFfmpeg([
+            '-y',
+            ...audioInputs,
+            '-filter_complex', filterComplex,
+            '-map', '[aout]',
+            '-vn',
+            ...aEncArgs,
+            '-t', totalTlDur.toFixed(3),
+            mixedAudioPath,
+          ], { timeout: 300000, skipReap: true });
+        }
+
+        exportStatus[pid] = {
+          running: true,
+          percent: 95,
+          message: 'Finalizing & multiplexing MP4 container…',
+          bitrate_info: initialBitrateInfo,
+        };
+
+        if (mixedAudioPath && fs.existsSync(mixedAudioPath)) {
+          try {
+            await runFfmpeg([
+              '-y',
+              '-f', 'concat', '-safe', '0', '-i', concatTxt,
+              '-i', mixedAudioPath,
+              '-map', '0:v:0', '-map', '1:a:0',
+              '-c', 'copy',
+              ...movFlags,
+              outPath,
+            ], { timeout: 180000, skipReap: true });
+          } catch {
+            await runFfmpeg([
+              '-y',
+              '-f', 'concat', '-safe', '0', '-i', concatTxt,
+              '-i', mixedAudioPath,
+              '-map', '0:v:0', '-map', '1:a:0',
+              ...activeVRateArgs,
+              '-c:a', 'copy',
+              ...movFlags,
+              outPath,
+            ], { timeout: 600000, skipReap: true });
           }
         } else {
-          filterParts.push(`[${voIdx}:a]asetpts=PTS-STARTPTS[nr0]`);
-          mixLabels.push('[nr0]');
+          await runFfmpeg([
+            '-y',
+            '-f', 'concat', '-safe', '0', '-i', concatTxt,
+            '-c', 'copy',
+            '-an',
+            ...movFlags,
+            outPath,
+          ], { timeout: 180000, skipReap: true });
         }
       }
 
-      if (hasPoem) {
-        const poemIdx = nextAudioIdx++;
-        audioInputs.push('-i', plan.poem_voiceover_path);
-        const pStart = Number(plan.poem_start_time || 0);
-        const pEnd = Number(plan.poem_end_time || 0);
-        const pDur = Math.max(0.5, pEnd - pStart);
-        const pDelayMs = Math.max(0, Math.round(pStart * 1000));
-        filterParts.push(
-          `[${poemIdx}:a]atrim=0:${pDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${pDelayMs}|${pDelayMs}[poem]`,
-        );
-        mixLabels.push('[poem]');
+      if (settings.export_srt_sidecar) {
+        const cues = plan.srt_cues && plan.srt_cues.length ? plan.srt_cues : buildSrtCues(plan.clips || [], plan);
+        const srtSidecarPath = path.join(EXPORTS_DIR, pid, `${safeTitle}.srt`);
+        fs.writeFileSync(srtSidecarPath, formatSrt(cues), 'utf-8');
       }
 
-      const totalTlDur = Math.max(1, Number(plan.total_duration || 10));
-      let filterComplex = '';
-      if (mixLabels.length === 1) {
-        filterComplex = `${filterParts.join(';')};${mixLabels[0]}apad=whole_dur=${totalTlDur.toFixed(3)}[aout]`;
-      } else {
-        filterComplex = `${filterParts.join(';')};${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:dropout_transition=0,volume=${mixLabels.length},apad=whole_dur=${totalTlDur.toFixed(3)}[aout]`;
-      }
+      try { if (jobDir) fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
 
-      const audioExt = settings.audio_encoder === 'mp3' ? 'mp3' : settings.audio_encoder === 'pcm' ? 'wav' : 'm4a';
-      const mixedAudioPath = path.join(jobDir, `mixed_audio.${audioExt}`);
-      await runFfmpeg([
-        '-y',
-        ...audioInputs,
-        '-filter_complex', filterComplex,
-        '-map', '[aout]',
-        '-vn',
-        ...aEncArgs,
-        '-t', totalTlDur.toFixed(3),
-        mixedAudioPath,
-      ], { timeout: 300000 });
-
-      // Step B: Encode video-only track with target compression settings (with zero-thread MPEG-4 fallback if container LVE blocks x264)
-      exportStatus[pid] = { running: true, percent: 93, message: 'Applying video compression…' };
-      const encodedVideoPath = path.join(jobDir, 'video_encoded.mp4');
-      try {
-        await runFfmpeg([
-          '-y',
-          '-i', videoSource,
-          ...vRateArgs,
-          '-an',
-          '-t', totalTlDur.toFixed(3),
-          encodedVideoPath,
-        ], { timeout: 600000 });
-      } catch {
-        await runFfmpeg([
-          '-y',
-          '-i', videoSource,
-          ...vRateFallbackArgs,
-          '-an',
-          '-t', totalTlDur.toFixed(3),
-          encodedVideoPath,
-        ], { timeout: 600000 });
-      }
-
-      // Step C: Ultra-lightweight stream-copy mux of encoded video + synced audio
-      exportStatus[pid] = { running: true, percent: 97, message: 'Finalizing MP4 container…' };
-      await runFfmpeg([
-        '-y',
-        '-i', encodedVideoPath,
-        '-i', mixedAudioPath,
-        '-map', '0:v:0', '-map', '1:a:0',
-        '-c', 'copy',
-        ...movFlags,
-        outPath,
-      ], { timeout: 120000 });
-    } else {
-      try {
-        await runFfmpeg([
-          '-y',
-          '-i', videoSource,
-          ...vRateArgs,
-          '-an',
-          ...movFlags,
-          outPath,
-        ], { timeout: 600000 });
-      } catch {
-        await runFfmpeg([
-          '-y',
-          '-i', videoSource,
-          ...vRateFallbackArgs,
-          '-an',
-          ...movFlags,
-          outPath,
-        ], { timeout: 600000 });
-      }
+      const sizeMb = Math.round((fs.statSync(outPath).size / (1024 * 1024)) * 100) / 100;
+      const finalBitrateInfo = computeBitrateSummary(settings, totalTlDur, sizeMb);
+      const payload = {
+        path: outPath,
+        saved_to: path.basename(outPath),
+        filename: path.basename(outPath),
+        size_mb: sizeMb,
+        bitrate_info: finalBitrateInfo,
+        settings,
+        title: rawTitle,
+        download: `/api/projects/${pid}/download`,
+        srt_download: `/api/projects/${pid}/srt/download?title=${encodeURIComponent(rawTitle)}`,
+      };
+      saveJson(pid, 'last_export.json', payload);
+      exportStatus[pid] = {
+        running: false,
+        done: true,
+        percent: 100,
+        message: `Export completed! (${sizeMb} MB · ${finalBitrateInfo.target_video_kbps} kbps ${finalBitrateInfo.bitrate_mode})`,
+        ...payload,
+      };
+      return payload;
+    } catch (e) {
+      try { if (jobDir) fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
+      const errMsg = String((e && e.stderr) || (e && e.message) || e).slice(0, 400);
+      exportStatus[pid] = {
+        running: false,
+        error: errMsg,
+        percent: 0,
+        message: `Export error: ${errMsg}`,
+        bitrate_info: initialBitrateInfo,
+      };
+      throw e;
     }
+  };
 
-    // Write sidecar SRT alongside export if requested
-    if (settings.export_srt_sidecar) {
-      const cues = plan.srt_cues && plan.srt_cues.length ? plan.srt_cues : buildSrtCues(plan.clips || [], plan);
-      const srtSidecarPath = path.join(EXPORTS_DIR, pid, `${safeTitle}.srt`);
-      fs.writeFileSync(srtSidecarPath, formatSrt(cues), 'utf-8');
+  if (req.body?.wait === true) {
+    try {
+      const payload = await runExportJob();
+      return res.json(payload);
+    } catch (e) {
+      return res.status(500).json({ detail: String((e && e.stderr) || (e && e.message) || e) });
     }
-
-    try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
-
-    const sizeMb = Math.round((fs.statSync(outPath).size / (1024 * 1024)) * 100) / 100;
-    const payload = {
-      path: outPath,
-      saved_to: '',
-      filename: path.basename(outPath),
-      size_mb: sizeMb,
-      settings,
-      title: rawTitle,
-      download: `/api/projects/${pid}/download`,
-      srt_download: `/api/projects/${pid}/srt/download?title=${encodeURIComponent(rawTitle)}`,
-    };
-    saveJson(pid, 'last_export.json', payload);
-    exportStatus[pid] = { running: false, percent: 100, message: 'Export completed!', ...payload };
-    res.json(payload);
-  } catch (e) {
-    exportStatus[pid] = { running: false, percent: 0, message: String(e) };
-    res.status(500).json({ detail: String(e) });
   }
+
+  // Non-blocking background execution so LiteSpeed / Cloudflare proxy never times out on 60s+ renders
+  void runExportJob().catch((err) => {
+    console.error(`Async export error for project ${pid}:`, err);
+  });
+  return res.json({
+    started: true,
+    running: true,
+    async: true,
+    status_url: `/api/projects/${pid}/export/status`,
+    bitrate_info: initialBitrateInfo,
+  });
 });
 
 app.get('/api/projects/:id/download', (req, res) => {
@@ -4482,6 +4752,11 @@ app.post('/api/projects/:id/collect', async (req, res) => {
 
   collectStatus[pid] = { running: true, percent: 10, message: 'Packing Filmora 15 .wfpbundle & media…' };
   try {
+    let plan = loadJson(pid, 'timeline.json');
+    if (plan) {
+      plan = await healTimelinePaths(pid, plan);
+      saveJson(pid, 'timeline.json', plan);
+    }
     const outDir = path.join(EXPORTS_DIR, pid);
     fs.mkdirSync(outDir, { recursive: true });
     const extSuffix = mode === 'wfpbundle' ? 'wfpbundle' : 'zip';
