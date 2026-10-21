@@ -31,7 +31,17 @@ try {
 } catch {}
 
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, 'data');
+// Store project data outside hbuilds/versions/<uuid> on Hostinger so redeployments never wipe projects
+function resolvePersistentDataDir() {
+  if (process.env.DGS_DATA_DIR) return process.env.DGS_DATA_DIR;
+  const norm = ROOT.replace(/\\/g, '/');
+  const hbuildsIdx = norm.indexOf('/hbuilds/');
+  if (hbuildsIdx > 0) {
+    return path.join(norm.slice(0, hbuildsIdx), 'dgs_data');
+  }
+  return path.join(ROOT, 'data');
+}
+const DATA_DIR = resolvePersistentDataDir();
 const PROJECTS_DIR = path.join(DATA_DIR, 'projects');
 const EXPORTS_DIR = path.join(DATA_DIR, 'exports');
 const PRESETS_FILE = path.join(DATA_DIR, 'presets.json');
@@ -1623,5 +1633,5 @@ if (fs.existsSync(PUBLIC_DIR)) {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`DGS Auto Editor Cloud Server running on port ${PORT} (FFmpeg: ${FFMPEG_BIN})`);
+  console.log(`DGS Auto Editor Cloud Server running on port ${PORT} (Data: ${DATA_DIR} | FFmpeg: ${FFMPEG_BIN})`);
 });
