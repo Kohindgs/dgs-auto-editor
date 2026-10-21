@@ -144,11 +144,11 @@ function withMediaLock(fn) {
 }
 
 // Container-safe FFmpeg runner: serializes media subprocesses, reaps sibling workers,
-// caps decoder/filtergraph/encoder threads to 1, and auto-retries on transient EAGAIN.
+// uses bounded slice threads (safe within CloudLinux NPROC), and auto-retries on transient EAGAIN.
 async function runFfmpeg(rawArgs, customOpts = {}) {
   const { skipReap = false, ...execOpts } = customOpts;
   return await withMediaLock(async () => {
-    const args = ['-hide_banner', '-loglevel', 'error', '-filter_threads', '1', '-filter_complex_threads', '1'];
+    const args = ['-hide_banner', '-loglevel', 'error', '-filter_threads', '2', '-filter_complex_threads', '2'];
     for (let i = 0; i < rawArgs.length; i++) {
       const a = rawArgs[i];
       if (a === '-hide_banner') continue;
@@ -157,9 +157,9 @@ async function runFfmpeg(rawArgs, customOpts = {}) {
         continue;
       }
       if (a === '-i') {
-        args.push('-threads', '1', '-thread_type', 'slice', '-i');
+        args.push('-threads', '2', '-thread_type', 'slice', '-i');
       } else if (i === rawArgs.length - 1 && !String(a).startsWith('-')) {
-        args.push('-threads', '1', '-thread_type', 'slice', a);
+        args.push('-threads', '3', '-thread_type', 'slice', a);
       } else {
         args.push(a);
       }
@@ -2607,24 +2607,23 @@ function buildVideoRateArgs(settings, fps = 30) {
     ? ['-colorspace', 'smpte170m', '-color_primaries', 'smpte170m', '-color_trc', 'smpte170m']
     : ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'];
 
-  const gop = Math.max(24, Math.round((Number(fps) || 30) * 2));
-  const minGop = Math.max(12, Math.round(Number(fps) || 30));
+  const gop = Math.max(60, Math.round((Number(fps) || 30) * 6));
+  const minGop = Math.max(15, Math.round(Number(fps) || 30));
 
   let base = ['-c:v', vcodec];
   if (vcodec === 'libx264') {
     base.push(
       '-preset', 'ultrafast',
-      '-tune', 'stillimage',
       '-profile:v', 'high',
       '-level', '4.1',
       '-g', String(gop),
       '-keyint_min', String(minGop),
       '-sc_threshold', '0',
       '-bf', '0',
-      '-x264-params', `threads=1:lookahead-threads=1:sync-lookahead=0:sliced-threads=1:ref=1:bframes=0:scenecut=0:repeat-headers=1:keyint=${gop}:min-keyint=${minGop}`,
+      '-x264-params', `threads=3:lookahead-threads=1:sync-lookahead=0:sliced-threads=1:cabac=1:ref=1:bframes=0:scenecut=0:repeat-headers=1:keyint=${gop}:min-keyint=${minGop}`,
     );
   } else if (vcodec === 'libx265') {
-    base.push('-preset', 'ultrafast', '-x265-params', 'pools=none:frame-threads=1:bframes=0:ref=1:repeat-headers=1');
+    base.push('-preset', 'ultrafast', '-x265-params', 'pools=none:frame-threads=2:bframes=0:ref=1:repeat-headers=1');
   }
   base.push('-pix_fmt', 'yuv420p', ...colorSpace);
 
@@ -2873,7 +2872,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
               const prevOffset = prev[0] - prev[1];
               const curOffset = cs - ni;
               const prevTlEnd = prev[0] + (prev[2] - prev[1]);
-              if (ni >= prev[2] - 0.25 && Math.abs(curOffset - prevOffset) < 0.45 && (cs - prevTlEnd) < 4.5) {
+              if (ni >= prev[2] - 0.5 && Math.abs(curOffset - prevOffset) < 1.5 && (cs - prevTlEnd) < 6.0) {
                 prev[2] = Math.max(prev[2], no);
                 continue;
               }
