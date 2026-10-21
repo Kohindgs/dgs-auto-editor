@@ -59,26 +59,130 @@ const TICKS_PER_SEC = 10000000;
 const IMAGE_BASE_OFFSET_TICKS = 36000000000;
 const EXEC_OPTS = { timeout: 180000, maxBuffer: 50 * 1024 * 1024 };
 
-// Container-safe FFmpeg runner: caps decoder, filtergraph, and encoder threads to 1
-// so shared/containerized Linux environments never hit EAGAIN ("Resource temporarily unavailable")
-async function runFfmpeg(rawArgs, customOpts = {}) {
-  const args = ['-hide_banner', '-loglevel', 'error', '-filter_threads', '1', '-filter_complex_threads', '1'];
-  for (let i = 0; i < rawArgs.length; i++) {
-    const a = rawArgs[i];
-    if (a === '-hide_banner') continue;
-    if (a === '-loglevel') {
-      i++;
-      continue;
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getProcAncestors() {
+  const keep = new Set([process.pid, process.ppid]);
+  try {
+    let cur = process.ppid;
+    for (let depth = 0; depth < 10 && cur > 1; depth++) {
+      keep.add(cur);
+      const st = fs.readFileSync(`/proc/${cur}/status`, 'utf-8');
+      const m = st.match(/^PPid:\s*(\d+)/m);
+      if (!m) break;
+      cur = parseInt(m[1], 10);
     }
-    if (a === '-i') {
-      args.push('-threads', '1', '-i');
-    } else if (i === rawArgs.length - 1 && !String(a).startsWith('-')) {
-      args.push('-threads', '1', a);
-    } else {
-      args.push(a);
+  } catch {}
+  return keep;
+}
+
+function inspectContainerProcs() {
+  if (!fs.existsSync('/proc')) return [];
+  const myUid = typeof process.getuid === 'function' ? process.getuid() : null;
+  const list = [];
+  try {
+    for (const ent of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(ent)) continue;
+      const pid = parseInt(ent, 10);
+      try {
+        const st = fs.readFileSync(`/proc/${pid}/status`, 'utf-8');
+        if (myUid != null) {
+          const uidM = st.match(/^Uid:\s*(\d+)/m);
+          if (uidM && parseInt(uidM[1], 10) !== myUid) continue;
+        }
+        const nameM = st.match(/^Name:\s*(\S+)/m);
+        const ppidM = st.match(/^PPid:\s*(\d+)/m);
+        const thM = st.match(/^Threads:\s*(\d+)/m);
+        let cmd = '';
+        try {
+          cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ').trim();
+        } catch {}
+        list.push({
+          pid,
+          ppid: ppidM ? parseInt(ppidM[1], 10) : 0,
+          name: nameM ? nameM[1] : '',
+          threads: thM ? parseInt(thM[1], 10) : 1,
+          cmd: cmd.slice(0, 160),
+        });
+      } catch {}
+    }
+  } catch {}
+  return list;
+}
+
+// Reaps duplicate LiteSpeed/Passenger node worker processes or orphaned ffmpeg processes
+// so CloudLinux LVE thread limits (NPROC ~25-35) are never exhausted by idle sibling workers.
+function reapExtraNodeWorkers(killFfmpegToo = false) {
+  if (!fs.existsSync('/proc')) return [];
+  const keep = getProcAncestors();
+  const procs = inspectContainerProcs();
+  const killed = [];
+  for (const p of procs) {
+    if (keep.has(p.pid)) continue;
+    const lowName = p.name.toLowerCase();
+    const lowCmd = p.cmd.toLowerCase();
+    const isSiblingNode = lowName.includes('node') || lowName.includes('lsnode') || lowCmd.includes('server.js') || lowCmd.includes('lsnode');
+    const isOrphanMedia = killFfmpegToo && (lowName.includes('ffmpeg') || lowName.includes('ffprobe'));
+    if (isSiblingNode || isOrphanMedia) {
+      try {
+        process.kill(p.pid, 'SIGKILL');
+        killed.push(p);
+      } catch {}
     }
   }
-  return await execFileAsync(FFMPEG_BIN, args, { ...EXEC_OPTS, ...customOpts });
+  return killed;
+}
+
+let mediaLockChain = Promise.resolve();
+function withMediaLock(fn) {
+  const next = mediaLockChain.then(() => fn(), () => fn());
+  mediaLockChain = next.catch(() => {});
+  return next;
+}
+
+// Container-safe FFmpeg runner: serializes media subprocesses, reaps sibling workers,
+// caps decoder/filtergraph/encoder threads to 1, and auto-retries on transient EAGAIN.
+async function runFfmpeg(rawArgs, customOpts = {}) {
+  return await withMediaLock(async () => {
+    const args = ['-hide_banner', '-loglevel', 'error', '-filter_threads', '1', '-filter_complex_threads', '1'];
+    for (let i = 0; i < rawArgs.length; i++) {
+      const a = rawArgs[i];
+      if (a === '-hide_banner') continue;
+      if (a === '-loglevel') {
+        i++;
+        continue;
+      }
+      if (a === '-i') {
+        args.push('-threads', '1', '-thread_type', 'slice', '-i');
+      } else if (i === rawArgs.length - 1 && !String(a).startsWith('-')) {
+        args.push('-threads', '1', '-thread_type', 'slice', a);
+      } else {
+        args.push(a);
+      }
+    }
+
+    const reaped = reapExtraNodeWorkers(false);
+    if (reaped.length) await sleepMs(80);
+
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        return await execFileAsync(FFMPEG_BIN, args, { ...EXEC_OPTS, ...customOpts });
+      } catch (err) {
+        lastErr = err;
+        const msg = String((err && err.stderr) || (err && err.message) || '');
+        if (/pthread_create|Resource temporarily unavailable|EAGAIN/i.test(msg) && attempt < 5) {
+          reapExtraNodeWorkers(true);
+          await sleepMs(350 * attempt);
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr;
+  });
 }
 
 const SUNDHARAM_BR = {
@@ -230,31 +334,35 @@ function detectScreens(filename, parentName = '') {
 
 async function probeDuration(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return null;
-  try {
-    const { stdout } = await execFileAsync(FFPROBE_BIN, [
-      '-v', 'error',
-      '-show_entries', 'format=duration',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
-      filePath,
-    ], { timeout: 25000, maxBuffer: 20 * 1024 * 1024 });
-    const v = parseFloat(String(stdout).trim());
-    if (Number.isFinite(v) && v > 0) return Math.round(v * 1000) / 1000;
-  } catch {}
-  // Fallback: parse Duration from ffmpeg -i stderr
-  try {
-    await execFileAsync(FFMPEG_BIN, ['-hide_banner', '-i', filePath], {
-      timeout: 20000,
-      maxBuffer: 20 * 1024 * 1024,
-    });
-  } catch (err) {
-    const stderr = String((err && err.stderr) || (err && err.message) || '');
-    const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i);
-    if (m) {
-      const sec = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
-      if (Number.isFinite(sec) && sec > 0) return Math.round(sec * 1000) / 1000;
+  return await withMediaLock(async () => {
+    const reaped = reapExtraNodeWorkers(false);
+    if (reaped.length) await sleepMs(60);
+    try {
+      const { stdout } = await execFileAsync(FFPROBE_BIN, [
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        filePath,
+      ], { timeout: 25000, maxBuffer: 20 * 1024 * 1024 });
+      const v = parseFloat(String(stdout).trim());
+      if (Number.isFinite(v) && v > 0) return Math.round(v * 1000) / 1000;
+    } catch {}
+    // Fallback: parse Duration from ffmpeg -i stderr
+    try {
+      await execFileAsync(FFMPEG_BIN, ['-hide_banner', '-threads', '1', '-i', filePath], {
+        timeout: 20000,
+        maxBuffer: 20 * 1024 * 1024,
+      });
+    } catch (err) {
+      const stderr = String((err && err.stderr) || (err && err.message) || '');
+      const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i);
+      if (m) {
+        const sec = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+        if (Number.isFinite(sec) && sec > 0) return Math.round(sec * 1000) / 1000;
+      }
     }
-  }
-  return null;
+    return null;
+  });
 }
 
 async function reindexMedia(pid) {
@@ -597,29 +705,33 @@ function isSpokenVo(scene, opts = {}) {
 
 async function detectSilences(audioPath) {
   if (!audioPath || !fs.existsSync(audioPath)) return [];
-  try {
-    const { stderr } = await execFileAsync(FFMPEG_BIN, [
-      '-hide_banner', '-nostats', '-filter_threads', '1',
-      '-threads', '1', '-i', audioPath,
-      '-af', 'silencedetect=noise=-34dB:d=0.18',
-      '-threads', '1', '-f', 'null', '-',
-    ], { timeout: 90000, maxBuffer: 50 * 1024 * 1024 });
-    const silences = [];
-    let curStart = null;
-    for (const line of String(stderr).split(/\r?\n/)) {
-      const ms = line.match(/silence_start:\s*([0-9.]+)/);
-      if (ms) curStart = parseFloat(ms[1]);
-      const me = line.match(/silence_end:\s*([0-9.]+)/);
-      if (me && curStart != null) {
-        const end = parseFloat(me[1]);
-        if (end > curStart) silences.push([curStart, end]);
-        curStart = null;
+  return await withMediaLock(async () => {
+    const reaped = reapExtraNodeWorkers(false);
+    if (reaped.length) await sleepMs(60);
+    try {
+      const { stderr } = await execFileAsync(FFMPEG_BIN, [
+        '-hide_banner', '-nostats', '-filter_threads', '1',
+        '-threads', '1', '-thread_type', 'slice', '-i', audioPath,
+        '-af', 'silencedetect=noise=-34dB:d=0.18',
+        '-threads', '1', '-f', 'null', '-',
+      ], { timeout: 90000, maxBuffer: 50 * 1024 * 1024 });
+      const silences = [];
+      let curStart = null;
+      for (const line of String(stderr).split(/\r?\n/)) {
+        const ms = line.match(/silence_start:\s*([0-9.]+)/);
+        if (ms) curStart = parseFloat(ms[1]);
+        const me = line.match(/silence_end:\s*([0-9.]+)/);
+        if (me && curStart != null) {
+          const end = parseFloat(me[1]);
+          if (end > curStart) silences.push([curStart, end]);
+          curStart = null;
+        }
       }
+      return silences;
+    } catch {
+      return [];
     }
-    return silences;
-  } catch {
-    return [];
-  }
+  });
 }
 
 function normScreenId(screen) {
@@ -1743,6 +1855,21 @@ app.get('/api/projects/:id/srt/download', (req, res) => {
   res.send(srt);
 });
 
+app.get('/api/health', (req, res) => {
+  const reaped = reapExtraNodeWorkers(false);
+  const procs = inspectContainerProcs();
+  res.json({
+    ok: true,
+    pid: process.pid,
+    ppid: process.ppid,
+    reaped_count: reaped.length,
+    reaped,
+    proc_count: procs.length,
+    total_threads: procs.reduce((acc, p) => acc + (p.threads || 1), 0),
+    procs,
+  });
+});
+
 app.get('/api/projects/:id/export/status', (req, res) => {
   res.json(exportStatus[req.params.id] || { running: false, percent: 0, message: '' });
 });
@@ -1758,7 +1885,7 @@ function buildVideoRateArgs(settings) {
 
   let base = ['-c:v', vcodec];
   if (vcodec === 'libx264') {
-    base.push('-preset', x264Preset, '-x264-params', 'threads=1:sync-lookahead=0:sliced-threads=1');
+    base.push('-preset', x264Preset, '-x264-params', 'threads=1:lookahead-threads=1:sync-lookahead=0:sliced-threads=1');
   } else if (vcodec === 'libx265') {
     base.push('-preset', x264Preset, '-x265-params', 'pools=none:frame-threads=1');
   }
@@ -1820,6 +1947,9 @@ app.post('/api/projects/:id/export', async (req, res) => {
     const partsDir = path.join(jobDir, 'parts');
     fs.mkdirSync(partsDir, { recursive: true });
 
+    // Use zero-thread intermediate MPEG-4 (q=2) for temp scene parts & logo pass
+    const intermediateCodec = ['-c:v', 'mpeg4', '-q:v', '2', '-pix_fmt', 'yuv420p', '-an'];
+
     const partFiles = [];
     for (let i = 0; i < plan.clips.length; i++) {
       const c = plan.clips[i];
@@ -1831,18 +1961,17 @@ app.post('/api/projects/:id/export', async (req, res) => {
       };
       const outPart = path.join(partsDir, `part_${String(i).padStart(4, '0')}.mp4`);
       const vfBase = `scale=${width}:${height}:force_original_aspect_ratio=decrease:threads=1,format=yuv420p,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${fps}`;
-      const x264SingleThread = ['-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:sync-lookahead=0:sliced-threads=1', '-crf', '18', '-pix_fmt', 'yuv420p', '-an'];
 
       if (!c.media_path || !fs.existsSync(c.media_path) || c.fit === 'missing') {
         await runFfmpeg([
           '-y', '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:d=${clipDur}:r=${fps}`,
-          '-t', String(clipDur), ...x264SingleThread, outPart,
+          '-t', String(clipDur), ...intermediateCodec, outPart,
         ]);
       } else if (c.kind === 'image') {
         await runFfmpeg([
-          '-y', '-loop', '1', '-framerate', String(fps), '-i', c.media_path,
+          '-y', '-loop', '1', '-framerate', '1', '-i', c.media_path,
           '-t', String(clipDur), '-vf', vfBase,
-          ...x264SingleThread, outPart,
+          ...intermediateCodec, outPart,
         ]);
       } else {
         // Video clip: if source video is shorter than slot duration, freeze last frame with tpad
@@ -1858,7 +1987,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
         await runFfmpeg([
           '-y', '-ss', String(srcIn), '-i', c.media_path,
           '-t', String(clipDur), '-vf', vfVideo,
-          ...x264SingleThread, outPart,
+          ...intermediateCodec, outPart,
         ]);
       }
       partFiles.push(outPart);
@@ -1882,13 +2011,14 @@ app.post('/api/projects/:id/export', async (req, res) => {
       await runFfmpeg([
         '-y', '-i', silentMp4, '-i', plan.logo_path,
         '-filter_complex', `[1:v]scale=${logoW}:-1:threads=1[lg];[0:v][lg]overlay=W-w-${padX}:${padY}:format=auto,format=yuv420p[vout]`,
-        '-map', '[vout]', '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:sync-lookahead=0:sliced-threads=1', '-crf', '18', '-an', logoMp4,
+        '-map', '[vout]', ...intermediateCodec, logoMp4,
       ]);
       videoSource = logoMp4;
     }
 
     exportStatus[pid] = { running: true, percent: 88, message: 'Encoding & syncing audio tracks…' };
     const vRateArgs = buildVideoRateArgs(settings);
+    const vRateFallbackArgs = buildVideoRateArgs({ ...settings, encoder: 'mpeg4' });
     const aEncArgs = buildAudioEncodeArgs(settings);
     const ext = ['mp4', 'mov', 'mkv', 'avi', 'mp3', 'wav'].includes(String(settings.format || '').toLowerCase())
       ? String(settings.format).toLowerCase()
@@ -1988,17 +2118,28 @@ app.post('/api/projects/:id/export', async (req, res) => {
         mixedAudioPath,
       ], { timeout: 300000 });
 
-      // Step B: Encode video-only track with target compression settings
+      // Step B: Encode video-only track with target compression settings (with zero-thread MPEG-4 fallback if container LVE blocks x264)
       exportStatus[pid] = { running: true, percent: 93, message: 'Applying video compression…' };
       const encodedVideoPath = path.join(jobDir, 'video_encoded.mp4');
-      await runFfmpeg([
-        '-y',
-        '-i', videoSource,
-        ...vRateArgs,
-        '-an',
-        '-t', totalTlDur.toFixed(3),
-        encodedVideoPath,
-      ], { timeout: 600000 });
+      try {
+        await runFfmpeg([
+          '-y',
+          '-i', videoSource,
+          ...vRateArgs,
+          '-an',
+          '-t', totalTlDur.toFixed(3),
+          encodedVideoPath,
+        ], { timeout: 600000 });
+      } catch {
+        await runFfmpeg([
+          '-y',
+          '-i', videoSource,
+          ...vRateFallbackArgs,
+          '-an',
+          '-t', totalTlDur.toFixed(3),
+          encodedVideoPath,
+        ], { timeout: 600000 });
+      }
 
       // Step C: Ultra-lightweight stream-copy mux of encoded video + synced audio
       exportStatus[pid] = { running: true, percent: 97, message: 'Finalizing MP4 container…' };
@@ -2012,14 +2153,25 @@ app.post('/api/projects/:id/export', async (req, res) => {
         outPath,
       ], { timeout: 120000 });
     } else {
-      await runFfmpeg([
-        '-y',
-        '-i', videoSource,
-        ...vRateArgs,
-        '-an',
-        ...movFlags,
-        outPath,
-      ], { timeout: 600000 });
+      try {
+        await runFfmpeg([
+          '-y',
+          '-i', videoSource,
+          ...vRateArgs,
+          '-an',
+          ...movFlags,
+          outPath,
+        ], { timeout: 600000 });
+      } catch {
+        await runFfmpeg([
+          '-y',
+          '-i', videoSource,
+          ...vRateFallbackArgs,
+          '-an',
+          ...movFlags,
+          outPath,
+        ], { timeout: 600000 });
+      }
     }
 
     // Write sidecar SRT alongside export if requested
