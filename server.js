@@ -113,7 +113,7 @@ function inspectContainerProcs() {
 }
 
 // Reaps duplicate LiteSpeed/Passenger node worker processes or orphaned ffmpeg processes
-// so CloudLinux LVE thread limits (NPROC ~25-35) are never exhausted by idle sibling workers.
+// so CloudLinux LVE thread limits (NPROC) are never exhausted by idle sibling workers.
 function reapExtraNodeWorkers(killFfmpegToo = false) {
   if (!fs.existsSync('/proc')) return [];
   const keep = getProcAncestors();
@@ -123,9 +123,10 @@ function reapExtraNodeWorkers(killFfmpegToo = false) {
     if (keep.has(p.pid)) continue;
     const lowName = p.name.toLowerCase();
     const lowCmd = p.cmd.toLowerCase();
-    const isSiblingNode = lowName.includes('node') || lowName.includes('lsnode') || lowCmd.includes('server.js') || lowCmd.includes('lsnode');
+    const isSiblingEditorNode = lowCmd.includes('editor.dgeniussolutions.com') && (lowName.includes('node') || lowName.includes('lsnode'));
+    const isEmergencyNode = killFfmpegToo && (lowName.includes('lsnode') || lowCmd.includes('lsnode.js'));
     const isOrphanMedia = killFfmpegToo && (lowName.includes('ffmpeg') || lowName.includes('ffprobe'));
-    if (isSiblingNode || isOrphanMedia) {
+    if (isSiblingEditorNode || isEmergencyNode || isOrphanMedia) {
       try {
         process.kill(p.pid, 'SIGKILL');
         killed.push(p);
@@ -1076,6 +1077,20 @@ app.get('/api/projects/recent', (req, res) => {
 app.post('/api/projects', (req, res) => {
   const pid = createProject();
   res.json({ project_id: pid });
+});
+
+app.delete('/api/projects/:id', (req, res) => {
+  const pid = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!pid) return res.status(400).json({ detail: 'Invalid project id' });
+  try {
+    const pDir = projectRoot(pid);
+    const eDir = path.join(EXPORTS_DIR, pid);
+    if (fs.existsSync(pDir)) fs.rmSync(pDir, { recursive: true, force: true });
+    if (fs.existsSync(eDir)) fs.rmSync(eDir, { recursive: true, force: true });
+    res.json({ ok: true, deleted: pid });
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
 });
 
 app.get('/api/projects/:id/load', (req, res) => {
