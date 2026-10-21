@@ -1416,6 +1416,7 @@ app.get('/api/projects/:id/media-file/:mediaId', (req, res) => {
   if (!item || !item.path || !fs.existsSync(item.path)) {
     return res.status(404).json({ detail: 'Media file not found' });
   }
+  res.setHeader('Cache-Control', 'public, max-age=86400');
   res.sendFile(path.resolve(item.path));
 });
 
@@ -1426,6 +1427,7 @@ app.get('/api/projects/:id/media-thumb/:mediaId', async (req, res) => {
   if (!item || !item.path || !fs.existsSync(item.path)) {
     return res.status(404).json({ detail: 'Media not found' });
   }
+  res.setHeader('Cache-Control', 'public, max-age=86400');
   if (item.kind === 'image') {
     return res.sendFile(path.resolve(item.path));
   }
