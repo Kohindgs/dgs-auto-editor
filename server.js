@@ -3444,290 +3444,211 @@ function inflateRawJson(buf) {
   }
 }
 
-// Filmora 15 C++ userData helpers
+// Filmora 15.6.4 C++ userData helpers ({ data, key, size })
 function udInt32(val, key) {
   const b = Buffer.alloc(4);
   b.writeInt32LE(Number(val) | 0, 0);
-  return { data: b.toString('base64'), key, type: 2 };
+  return { data: b.toString('base64'), key, size: 4 };
 }
 function udUint32(val, key) {
   const b = Buffer.alloc(4);
   b.writeUInt32LE(Number(val) >>> 0, 0);
-  return { data: b.toString('base64'), key, type: 3 };
+  return { data: b.toString('base64'), key, size: 4 };
 }
 function udFloat32(val, key) {
   const b = Buffer.alloc(4);
   b.writeFloatLE(Number(val) || 0, 0);
-  return { data: b.toString('base64'), key, type: 4 };
+  return { data: b.toString('base64'), key, size: 4 };
 }
 function udFloat64(val, key) {
   const b = Buffer.alloc(8);
   b.writeDoubleLE(Number(val) || 0, 0);
-  return { data: b.toString('base64'), key, type: 5 };
+  return { data: b.toString('base64'), key, size: 8 };
 }
 function udStr(text, key, nullTerm = false) {
   const raw = Buffer.from(nullTerm ? `${text}\0` : String(text), 'utf-8');
-  return { data: raw.toString('base64'), key, type: 9 };
+  return { data: raw.toString('base64'), key, size: raw.length };
 }
 function udBytes(buf, key) {
-  return { data: Buffer.from(buf).toString('base64'), key, type: 10 };
+  const b = Buffer.from(buf);
+  return { data: b.toString('base64'), key, size: b.length };
 }
 function udGuid38(guidStr, key) {
   const raw = Buffer.from(String(guidStr).slice(0, 38).padEnd(38, '\0'), 'ascii');
-  return { data: raw.toString('base64'), key, type: 10 };
+  return { data: raw.toString('base64'), key, size: 38 };
 }
 function udGuid64(guidStr, key) {
   const raw = Buffer.alloc(64, 0);
   raw.write(String(guidStr).slice(0, 38), 0, 'ascii');
-  return { data: raw.toString('base64'), key, type: 10 };
+  return { data: raw.toString('base64'), key, size: 64 };
 }
 
-function imageMediaJson(absPath, mtimeSec, fileSize) {
+function imageMediaJson(absPath, mtimeSec = 0) {
   const p = normSlash(absPath);
-  const name = path.basename(p);
   return {
-    adjust_color_data_new: '',
-    ai_palette_property_info_data: '',
-    anchor_point: [0.0, 0.0],
-    attribute: 1,
-    audio_denoise_info: '',
-    audio_duck_info: '',
-    audio_info: null,
-    audio_voice_balance_info: '',
-    bModifyTitle: false,
-    built_in_color_type: -1,
-    cloud_file_download_state: 1,
-    cloud_file_type: -1,
-    cloud_from_type: -1,
-    composition_data: '',
-    compound_clip_version: 0,
-    custom_info: {},
-    custom_speed_Controller: '',
-    duration: 0,
-    file_create_time: mtimeSec,
-    file_modify_time: mtimeSec,
-    file_size: fileSize,
-    filename: p,
-    image_info: {
-      color_space: 0,
-      crop_bottom: 0.0,
-      crop_left: 0.0,
-      crop_right: 0.0,
-      crop_top: 0.0,
-      height: 1080,
-      orientation: 1,
-      raw_height: 1080,
-      raw_width: 1920,
-      rotation: 0,
-      size: fileSize,
-      stream_id: 200,
-      width: 1920,
+    version: '1.1.7',
+    file_name: p,
+    sourceInfo: {
+      basicInfo: {
+        streamType: 5,
+        fourCC: 541544016,
+        mediaLength: 0,
+        programCount: 0,
+        videoStreamCount: 1,
+        audioStreamCount: 0,
+        subPicStreamCount: 0,
+        bitRate: 0,
+        createDate: 0,
+      },
+      vidStreamInfos: [
+        {
+          vidStreamId: 0,
+          fourCC: 0,
+          streamLength: 0,
+          bitRate: 0,
+          startTimestamp: 0,
+          timestampOffset: 0,
+          videoScanType: 0,
+          width: 1920,
+          height: 1080,
+          frameRate: { den: 1, num: 25 },
+          maxFrameRate: { den: 1, num: 25 },
+          totalFrames: 0,
+          xRatio: 1920,
+          yRatio: 1080,
+          rotation: 0,
+          flipType: 0,
+          gpsLatitude: 0.0,
+          gpsLongitude: 0.0,
+          cameraMaker: 'None',
+          cameraModel: 'None',
+          exposureTime: 0.0,
+          premultiAlphaTypePhoto: -1,
+          transferCharacteristics: 0,
+          maxGopSize: -1,
+          lastframeRate: { den: 1, num: 25 },
+          alphaChannel: 0,
+          isDolbyVision: 0,
+          colorSpaceSource: 0,
+        },
+      ],
+      recordInfos: {},
     },
-    in_point: 0,
-    link_mattings: [],
-    media_tree_node_expand_status: false,
-    motion_blur_data: '',
-    name,
-    obj_detect_data: '',
-    orientation: 1,
-    original_frame_rate: [1, 1],
-    original_video_resolution: [0, 0],
-    out_point: 0,
-    PosScale: [1.0, 1.0],
-    preset_manger_data: '',
-    proxy_audio_info: null,
-    proxy_filename: '',
-    proxy_video_info: null,
-    retime_method: 1,
-    ReverseAudioInfo: null,
-    ReverseFileName: '',
-    ReverseVideoInfo: null,
-    RotateAngle: 0.0,
-    SilenceDetectArg: { dThreshold: 0.5, nMinContinueDuration: 500, nMiniVoicelessDuration: 500 },
-    solid_color_info: null,
-    source_count: 1,
-    stabilization_data: '',
-    strech_mode: 0,
-    text_info: null,
-    timeline_data_file: '',
-    timeline_extra_data_file: '',
-    title: name,
-    TransformPosition: [0.0, 0.0],
-    type: 1,
-    video_info: null,
   };
 }
 
-function videoMediaJson(absPath, mtimeSec, fileSize, durTicks, fps = 30) {
+function videoMediaJson(absPath, mtimeSec, fileSize, durTicks, fps = 24) {
   const p = normSlash(absPath);
-  const name = path.basename(p);
-  const vinfo = {
-    bit_rate: 2500000,
-    color_primaries: 2,
-    color_range: 1,
-    color_space: 2,
-    color_trc: 2,
-    crop_bottom: 0.0,
-    crop_left: 0.0,
-    crop_right: 0.0,
-    crop_top: 0.0,
-    duration: durTicks,
-    file_fourcc: 875967080,
-    format: 0,
-    frame_rate: [fps, 1],
-    hdr_To_sdr_type: '',
-    hdr_data_describe: ' SDR ',
-    hdr_type: 0,
-    height: 1080,
-    mediacodec_10bit_decode: 0,
-    mediafoundation_10bit_decode: 1,
-    orientation: 0,
-    raw_height: 1080,
-    raw_width: 1920,
-    rotation: 0,
-    size: fileSize,
-    stream_fourcc: 875967080,
-    stream_id: 0,
-    time_base: [1, 15360],
-    vfr_type: 0,
-    video_codecid: 27,
-    videotoolbox_10bit_decode: 0,
-    width: 1920,
-  };
+  const durSec = Math.max(0.1, durTicks / TICKS_PER_SEC);
+  const totalFrames = Math.max(1, Math.round(durSec * fps));
   return {
-    adjust_color_data_new: '',
-    ai_palette_property_info_data: '',
-    anchor_point: [0.0, 0.0],
-    attribute: 1,
-    audio_denoise_info: '',
-    audio_duck_info: '',
-    audio_info: null,
-    audio_voice_balance_info: '',
-    bModifyTitle: false,
-    built_in_color_type: -1,
-    cloud_file_download_state: 1,
-    cloud_file_type: -1,
-    cloud_from_type: -1,
-    composition_data: '',
-    compound_clip_version: 0,
-    custom_info: {},
-    custom_speed_Controller: '',
-    duration: durTicks,
-    file_create_time: mtimeSec,
-    file_modify_time: mtimeSec,
-    file_size: fileSize,
-    filename: p,
-    image_info: null,
-    in_point: 0,
-    link_mattings: [],
-    media_tree_node_expand_status: false,
-    motion_blur_data: '',
-    name,
-    obj_detect_data: '',
-    orientation: 0,
-    original_frame_rate: [fps, 1],
-    original_video_resolution: [1920, 1080],
-    out_point: durTicks,
-    PosScale: [1.0, 1.0],
-    preset_manger_data: '',
-    proxy_audio_info: null,
-    proxy_filename: '',
-    proxy_video_info: null,
-    retime_method: 1,
-    ReverseAudioInfo: null,
-    ReverseFileName: '',
-    ReverseVideoInfo: null,
-    RotateAngle: 0.0,
-    SilenceDetectArg: { dThreshold: 0.5, nMinContinueDuration: 500, nMiniVoicelessDuration: 500 },
-    solid_color_info: null,
-    source_count: 1,
-    stabilization_data: '',
-    strech_mode: 0,
-    text_info: null,
-    timeline_data_file: '',
-    timeline_extra_data_file: '',
-    title: name,
-    TransformPosition: [0.0, 0.0],
-    type: 2,
-    video_info: vinfo,
+    version: '1.1.7',
+    file_name: p,
+    sourceInfo: {
+      basicInfo: {
+        streamType: 2,
+        fourCC: 540299341,
+        mediaLength: durTicks,
+        programCount: 1,
+        videoStreamCount: 1,
+        audioStreamCount: 1,
+        subPicStreamCount: 0,
+        bitRate: 9998787,
+        createDate: mtimeSec,
+      },
+      vidStreamInfos: [
+        {
+          vidStreamId: 0,
+          fourCC: 875967048,
+          streamLength: durTicks,
+          bitRate: 9870787,
+          startTimestamp: 0,
+          timestampOffset: 0,
+          videoScanType: 2,
+          width: 1920,
+          height: 1080,
+          frameRate: { den: 1, num: fps },
+          maxFrameRate: { den: 1000, num: fps * 1000 },
+          totalFrames,
+          xRatio: 1920,
+          yRatio: 1080,
+          rotation: 0,
+          flipType: 0,
+          gpsLatitude: 0.0,
+          gpsLongitude: 0.0,
+          cameraMaker: 'None',
+          cameraModel: 'None',
+          exposureTime: 0.0,
+          premultiAlphaTypePhoto: -1,
+          transferCharacteristics: 0,
+          maxGopSize: totalFrames,
+          lastframeRate: { den: 1, num: fps },
+          alphaChannel: 0,
+          isDolbyVision: 0,
+          colorSpaceSource: 1,
+        },
+      ],
+      audStreamInfos: [
+        {
+          audStreamId: 1,
+          fourCC: 541278529,
+          streamLength: durTicks,
+          sampleRate: 48000,
+          channels: 2,
+          layout: 0,
+          duration: Number((durSec + 0.00000001).toFixed(8)),
+          bytesPerSecond: 17500,
+          bitRate: 128000,
+          bitDepth: 16,
+          description: 'Advanced Audio Codec',
+        },
+      ],
+      recordInfos: {},
+    },
   };
 }
 
 function audioMediaJson(absPath, mtimeSec, fileSize, durTicks) {
   const p = normSlash(absPath);
-  const name = path.basename(p);
+  const durSec = Math.max(0.1, durTicks / TICKS_PER_SEC);
   return {
-    adjust_color_data_new: '',
-    ai_palette_property_info_data: '',
-    anchor_point: [0.0, 0.0],
-    attribute: 1,
-    audio_denoise_info: '',
-    audio_duck_info: '',
-    audio_info: {
-      bit_rate: 128000,
-      channels: 2,
-      duration: durTicks,
-      sample_format: 6,
-      sample_rate: 44100,
-      size: fileSize,
-      stream_fourcc: 0,
-      stream_id: 0,
-      time_base: [1, 14112000],
+    version: '1.1.7',
+    file_name: p,
+    sourceInfo: {
+      basicInfo: {
+        streamType: 3,
+        fourCC: 3371117,
+        mediaLength: durTicks,
+        programCount: 1,
+        videoStreamCount: 0,
+        audioStreamCount: 1,
+        subPicStreamCount: 0,
+        bitRate: 128000,
+        createDate: mtimeSec,
+      },
+      audStreamInfos: [
+        {
+          audStreamId: 0,
+          fourCC: 859918413,
+          streamLength: durTicks,
+          sampleRate: 44100,
+          channels: 1,
+          layout: 0,
+          duration: Number((durSec + 0.00000001).toFixed(8)),
+          bytesPerSecond: 16000,
+          bitRate: 128000,
+          bitDepth: 16,
+          description: 'mp3 MPEG layer-2, layer-3',
+        },
+      ],
+      recordInfos: {},
     },
-    audio_voice_balance_info: '',
-    bModifyTitle: false,
-    built_in_color_type: -1,
-    cloud_file_download_state: 1,
-    cloud_file_type: -1,
-    cloud_from_type: -1,
-    composition_data: '',
-    compound_clip_version: 0,
-    custom_info: {},
-    custom_speed_Controller: '',
-    duration: durTicks,
-    file_create_time: mtimeSec,
-    file_modify_time: mtimeSec,
-    file_size: fileSize,
-    filename: p,
-    image_info: null,
-    in_point: 0,
-    link_mattings: [],
-    media_tree_node_expand_status: false,
-    motion_blur_data: '',
-    name,
-    obj_detect_data: '',
-    orientation: 0,
-    original_frame_rate: [1, 1],
-    original_video_resolution: [0, 0],
-    out_point: durTicks,
-    PosScale: [1.0, 1.0],
-    preset_manger_data: '',
-    proxy_audio_info: null,
-    proxy_filename: '',
-    proxy_video_info: null,
-    retime_method: 1,
-    ReverseAudioInfo: null,
-    ReverseFileName: '',
-    ReverseVideoInfo: null,
-    RotateAngle: 0.0,
-    SilenceDetectArg: { dThreshold: 0.5, nMinContinueDuration: 500, nMiniVoicelessDuration: 500 },
-    solid_color_info: null,
-    source_count: 1,
-    stabilization_data: '',
-    strech_mode: 0,
-    text_info: null,
-    timeline_data_file: '',
-    timeline_extra_data_file: '',
-    title: name,
-    TransformPosition: [0.0, 0.0],
-    type: 4,
-    video_info: null,
   };
 }
 
-function formatMediasInfoJson(mediaIds, timelineMediaId, mediaItemsMeta) {
-  const folderPairs = [];
-  for (const mid of [...mediaIds, timelineMediaId]) {
+function formatMediasInfoJson(mediaIds, timelineMediaId, mediaItemsMeta, nowTs, totalTicks) {
+  const folderPairs = ['"visible":"true"', '"SerializeDataOnlyProjectUsered":"false"'];
+  for (const mid of mediaIds) {
     folderPairs.push(`"media_item":${JSON.stringify(mid)}`);
   }
   const folderBody = folderPairs.join(',');
@@ -3736,22 +3657,17 @@ function formatMediasInfoJson(mediaIds, timelineMediaId, mediaItemsMeta) {
     itemsDict[mid] = mediaItemsMeta[mid];
   }
   itemsDict[timelineMediaId] = {
-    cloud_file_type: -1,
-    cloud_from_type: -1,
-    data: `Medias/${timelineMediaId}/media.json`,
-    extra_data: `Medias/${timelineMediaId}/extra.json`,
-    media_attribute: 4,
-    media_missing: 0,
-    media_title: 'Project',
-    media_type: 32,
-    proxy_missing: 0,
-    src_filename: '',
-    src_md5: '',
-    thumbnail: `Medias/${timelineMediaId}/thumbnail.png`,
-    timeline_data: `Medias/${timelineMediaId}/timeline.wesproj`,
-    title_modified: false,
+    name: 'Untitle',
+    download_url: '',
+    id: timelineMediaId,
+    timeline_uuid: TIMELINE_UUID,
+    media_type: 1048576,
+    create_time: nowTs,
+    duration: totalTicks,
+    enable_modify_mediaId: 0,
+    mark_info_list: [{ mark_in: -1, mark_out: -1 }],
   };
-  return `{"media_structure":{"Folder":{${folderBody}}},"media_items":${JSON.stringify(itemsDict)},"version":"1.0.1.0"}`;
+  return `{"media_structure":{"visible":"true","SerializeDataOnlyProjectUsered":"false","Folder":{${folderBody}},"media_item":${JSON.stringify(timelineMediaId)}},"media_items":${JSON.stringify(itemsDict)}}`;
 }
 
 function buildDgsBundleDict(pid, title, relMap = null) {
@@ -3801,6 +3717,7 @@ function buildDgsBundleDict(pid, title, relMap = null) {
     dgs_format: 'dgs_filmora_project_v2',
     created_at: Math.floor(Date.now() / 1000),
     project_id: pid,
+    source_project_id: pid,
     title: title || scriptMeta.filename || `Project_${pid}`,
     portable: Boolean(relMap),
     script_meta: scriptMeta,
@@ -3819,7 +3736,7 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
   if (!plan) throw new Error('Build a timeline first before exporting .wfp');
 
   const nowTs = Math.floor(Date.now() / 1000);
-  const fps = 30;
+  const fps = 25;
   const projGuid = filmoraGuid(`proj:${pid}:${title}`);
 
   const mediaIds = [];
@@ -3838,7 +3755,7 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     if (pathToMediaGuid.has(normAbs)) return pathToMediaGuid.get(normAbs);
 
     let mtimeSec = nowTs;
-    let fileSize = 0;
+    let fileSize = 512000;
     let md5Str = '';
     try {
       const st = fs.statSync(p);
@@ -3851,126 +3768,220 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
 
     const mid = filmoraGuid(`media:${pid}:${normAbs}`);
     const resUid = uidLower(`res:${pid}:${normAbs}`);
-    const durTicks = secToTicks(Math.max(0.5, Number(approxDurSec) || 5.0));
+    const durSec = Math.max(0.5, Number(approxDurSec) || 5.0);
+    const durTicks = kind === 'image' ? 0 : secToTicks(durSec);
 
-    let normP = normAbs;
-    if (archiveMode) {
-      normP = `%DOCUMENT_DIR%/Medias/${mid}/${path.basename(p)}`;
-    } else if (relMap && (relMap[normAbs] || relMap[normSlash(rawPath)])) {
-      normP = relMap[normAbs] || relMap[normSlash(rawPath)];
+    // Ensure Windows-compatible drive path (never a Linux '/home/...' path that turns into 'file://home/...' UNC share on Windows!)
+    const winDisplayPath = /^[A-Za-z]:\//.test(normAbs)
+      ? normAbs
+      : `D:/AI Editor/data/projects/${pid}/${kind === 'image' ? 'media/images' : kind === 'video' ? 'media/videos' : 'voiceover'}/${path.basename(p)}`;
+
+    let clipRefPath = `%DOCUMENT_DIR%/Medias/${mid}/${path.basename(p)}`;
+    if (!archiveMode && relMap && (relMap[normAbs] || relMap[normSlash(rawPath)])) {
+      clipRefPath = relMap[normAbs] || relMap[normSlash(rawPath)];
     }
 
     mediaIds.push(mid);
     mediaGuidToPath.set(mid, p);
-    mediaClipsMap[mid] = [];
+
+    const mediaTypeNum = kind === 'image' ? 16 : kind === 'video' ? 8 : 4;
+    mediaItemsMeta[mid] = {
+      download_url: winDisplayPath,
+      id: mid,
+      media_type: mediaTypeNum,
+      media_length: durTicks,
+      name: path.parse(p).name,
+      mediaCreationInfo: '{"creationType":0}',
+      import_time: mtimeSec,
+      src_md5: md5Str,
+      stream_idx: kind === 'image' ? -1 : 0,
+      mark_info_list: [{ mark_in: -1, mark_out: -1 }],
+      scence_info: [],
+      _clip_ref_path: clipRefPath,
+      _orig_abs_path: winDisplayPath,
+      _dur_sec: durSec,
+    };
 
     if (kind === 'image') {
-      perMediaJson[mid] = imageMediaJson(normP, mtimeSec, fileSize);
-      mediaItemsMeta[mid] = {
-        cloud_file_type: -1,
-        cloud_from_type: -1,
-        data: `Medias/${mid}/media.json`,
-        media_attribute: 1,
-        media_missing: 0,
-        media_title: path.basename(p),
-        media_type: 1,
-        proxy_missing: 1,
-        src_filename: normP,
-        src_md5: md5Str,
-        thumbnail: `Medias/${mid}/thumbnail.png`,
-        title_modified: false,
-      };
+      perMediaJson[mid] = imageMediaJson(winDisplayPath, mtimeSec);
       resources.push({
-        duration: -1,
-        filename: normP,
+        AIGCMeta: { data: '', size: 0 },
+        alphaPremultiply: 0,
+        audioStreamCount: 0,
+        bitRate: 0,
+        createDate: 0,
+        filename: `file:/${winDisplayPath}`,
+        fourCC: 541544016,
+        mediaLength: 0,
+        modifyDate: 0,
+        programCount: 0,
         sourceUuid: resUid,
-        streamIdx: 200,
-        tracks: [{ codec: 'image', height: 1080, index: 200, type: 1, width: 1920 }],
-        type: 3,
-        userData: [udInt32(0, 62)],
+        streamType: 5,
+        subPicStreamCount: 0,
+        vidStreamInfo: [
+          {
+            FNumber: 0.0,
+            FocalLength: 0.0,
+            ISO: 0,
+            ViewsCount: 0,
+            alphaChannel: 0,
+            artist: '',
+            bitRate: 0,
+            bitsDepth: 24,
+            cameraLensMaker: '',
+            cameraLensModel: '',
+            cameraMaker: '',
+            cameraModel: '',
+            colorChromesubsampling: 0,
+            colorPrimary: 0,
+            colorRange: 0,
+            colorSpace: 0,
+            colorSpaceSource: 0,
+            colorTemperature: 0,
+            dateTimerOriginal: '',
+            exposureTime: 0.0,
+            flipType: 0,
+            fourCC: 0,
+            frameRate: { den: 1, num: 25 },
+            gpsAltitude: 0.0,
+            gpsLatitude: 0.0,
+            gpsLongitude: 0.0,
+            height: 1080,
+            isDolbyVision: 0,
+            matrixCoefficients: 0,
+            maxFrameRate: { den: 1, num: 25 },
+            maxGopSize: -1,
+            proresRawISO: 0,
+            rotation: 0,
+            startTimestamp: 0,
+            streamLength: 0,
+            timestampOffset: 0,
+            totalFrames: 0,
+            transferCharacteristics: 0,
+            vidStreamId: 0,
+            videoScanType: 0,
+            width: 1920,
+            xRatio: 1920,
+            yRatio: 1080,
+          },
+        ],
+        videoStreamCount: 1,
       });
     } else if (kind === 'video') {
-      perMediaJson[mid] = videoMediaJson(normP, mtimeSec, fileSize, durTicks, fps);
-      mediaItemsMeta[mid] = {
-        cloud_file_type: -1,
-        cloud_from_type: -1,
-        data: `Medias/${mid}/media.json`,
-        media_attribute: 1,
-        media_missing: 0,
-        media_title: path.basename(p),
-        media_type: 2,
-        proxy_missing: 1,
-        src_filename: normP,
-        src_md5: md5Str,
-        thumbnail: `Medias/${mid}/thumbnail.png`,
-        title_modified: false,
-      };
+      perMediaJson[mid] = videoMediaJson(winDisplayPath, mtimeSec, fileSize, durTicks, 24);
+      const totalFrames = Math.max(1, Math.round(durSec * 24));
       resources.push({
-        duration: durTicks,
-        filename: normP,
-        sourceUuid: resUid,
-        streamIdx: 0,
-        tracks: [
+        AIGCMeta: { data: '', size: 0 },
+        alphaPremultiply: 0,
+        audStreamInfo: [
           {
-            bitrate: 2500000,
-            codec: 'h264',
-            colorSpace: 'BT709',
-            duration: durTicks,
-            format: 'nv12',
-            frameRate: { den: 1, num: fps },
-            height: 1080,
-            index: 0,
-            timebase: { den: 15360, num: 1 },
-            type: 1,
-            width: 1920,
+            audLang: '',
+            audStreamId: 1,
+            bitDepth: 16,
+            bitRate: 128000,
+            bytesPerSecond: 17485,
+            channels: 2,
+            description: 'Advanced Audio Codec',
+            duration: Number((durSec + 0.00000001).toFixed(8)),
+            fourCC: 541278529,
+            layout: 0,
+            sampleRate: 48000,
+            streamLength: durTicks,
           },
         ],
-        type: 1,
-        userData: [udInt32(0, 62)],
+        audioStreamCount: 1,
+        bitRate: 9757584,
+        createDate: mtimeSec,
+        filename: `file:/${winDisplayPath}`,
+        fourCC: 540299341,
+        mediaLength: durTicks,
+        modifyDate: mtimeSec,
+        programCount: 1,
+        sourceUuid: resUid,
+        streamType: 2,
+        subPicStreamCount: 0,
+        vidStreamInfo: [
+          {
+            FNumber: 0.0,
+            FocalLength: 0.0,
+            ISO: 0,
+            ViewsCount: 1,
+            alphaChannel: 0,
+            artist: '',
+            bitRate: 9629584,
+            bitsDepth: 24,
+            cameraLensMaker: '',
+            cameraLensModel: '',
+            cameraMaker: '',
+            cameraModel: '',
+            colorChromesubsampling: 0,
+            colorPrimary: 0,
+            colorRange: 0,
+            colorSpace: 0,
+            colorSpaceSource: 1,
+            colorTemperature: 0,
+            dateTimerOriginal: '',
+            exposureTime: 0.0,
+            flipType: 0,
+            fourCC: 875967048,
+            frameRate: { den: 1, num: 24 },
+            gpsAltitude: 0.0,
+            gpsLatitude: 0.0,
+            gpsLongitude: 0.0,
+            height: 1080,
+            isDolbyVision: 0,
+            matrixCoefficients: 0,
+            maxFrameRate: { den: 1000, num: 24000 },
+            maxGopSize: totalFrames,
+            proresRawISO: 0,
+            rotation: 0,
+            startTimestamp: 0,
+            streamLength: durTicks,
+            timestampOffset: 0,
+            totalFrames,
+            transferCharacteristics: 0,
+            vidStreamId: 0,
+            videoScanType: 2,
+            width: 1920,
+            xRatio: 1920,
+            yRatio: 1080,
+          },
+        ],
+        videoStreamCount: 1,
       });
     } else {
-      perMediaJson[mid] = audioMediaJson(normP, mtimeSec, fileSize, durTicks);
-      mediaItemsMeta[mid] = {
-        cloud_file_type: -1,
-        cloud_from_type: -1,
-        data: `Medias/${mid}/media.json`,
-        media_attribute: 1,
-        media_missing: 0,
-        media_title: path.basename(p),
-        media_type: 4,
-        proxy_missing: 1,
-        src_filename: normP,
-        src_md5: md5Str,
-        title_modified: false,
-      };
-      beatDetectMap[mid] = {
-        bEnableMarkAdded: true,
-        beatInterval: 4,
-        beatModel: 1,
-        nHighlightOnly: 0,
-        strMusicAnalysisJsonPath: '',
-      };
+      perMediaJson[mid] = audioMediaJson(winDisplayPath, mtimeSec, fileSize, durTicks);
       resources.push({
-        duration: durTicks,
-        filename: normP,
-        sourceUuid: resUid,
-        streamIdx: 0,
-        tracks: [
+        AIGCMeta: { data: '', size: 0 },
+        alphaPremultiply: 0,
+        audStreamInfo: [
           {
-            bitrate: 128000,
-            channelLayout: 3,
-            channels: 2,
-            codec: 'mp3float',
-            duration: durTicks,
-            format: 'fltp',
-            index: 0,
+            audLang: '',
+            audStreamId: 0,
+            bitDepth: 16,
+            bitRate: 128000,
+            bytesPerSecond: 16000,
+            channels: 1,
+            description: 'mp3 MPEG layer-2, layer-3',
+            duration: Number((durSec + 0.00000001).toFixed(8)),
+            fourCC: 859918413,
+            layout: 0,
             sampleRate: 44100,
-            timebase: { den: 14112000, num: 1 },
-            type: 2,
+            streamLength: durTicks,
           },
         ],
-        type: 2,
-        userData: [udInt32(0, 62)],
+        audioStreamCount: 1,
+        bitRate: 128000,
+        createDate: mtimeSec,
+        filename: `file:/${winDisplayPath}`,
+        fourCC: 3371117,
+        mediaLength: durTicks,
+        modifyDate: mtimeSec,
+        programCount: 1,
+        sourceUuid: resUid,
+        streamType: 3,
+        subPicStreamCount: 0,
+        videoStreamCount: 0,
       });
     }
 
@@ -3979,7 +3990,7 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     return pair;
   };
 
-  const makeVisualClip = (clipKey, mid, resUid, filenameStr, kind, tlBeginTicks, tlEndTicks, srcInSec = 0, srcOutSec = null, customTransform = null) => {
+  const makeVisualClip = (clipKey, mid, resUid, filenameStr, origAbsPath, kind, tlBeginTicks, tlEndTicks, srcInSec = 0, srcOutSec = null, totalResSec = 10.0) => {
     const durTicks = Math.max(1, tlEndTicks - tlBeginTicks);
     let inTicks;
     let outTicks;
@@ -3992,300 +4003,264 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
       if (outTicks <= inTicks) outTicks = inTicks + durTicks;
     }
 
-    const ctype = kind === 'image' ? 3 : 1;
-    const outerUid = uidLower(`vclip_out:${clipKey}`);
-    const innerUid = uidLower(`vclip_in:${clipKey}`);
-    const stabUid = uidLower(`vstab:${clipKey}`);
-    const outerGuid38 = `{${outerUid.toUpperCase()}}`;
-    const colorRangeXml = '<?xml version="1.0"?>\n<timeline_project name="ColorRangeFilter">\n\t<version>1</version>\n\t<Next FilterId="1001" />\n</timeline_project>\n';
+    const thisUId = uidLower(`vclip_uid:${clipKey}`);
+    const clipGuid38 = filmoraGuid(`vclip_guid:${clipKey}`);
+    const cropUid = uidLower(`vcrop:${clipKey}`);
+    const cropGuid = filmoraGuid(`vcrop_g:${clipKey}`);
+    const transUid = uidLower(`vtrans:${clipKey}`);
+    const transGuid = filmoraGuid(`vtrans_g:${clipKey}`);
 
-    const clipObj = {
-      anchorX: 0.0,
-      anchorY: 0.0,
-      applyDeinterlace: false,
-      audioChannelProcessIndex: 0,
-      auto_normalize_value: -1000,
-      bOpenAutoNormalize: false,
-      bSyncedATempo: true,
-      blendMode: 0,
-      blendVisible: true,
-      bottom: 0.0,
-      brightness: 0.0,
-      clipList: [
+    const offsetSec = Number((inTicks / TICKS_PER_SEC).toFixed(4));
+    const offsetEndSec = Number((outTicks / TICKS_PER_SEC).toFixed(4));
+    const totTime = kind === 'image' ? 86400.0 : Math.max(1.0, Number(totalResSec) || 10.0);
+    const speedMd5 = crypto.createHash('md5').update(`speed:${totTime}`).digest('hex');
+    const speedParam = `{"Version": 3,"ParameterType": 0,"keyframeSets": [{"_time": 0.0,"Interpolation": 6,"_value": 1.0},{"_time": ${totTime.toFixed(1)},"Interpolation": 6,"_value": 1.0}],"MD5": "${speedMd5}","_totalTime": ${totTime.toFixed(1)}}`;
+
+    const stylizer73 = JSON.stringify({
+      effectList: [
         {
-          clipMaskList: [],
-          clipMode: 0,
-          contextType: 0,
-          customSpeedControllJson: '',
-          enable: true,
-          filename: filenameStr,
-          inPoint: inTicks,
-          locked: false,
-          name: '',
-          outPoint: outTicks,
-          retimeMethod: 1,
-          reverse: false,
-          source: resUid,
-          sourceUuid: resUid,
-          speed: 1.0,
-          strVariableSpeedInfo: '',
-          streamIdx: kind === 'image' ? 200 : 0,
-          sync: 0,
-          tlBegin: 0,
-          tlEnd: durTicks,
-          type: ctype,
-          uid: innerUid,
-          userData: [udInt32(0, 62)],
-          videostabilizer: {
-            bEdgeExtend: true,
-            bUseStabilizer: false,
-            enable: true,
-            fSmoothLevel: 0.20000000298023224,
-            filename: filenameStr,
-            inPoint: inTicks,
-            locked: false,
-            name: '',
-            outPoint: outTicks,
-            sourceUuid: resUid,
-            speed: 1.0,
-            tlBegin: 0,
-            tlEnd: durTicks,
-            type: 0,
-            uid: stabUid,
-            userData: [udInt32(0, 62)],
-          },
+          enable: false,
+          id: 'video/effect/ai_image_stylizer',
+          paramList: [{ fxParam: { paramType: 6, unValue: origAbsPath, valid: true }, name: 'OriginPath' }],
+          userData: [],
         },
       ],
-      clipMaskList: [],
-      clipMode: 0,
-      colorize: { bColorize: false, brightness: 50.0, hue: 180.0, opacity: 50.0, saturation: 50.0 },
-      contextType: 1,
-      contrast: 0.0,
-      cropMode: 0,
-      customSpeedControllJson: '',
-      denoiseLevel: 0,
-      displayMode: 0,
-      dropShadow: { angle: 60.0, bDropShadow: false, blur: 0.0, color: 0, distance: 0.0, opacity: 60, scale: 100.0 },
-      enable: true,
-      fadeInDuration: 0,
-      fadeOutDuration: 0,
-      fieldOrder: 0,
-      flipHorizontal: false,
-      flipVertical: false,
-      freezeDuration: 36000000000,
-      freezePosition: -1,
-      freezeScale: 0.0,
+    });
+    const stylizer74 = JSON.stringify({
+      effectList: [
+        {
+          enable: false,
+          id: 'video/effect/ai_image_video_stylizer',
+          paramList: [{ fxParam: { paramType: 6, unValue: origAbsPath, valid: true }, name: 'OriginPath' }],
+          userData: [],
+        },
+        {
+          enable: false,
+          id: 'video/effect/ai_template_generate',
+          paramList: [{ fxParam: { paramType: 6, unValue: origAbsPath, valid: true }, name: 'OriginPath' }],
+          userData: [],
+        },
+      ],
+    });
+
+    const clipTitle = path.parse(filenameStr).name || 'Clip';
+    const clipObj = {
+      backgroundFillBluredness: 20,
+      effectChainList: [
+        {
+          effectList: [
+            {
+              display: 'crop-pan-zoom',
+              id: 'video/effect/crop-pan-zoom',
+              placeholder: false,
+              placeholderStatus: 0,
+              thisUId: cropUid,
+              type: 3,
+              userData: [udGuid64(cropGuid, 3), udBytes(Buffer.from([0x01]), 7)],
+            },
+            {
+              display: 'transform',
+              id: 'video/effect/transform',
+              paramList: [
+                { fxParam: { paramType: 5, unValue: 1186339 }, name: 'dwValue' },
+                { fxParam: { paramType: 5, unValue: 1 }, name: 'EnableTransform' },
+              ],
+              placeholder: false,
+              placeholderStatus: 0,
+              thisUId: transUid,
+              type: 3,
+              userData: [
+                udStr('1.0', 15005, false),
+                udGuid64(transGuid, 3),
+                udBytes(Buffer.from([0x01]), 7),
+                udStr('1', 36880, true),
+              ],
+            },
+          ],
+          name: 'Basic',
+        },
+        { effectList: [], name: 'Effect' },
+        { effectList: [], name: '_wes_hold_effectchain_' },
+      ],
+      filename: filenameStr,
+      image_denoise: { cache_mode: 0, sigma: 20.0, status: 0, version: 1.0 },
       inPoint: inTicks,
-      left: 0.0,
-      locked: false,
-      lutStrength: 100.0,
-      matteMode: 0,
-      motionBlur: { bEnable: false, fPhase: 0.0, fShutterAngle: 180.0, nSamplesCount: 16 },
-      name: '',
-      opacity: 100,
       outPoint: outTicks,
-      pitch: 0,
-      retimeMethod: 1,
-      reverse: false,
-      right: 0.0,
-      rotation: 0.0,
-      rotationX: 0.0,
-      rotationY: 0.0,
-      saturation: 0.0,
-      scaleX: customTransform ? customTransform.scaleX : 1.0,
-      scaleY: customTransform ? customTransform.scaleY : 1.0,
-      settingScaleToFit: 0,
-      sharpness: 0.0,
-      speed: 1.0,
-      strVariableSpeedInfo: '',
-      stretchMode: 0,
-      sync: 0,
-      tint: 0.0,
+      picSequence: false,
+      pipBuf: '{"Algorithm":"Bilinear","BlendMode":0,"BlenderName":"video/blender/simple-pip","Enable":true,"Opacity":100.0}',
+      pipBufSize: 110,
+      placeholder: false,
+      placeholderStatus: 0,
+      sourceUuid: resUid,
+      speed: {
+        offset: offsetSec,
+        offsetEnd: offsetEndSec,
+        reverse: false,
+        speedParam,
+      },
+      stabilization: { cache_mode: 0, smooth: 5.0, status: 0, version: 1.0 },
+      stabilizeAnalysisData: null,
+      streamId: 0,
+      thisUId,
       tlBegin: tlBeginTicks,
       tlEnd: tlEndTicks,
-      top: 0.0,
-      transX: customTransform ? customTransform.transX : 0.0,
-      transY: customTransform ? customTransform.transY : 0.0,
-      type: ctype,
-      uid: outerUid,
+      type: 1,
       userData: [
-        udStr(filenameStr, 30016),
-        udStr(path.basename(filenameStr), 50, true),
-        udGuid64(mid, 9),
-        udInt32(0, 29),
-        udInt32(0, 62),
-        udUint32(4294967295, 13000),
-        udFloat32(0.0, 22),
-        udFloat32(0.0, 120),
-        udGuid38(outerGuid38, 30309),
-        udBytes(Buffer.from([0x04]), 14002),
-        udStr('{"type":0,"version":1,"visible":true}', 30304),
-        udFloat64(0.0, 71),
-        udStr(colorRangeXml, 30059),
+        udInt32(0, 102),
+        udInt32(kind === 'image' ? 3 : 2, 103),
+        udInt32(kind === 'image' ? 4 : 1, 1),
+        udStr(stylizer73, 73, false),
+        udStr(clipTitle, 50, false),
+        udInt32(0, 2),
+        udGuid38(mid, 10),
+        udStr(stylizer74, 74, false),
+        udGuid64(clipGuid38, 3),
+        udInt32(9, 6),
       ],
-      volume: 0.0,
+      video_cloud_algorithm: { info: [{ type: 'video' }], version: 1 },
     };
-    if (mediaClipsMap[mid]) mediaClipsMap[mid].push(outerGuid38);
+
+    mediaClipsMap[clipGuid38] = { mediaId: mid, subClips: {} };
+    beatDetectMap[clipGuid38] = { algorithmType: 0, level: 0 };
     return clipObj;
   };
 
-  const makeAudioClip = (clipKey, mid, resUid, filenameStr, tlBeginTicks, tlEndTicks, srcInSec = 0, srcOutSec = null) => {
+  const makeAudioClip = (clipKey, mid, resUid, filenameStr, tlBeginTicks, tlEndTicks, srcInSec = 0, srcOutSec = null, totalResSec = 10.0) => {
     const durTicks = Math.max(1, tlEndTicks - tlBeginTicks);
     const inTicks = secToTicks(srcInSec || 0);
     let outTicks = srcOutSec != null ? secToTicks(srcOutSec) : (inTicks + durTicks);
     if (outTicks <= inTicks) outTicks = inTicks + durTicks;
 
-    const outerUid = uidLower(`aclip_out:${clipKey}`);
-    const innerUid = uidLower(`aclip_in:${clipKey}`);
-    const outerGuid38 = `{${outerUid.toUpperCase()}}`;
-    const colorRangeXml = '<?xml version="1.0"?>\n<timeline_project name="ColorRangeFilter">\n\t<version>1</version>\n\t<Next FilterId="1001" />\n</timeline_project>\n';
+    const thisUId = uidLower(`aclip_uid:${clipKey}`);
+    const clipGuid38 = filmoraGuid(`aclip_guid:${clipKey}`);
+    const offsetSec = Number((inTicks / TICKS_PER_SEC).toFixed(4));
+    const offsetEndSec = Number((outTicks / TICKS_PER_SEC).toFixed(4));
+    const totTime = Math.max(1.0, Number(totalResSec) || 10.0);
+    const speedMd5 = crypto.createHash('md5').update(`aspeed:${totTime}`).digest('hex');
+    const speedParam = `{"Version": 3,"ParameterType": 0,"keyframeSets": [{"_time": 0.0,"Interpolation": 6,"_value": 1.0},{"_time": ${totTime.toFixed(8)},"Interpolation": 6,"_value": 1.0}],"MD5": "${speedMd5}","_totalTime": ${totTime.toFixed(8)}}`;
 
+    const mkFx = (disp, fxKey) => ({
+      display: disp,
+      id: `audio/effect/${disp}`,
+      placeholder: false,
+      placeholderStatus: 0,
+      thisUId: uidLower(`afx_u:${clipKey}:${fxKey}`),
+      type: 3,
+      userData: [udGuid64(filmoraGuid(`afx_g:${clipKey}:${fxKey}`), 3), udBytes(Buffer.from([0x01]), 7)],
+      ...(disp === 'ducking' ? { enable: false } : {}),
+    });
+
+    const clipTitle = path.parse(filenameStr).name || 'Audio';
     const clipObj = {
-      anchorX: 0.0,
-      anchorY: 0.0,
-      applyDeinterlace: false,
-      audioChannelProcessIndex: 0,
-      auto_normalize_value: -1000,
-      bOpenAutoNormalize: false,
-      bSyncedATempo: true,
-      blendMode: 0,
-      blendVisible: true,
-      bottom: 0.0,
-      brightness: 0.0,
-      clipList: [
+      audioDuckingframe: {
+        parameter: '{"Version": 3,"ParameterType": 0,"keyframeSets": [],"MD5":"d41d8cd98f00b204e9800998ecf8427e"}',
+      },
+      audio_cloud_algorithm: { info: [{ type: 'audio' }], version: 1 },
+      denoiseV3Strength: 50.0,
+      effectChainList: [
+        { effectList: [], name: 'Basic' },
         {
-          clipMaskList: [],
-          clipMode: 0,
-          contextType: 0,
-          customSpeedControllJson: '',
-          enable: true,
-          filename: filenameStr,
-          inPoint: inTicks,
-          locked: false,
-          name: '',
-          outPoint: outTicks,
-          retimeMethod: 1,
-          reverse: false,
-          source: resUid,
-          sourceUuid: resUid,
-          speed: 1.0,
-          strVariableSpeedInfo: '',
-          streamIdx: 0,
-          sync: 0,
-          tlBegin: 0,
-          tlEnd: durTicks,
-          type: 2,
-          uid: innerUid,
-          userData: [udInt32(0, 62)],
+          effectList: [
+            mkFx('clip_volume', 1),
+            mkFx('change_channel', 2),
+            mkFx('volume', 3),
+            mkFx('ducking', 4),
+            mkFx('fade', 5),
+            mkFx('equalizer', 6),
+          ],
+          name: 'BasicFollow',
         },
+        { effectList: [], name: 'Effect' },
+        { effectList: [], name: '_wes_hold_effectchain_' },
       ],
-      clipMaskList: [],
-      clipMode: 0,
-      colorize: { bColorize: false, brightness: 50.0, hue: 180.0, opacity: 50.0, saturation: 50.0 },
-      contextType: 1,
-      contrast: 0.0,
-      cropMode: 0,
-      customSpeedControllJson: '',
-      denoiseLevel: 0,
-      displayMode: 0,
-      dropShadow: { angle: 60.0, bDropShadow: false, blur: 0.0, color: 0, distance: 0.0, opacity: 60, scale: 100.0 },
-      enable: true,
-      fadeInDuration: 0,
-      fadeOutDuration: 0,
-      fieldOrder: 0,
-      flipHorizontal: false,
-      flipVertical: false,
-      freezeDuration: 36000000000,
-      freezePosition: -1,
-      freezeScale: 0.0,
+      filename: filenameStr,
       inPoint: inTicks,
-      left: 0.0,
-      locked: false,
-      lutStrength: 100.0,
-      matteMode: 0,
-      motionBlur: { bEnable: false, fPhase: 0.0, fShutterAngle: 180.0, nSamplesCount: 16 },
-      name: '',
-      opacity: 100,
       outPoint: outTicks,
-      pitch: 0,
-      retimeMethod: 1,
-      reverse: false,
-      right: 0.0,
-      rotation: 0.0,
-      rotationX: 0.0,
-      rotationY: 0.0,
-      saturation: 0.0,
-      scaleX: 1.0,
-      scaleY: 1.0,
-      settingScaleToFit: 0,
-      sharpness: 0.0,
-      speed: 1.0,
-      strVariableSpeedInfo: '',
-      stretchMode: 0,
-      sync: 0,
-      tint: 0.0,
+      placeholder: false,
+      placeholderStatus: 0,
+      sourceUuid: resUid,
+      speed: {
+        offset: offsetSec,
+        offsetEnd: offsetEndSec,
+        reverse: false,
+        speedParam,
+      },
+      streamId: 0,
+      thisUId,
       tlBegin: tlBeginTicks,
       tlEnd: tlEndTicks,
-      top: 0.0,
-      transX: 0.0,
-      transY: 0.0,
       type: 2,
-      uid: outerUid,
       userData: [
-        udStr(filenameStr, 30016),
-        udStr(path.basename(filenameStr), 50, true),
-        udGuid64(mid, 9),
-        udInt32(0, 29),
-        udInt32(0, 62),
-        udUint32(4294967295, 13000),
-        udFloat32(0.0, 22),
-        udFloat32(0.0, 120),
-        udGuid38(outerGuid38, 30309),
-        udBytes(Buffer.from([0x04]), 14002),
-        udFloat64(0.0, 71),
-        udStr(colorRangeXml, 30059),
+        udInt32(9, 6),
+        udInt32(0, 102),
+        udInt32(4, 103),
+        udStr(clipTitle, 50, false),
+        udInt32(0, 2),
+        udGuid38(mid, 10),
+        udGuid64(clipGuid38, 3),
+        udInt32(2, 1),
+        udStr('0', 13019, false),
       ],
-      volume: 0.0,
+      volumeKeyframe: {
+        parameter: '{"Version": 3,"ParameterType": 0,"keyframeSets": [],"MD5":"d41d8cd98f00b204e9800998ecf8427e"}',
+      },
     };
-    if (mediaClipsMap[mid]) mediaClipsMap[mid].push(outerGuid38);
+
+    mediaClipsMap[clipGuid38] = { mediaId: mid, subClips: {} };
+    beatDetectMap[clipGuid38] = { algorithmType: 0, level: 0 };
     return clipObj;
   };
 
-  // 1. Main visual scene clips (Video Track 1)
+  // 1. Main visual scene clips
   const videoClipsTrack = [];
   for (let idx = 0; idx < (plan.clips || []).length; idx++) {
     const c = plan.clips[idx];
-    if (!c.media_path || !fs.existsSync(c.media_path)) continue;
-    const [mid, resUid] = registerMedia(c.media_path, c.kind, Math.max(Number(c.duration || 0), Number(c.source_out || 0), 5.0));
+    if (!c.media_path) continue;
+    const estDur = Math.max(Number(c.duration || 0), Number(c.source_out || 0), 5.0);
+    const [mid, resUid] = registerMedia(c.media_path, c.kind, estDur);
     if (!mid) continue;
     const tlBegin = secToTicks(c.start);
     const tlEnd = Math.max(tlBegin + 1, secToTicks(c.end));
-    const clipFn = mediaItemsMeta[mid].src_filename;
+    const metaM = mediaItemsMeta[mid];
     videoClipsTrack.push(
-      makeVisualClip(`scene_${idx}_${c.screen}`, mid, resUid, clipFn, c.kind, tlBegin, tlEnd, c.source_in || 0, c.source_out),
+      makeVisualClip(
+        `scene_${idx}_${c.screen}`,
+        mid,
+        resUid,
+        metaM._clip_ref_path,
+        metaM._orig_abs_path,
+        c.kind,
+        tlBegin,
+        tlEnd,
+        c.source_in || 0,
+        c.source_out,
+        metaM._dur_sec,
+      ),
     );
   }
 
   // 2. Narration VO audio track
   const voClipsTrack = [];
   const slots = Array.isArray(plan.voiceover_slots) ? plan.voiceover_slots : [];
-  if (slots.length > 0 && slots.some((s) => s.path && fs.existsSync(s.path))) {
+  if (slots.length > 0 && slots.some((s) => Boolean(s && s.path))) {
     for (let idx = 0; idx < slots.length; idx++) {
       const s = slots[idx];
-      if (!s.path || !fs.existsSync(s.path)) continue;
-      const [mid, resUid] = registerMedia(s.path, 'audio', Math.max(Number(s.duration || 0), 5.0));
+      if (!s || !s.path) continue;
+      const sDur = Math.max(Number(s.duration || 0), Number(s.end || 0) - Number(s.start || 0), 5.0);
+      const [mid, resUid] = registerMedia(s.path, 'audio', sDur);
       if (!mid) continue;
       const tlBegin = secToTicks(s.start);
       const tlEnd = Math.max(tlBegin + 1, secToTicks(s.end));
-      const clipFn = mediaItemsMeta[mid].src_filename;
+      const metaM = mediaItemsMeta[mid];
       voClipsTrack.push(
-        makeAudioClip(`vo_slot_${idx}_${s.slot}`, mid, resUid, clipFn, tlBegin, tlEnd, 0.0, s.duration),
+        makeAudioClip(`vo_slot_${idx}_${s.slot}`, mid, resUid, metaM._clip_ref_path, tlBegin, tlEnd, 0.0, s.duration, metaM._dur_sec),
       );
     }
-  } else if (plan.voiceover_path && fs.existsSync(plan.voiceover_path)) {
-    const [mid, resUid] = registerMedia(plan.voiceover_path, 'audio', Math.max(Number(plan.total_duration || 10), 5.0));
+  } else if (plan.voiceover_path) {
+    const totVoDur = Math.max(Number(plan.total_duration || 10), 5.0);
+    const [mid, resUid] = registerMedia(plan.voiceover_path, 'audio', totVoDur);
     if (mid) {
-      const clipFn = mediaItemsMeta[mid].src_filename;
+      const metaM = mediaItemsMeta[mid];
       const spokenClips = (plan.clips || []).filter((c) => c.narration_in != null && c.narration_out != null && c.narration_out > c.narration_in);
       if (spokenClips.length) {
         for (let idx = 0; idx < spokenClips.length; idx++) {
@@ -4294,12 +4269,12 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
           const tlBegin = secToTicks(c.start);
           const tlEnd = secToTicks(Number(c.start) + durN);
           voClipsTrack.push(
-            makeAudioClip(`vo_seg_${idx}`, mid, resUid, clipFn, tlBegin, tlEnd, c.narration_in, c.narration_out),
+            makeAudioClip(`vo_seg_${idx}`, mid, resUid, metaM._clip_ref_path, tlBegin, tlEnd, c.narration_in, c.narration_out, metaM._dur_sec),
           );
         }
       } else {
         voClipsTrack.push(
-          makeAudioClip('vo_full', mid, resUid, clipFn, 0, secToTicks(plan.total_duration || 10), 0.0, plan.total_duration),
+          makeAudioClip('vo_full', mid, resUid, metaM._clip_ref_path, 0, secToTicks(totVoDur), 0.0, totVoDur, metaM._dur_sec),
         );
       }
     }
@@ -4307,172 +4282,92 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
 
   // 3. Poem / Suno VO audio track
   const poemClipsTrack = [];
-  if (plan.poem_voiceover_path && fs.existsSync(plan.poem_voiceover_path)) {
+  if (plan.poem_voiceover_path) {
     const pStart = Number(plan.poem_start_time || 0);
     const pEnd = Number(plan.poem_end_time || 0) > pStart ? Number(plan.poem_end_time) : Number(plan.total_duration || 10);
     const pDur = Math.max(1.0, pEnd - pStart);
     const [mid, resUid] = registerMedia(plan.poem_voiceover_path, 'audio', pDur);
     if (mid) {
-      const clipFn = mediaItemsMeta[mid].src_filename;
+      const metaM = mediaItemsMeta[mid];
       poemClipsTrack.push(
-        makeAudioClip('poem_vo', mid, resUid, clipFn, secToTicks(pStart), secToTicks(pEnd), 0.0, pDur),
+        makeAudioClip('poem_vo', mid, resUid, metaM._clip_ref_path, secToTicks(pStart), secToTicks(pEnd), 0.0, pDur, metaM._dur_sec),
       );
     }
   }
 
-  // 4. Logo overlay track (top-right corner across entire timeline)
+  // 4. Logo overlay track
   const logoClipsTrack = [];
   const logoMeta = loadJson(pid, 'logo.json') || {};
   const logoPath = plan.logo_path || logoMeta.path;
   const logoEnabled = Boolean(plan.logo_enabled ?? logoMeta.enabled ?? true);
-  if (logoEnabled && logoPath && fs.existsSync(logoPath)) {
+  if (logoEnabled && logoPath) {
     const [mid, resUid] = registerMedia(logoPath, 'image', Number(plan.total_duration || 10));
     if (mid) {
-      const clipFn = mediaItemsMeta[mid].src_filename;
+      const metaM = mediaItemsMeta[mid];
       logoClipsTrack.push(
         makeVisualClip(
           'logo_overlay',
           mid,
           resUid,
-          clipFn,
+          metaM._clip_ref_path,
+          metaM._orig_abs_path,
           'image',
           0,
           secToTicks(Math.max(1.0, Number(plan.total_duration || 10))),
           0.0,
           null,
-          { scaleX: 0.14, scaleY: 0.14, transX: 0.4, transY: -0.39 },
+          86400.0,
         ),
       );
     }
   }
 
-  // 5. Native Filmora 15 Subtitle track (`type: 22` with `subtitleSource` JSON) — supports English & Marathi Devanagari!
-  const cuesList = plan.srt_cues && plan.srt_cues.length ? plan.srt_cues : buildSrtCues(plan.clips || [], plan);
-  const subtitleClipsTrack = [];
   const totalTicks = secToTicks(Math.max(1.0, Number(plan.total_duration || 10)));
-  if (cuesList.length) {
-    const subItems = [];
-    for (let idx = 0; idx < cuesList.length; idx++) {
-      const q = cuesList[idx];
-      const sSec = Number(q.start || 0);
-      const eSec = Number(q.end || 0);
-      const txt = String(q.text || '').trim();
-      if (!txt || eSec <= sSec) continue;
-      subItems.push({
-        Start: secToTicks(sSec),
-        End: secToTicks(eSec),
-        Content: txt,
-        Pos: [0.0, -0.38],
-        Scale: [1.0, 1.0],
-        Index: idx,
-      });
-    }
-    if (subItems.length) {
-      const subGuid = filmoraGuid(`sub_clip:${pid}`);
-      const subSourceJson = JSON.stringify({
-        Items: subItems,
-         FontInfo: {
-          FontName: 'Noto Sans Devanagari',
-          FontSize: 42,
-          TextColor: 4294967295,
-          IsBold: true,
-        },
-      }).replace('" FontInfo":', '"FontInfo":');
-      subtitleClipsTrack.push({
-        anchorX: 0.0,
-        anchorY: 0.0,
-        blendMode: 0,
-        blendVisible: true,
-        clipList: [],
-        clipMaskList: [],
-        clipMode: 0,
-        contextType: 0,
-        enable: true,
-        inPoint: 0,
-        locked: false,
-        name: 'Subtitles',
-        opacity: 100,
-        outPoint: totalTicks,
-        rotation: 0.0,
-        scaleX: 1.0,
-        scaleY: 1.0,
-        speed: 1.0,
-        subtitleSource: subSourceJson,
-        sync: 0,
-        tlBegin: 0,
-        tlEnd: totalTicks,
-        transX: 0.0,
-        transY: 0.0,
-        type: 22,
-        uid: uidLower(`sub_uid:${pid}`),
-        userData: [
-          udStr('Subtitles', 50, true),
-          udGuid38(subGuid, 30309),
-        ],
-      });
-    }
+
+  // Strip internal helper keys before serializing medias_info.json
+  for (const mid of mediaIds) {
+    delete mediaItemsMeta[mid]._clip_ref_path;
+    delete mediaItemsMeta[mid]._orig_abs_path;
+    delete mediaItemsMeta[mid]._dur_sec;
   }
 
   const tracks = [
     {
-      clipList: videoClipsTrack,
-      trackTag: 1,
-      trackType: 1,
-      userData: [udInt32(0, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(54, 12000)],
-      uuid: uidLower('track_v_main'),
+      busUuids: [AUDIO_BUS_UID],
+      clipList: voClipsTrack,
+      trackType: 2,
+      userData: [udInt32(45, 12000)],
+      uuid: uidLower('track_a_vo'),
     },
     {
-      audioBusUid: AUDIO_BUS_UID,
-      balance: 0.5,
-      clipList: [],
-      gain: 0.0,
-      solo: false,
-      trackTag: 1,
+      busUuids: [AUDIO_BUS_UID],
+      clipList: poemClipsTrack,
       trackType: 2,
-      userData: [udInt32(0, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(54, 12000)],
+      userData: [udInt32(45, 12000)],
       uuid: uidLower('track_a_default'),
     },
     {
-      audioBusUid: AUDIO_BUS_UID,
-      balance: 0.5,
-      clipList: voClipsTrack,
-      gain: 0.0,
-      solo: false,
-      trackTag: 2,
+      busUuids: [AUDIO_BUS_UID],
+      clipList: [],
+      trackTag: 1,
       trackType: 2,
-      userData: [udInt32(1, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(54, 12000)],
-      uuid: uidLower('track_a_vo'),
+      userData: [udInt32(3, 20)],
+      uuid: uidLower('track_a_vid'),
+    },
+    {
+      clipList: videoClipsTrack,
+      trackTag: 2,
+      trackType: 1,
+      userData: [udInt32(1, 21), udInt32(70, 12000)],
+      uuid: uidLower('track_v_main'),
     },
   ];
 
-  if (poemClipsTrack.length) {
-    tracks.push({
-      audioBusUid: AUDIO_BUS_UID,
-      balance: 0.5,
-      clipList: poemClipsTrack,
-      gain: 0.0,
-      solo: false,
-      trackTag: 4,
-      trackType: 2,
-      userData: [udInt32(2, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(54, 12000)],
-      uuid: uidLower('track_a_poem'),
-    });
-  }
-  if (subtitleClipsTrack.length) {
-    tracks.push({
-      clipList: subtitleClipsTrack,
-      trackTag: 4,
-      trackType: 1,
-      userData: [udInt32(1, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(32, 12000)],
-      uuid: uidLower('track_v_subtitles'),
-    });
-  }
   if (logoClipsTrack.length) {
     tracks.push({
       clipList: logoClipsTrack,
-      trackTag: 6,
       trackType: 1,
-      userData: [udInt32(1, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(32, 12000)],
+      userData: [udInt32(70, 12000)],
       uuid: uidLower('track_v_logo'),
     });
   }
@@ -4509,7 +4404,7 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
           udGuid64(TIMELINE_UUID, 11000),
           udGuid64(filmoraGuid(`tl3:${pid}`), 3),
           udGuid38(TIMELINE_UUID, 30309),
-          udStr(crypto.createHash('md5').update(`Filmora${TIMELINE_MEDIA_ID}`, 'utf-8').digest('hex'), 140),
+          udStr(crypto.createHash('md5').update(`Filmora${TIMELINE_MEDIA_ID}`, 'utf-8').digest('hex'), 140, false),
           udBytes(tlPageJson, 30306),
           udInt32(0, 11003),
           udBytes(tlRangeJson, 11001),
@@ -4554,7 +4449,7 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     project_player_quality: 0,
     project_player_zoom_level: 0,
     project_player_safe_zone: false,
-    project_archive: Boolean(archiveMode),
+    project_archive: true,
     project_storage: true,
     project_backup: false,
     project_cover: false,
@@ -4565,7 +4460,10 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     project_template_name: '',
     timeline_mediaId: TIMELINE_MEDIA_ID,
     project_guid: projGuid,
-    proj_zip_save_path: wfpSavePath ? normSlash(wfpSavePath) : `${safeName}.wfp`,
+    proj_zip_save_path:
+      wfpSavePath && /^[A-Za-z]:\//.test(normSlash(wfpSavePath))
+        ? normSlash(wfpSavePath)
+        : `C:/Users/Kohin/Downloads/${safeName}.wfp`,
     proj_cover_proj_path: coverBackupPath,
     nSizeRatioType: 0,
     project_source: crypto.createHash('md5').update(`Filmora${nowTs}`, 'utf-8').digest('hex'),
@@ -4593,33 +4491,43 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
   } catch {}
 
   const zip = new AdmZip();
+  const addStored = (entryPath, buf) => {
+    zip.addFile(entryPath, buf);
+    const e = zip.getEntry(entryPath);
+    if (e) e.header.method = 0;
+  };
+  const addDeflated = (entryPath, buf) => {
+    zip.addFile(entryPath, buf);
+    const e = zip.getEntry(entryPath);
+    if (e) e.header.method = 8;
+  };
+
   for (const [mid, mjson] of Object.entries(perMediaJson)) {
-    zip.addFile(`ProjectFolder/Medias/${mid}/media.json`, Buffer.from(JSON.stringify(mjson), 'utf-8'));
+    addStored(`ProjectFolder/Medias/${mid}/media.json`, Buffer.from(JSON.stringify(mjson), 'utf-8'));
     const metaEntry = mediaItemsMeta[mid] || {};
     if (metaEntry.media_type !== 4) {
-      zip.addFile(`ProjectFolder/Medias/${mid}/thumbnail.png`, THUMB_320_180);
+      addStored(`ProjectFolder/Medias/${mid}/thumbnail.png`, THUMB_320_180);
     }
   }
-  zip.addFile(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/thumbnail.png`, THUMB_320_180);
-  zip.addFile('ProjectFolder/Anon/AppData/Windows/functionExtraData.json', Buffer.from('{"9":"2"}', 'utf-8'));
-  zip.addFile('ProjectFolder/Medias/medias_info.json', Buffer.from(formatMediasInfoJson(mediaIds, TIMELINE_MEDIA_ID, mediaItemsMeta), 'utf-8'));
-  zip.addFile(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/extra.json`, Buffer.from(JSON.stringify(extraJson), 'utf-8'));
-  zip.addFile(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/timeline.wesproj`, Buffer.from(JSON.stringify(wesproj), 'utf-8'));
-  zip.addFile('ProjectFolder/project_info.json', Buffer.from(JSON.stringify(projectInfo, null, 4), 'utf-8'));
-  zip.addFile('ProjectFolder/Anon/Cover/thumb.fsthumb', COVER_160_90);
-  zip.addFile('ProjectFolder/dgs_project.json', Buffer.from(rawDgs, 'utf-8'));
+  addStored(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/thumbnail.png`, THUMB_320_180);
+  addStored('ProjectFolder/Anon/AppData/Windows/functionExtraData.json', Buffer.from('{"9":"2"}', 'utf-8'));
+  addDeflated('ProjectFolder/Medias/medias_info.json', Buffer.from(formatMediasInfoJson(mediaIds, TIMELINE_MEDIA_ID, mediaItemsMeta, nowTs, totalTicks), 'utf-8'));
+  addDeflated(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/extra.json`, Buffer.from(JSON.stringify(extraJson), 'utf-8'));
+  addDeflated(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/timeline.wesproj`, Buffer.from(JSON.stringify(wesproj), 'utf-8'));
+  addDeflated('ProjectFolder/project_info.json', Buffer.from(JSON.stringify(projectInfo), 'utf-8'));
+  addDeflated('ProjectFolder/Anon/Cover/thumb.fsthumb', COVER_160_90);
   if (dgsComment) {
     zip.addZipComment(dgsComment);
   }
 
-  return { wfpBuffer: zip.toBuffer(), mediaGuidToPath };
+  return { wfpBuffer: zip.toBuffer(), mediaGuidToPath, dgsComment };
 }
 
 function buildWfpBundleFileOnDisk(pid, rawTitle, bundlePath, progressCb = null) {
   const safeTitle = String(rawTitle || `Project_${pid}`).trim().replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
   if (progressCb) progressCb(10, 'Building Filmora 15 .wfp archive metadata…');
   const innerWfpName = `${safeTitle}.wfp`;
-  const { wfpBuffer, mediaGuidToPath } = buildWfpAndMediaMap(pid, rawTitle, {
+  const { wfpBuffer, mediaGuidToPath, dgsComment } = buildWfpAndMediaMap(pid, rawTitle, {
     wfpSavePath: path.join(path.dirname(bundlePath), innerWfpName),
     archiveMode: true,
   });
@@ -4635,7 +4543,7 @@ function buildWfpBundleFileOnDisk(pid, rawTitle, bundlePath, progressCb = null) 
     }
     if (fs.existsSync(srcPath) && fs.statSync(srcPath).isFile()) {
       bundleZip.addLocalFile(srcPath, `Medias/${mid}`, path.basename(srcPath));
-      // Set STORED method on large media entries so Filmora 15 opens .wfpbundle directly
+      // Set STORED method on media entries so Filmora 15 opens .wfpbundle directly
       const entry = bundleZip.getEntry(`Medias/${mid}/${path.basename(srcPath)}`);
       if (entry) entry.header.method = 0;
     }
@@ -4644,6 +4552,9 @@ function buildWfpBundleFileOnDisk(pid, rawTitle, bundlePath, progressCb = null) 
   bundleZip.addFile(innerWfpName, wfpBuffer);
   const wfpEntry = bundleZip.getEntry(innerWfpName);
   if (wfpEntry) wfpEntry.header.method = 0;
+  if (dgsComment) {
+    bundleZip.addZipComment(dgsComment);
+  }
   fs.mkdirSync(path.dirname(bundlePath), { recursive: true });
   bundleZip.writeZip(bundlePath);
   return { bundlePath, fileCount: items.length + 1, innerWfpBuffer: wfpBuffer };
@@ -4970,7 +4881,26 @@ async function handleOpenProjectFile(tempPath, origName) {
         dgsData.logo.path = dstLogo;
         saveJson(pid, 'logo.json', dgsData.logo);
         if (dgsData.timeline) dgsData.timeline.logo_path = dstLogo;
+      } else {
+        saveJson(pid, 'logo.json', dgsData.logo);
       }
+    }
+
+    // Pre-seed media.json with dgsData.media so:
+    // 1) reindexMedia reuses known durations & IDs (0 ffprobe calls on 30+ videos!)
+    // 2) standalone .wfp files (where media is local on the user's PC) retain all media items!
+    if (Array.isArray(dgsData.media) && dgsData.media.length > 0) {
+      const seededMedia = dgsData.media.map((m) => {
+        const rp = resolveDocDirOrPath(m.path || m.filename || '');
+        const existsOnDisk = Boolean(rp && fs.existsSync(rp));
+        return {
+          ...m,
+          id: m.id || crypto.randomUUID(),
+          path: existsOnDisk ? path.resolve(rp) : (rp || m.path),
+          local_only: !existsOnDisk,
+        };
+      });
+      saveJson(pid, 'media.json', seededMedia);
     }
 
     const mediaItems = await reindexMedia(pid);
@@ -4984,11 +4914,14 @@ async function handleOpenProjectFile(tempPath, origName) {
         for (const s of vo.slots) {
           if (s && s.path) s.path = resolveDocDirOrPath(s.path);
         }
-        // If multi-slot VO was archived as individual slots without merged_narration.mp3, rebuild merged narration VO
-        if (vo.slots.length > 1 && (!vo.path || !fs.existsSync(vo.path))) {
+        // If multi-slot VO was archived as individual slots without merged_narration.mp3, rebuild merged narration VO only if slot files exist on disk
+        const allSlotsExist = vo.slots.every((s) => s && s.path && fs.existsSync(s.path));
+        if (vo.slots.length > 1 && allSlotsExist && (!vo.path || !fs.existsSync(vo.path))) {
           const rebuilt = await rebuildMergedVo(pid, vo.slots);
           vo.path = rebuilt.path;
           vo.duration = rebuilt.duration;
+        } else if (vo.slots.length === 1 && vo.slots[0]?.path && fs.existsSync(vo.slots[0].path)) {
+          vo.path = vo.slots[0].path;
         }
       }
       saveJson(pid, 'voiceover.json', vo);
@@ -5003,6 +4936,7 @@ async function handleOpenProjectFile(tempPath, origName) {
     }
 
     const plan = dgsData.timeline;
+    const sourcePid = dgsData.source_project_id || dgsData.project_id || null;
     plan.project_id = pid;
     if (plan.voiceover_path) plan.voiceover_path = dgsData.voiceover?.path || resolveDocDirOrPath(plan.voiceover_path);
     if (plan.poem_voiceover_path) plan.poem_voiceover_path = resolveDocDirOrPath(plan.poem_voiceover_path);
@@ -5024,6 +4958,7 @@ async function handleOpenProjectFile(tempPath, origName) {
     saveJson(pid, 'last_export.json', { title });
     return {
       project_id: pid,
+      source_project_id: sourcePid,
       title,
       scenes: loadJson(pid, 'script.json') || [],
       poem: dgsData.script_meta?.poem || { has_poem: Boolean(plan.has_poem) },
@@ -5039,10 +4974,38 @@ async function handleOpenProjectFile(tempPath, origName) {
   if (wesprojData) {
     const title = projInfoData?.project_file_name || projTitle;
     const resUidMap = {};
+    const resDurMap = {};
+    const seededFromWesproj = [];
     for (const rItem of wesprojData.resources || []) {
       const ruid = String(rItem.sourceUuid || rItem.uid || '').trim();
       const rfn = String(rItem.filename || '').trim();
       if (ruid && rfn) resUidMap[ruid] = rfn;
+      const ticks = Number(rItem.mediaLength || rItem.duration || 0);
+      const durS = ticks > 0 ? Math.round((ticks / TICKS_PER_SEC) * 1000) / 1000 : null;
+      if (rfn) {
+        const resolved = resolveDocDirOrPath(rfn);
+        const fname = path.basename(resolved || rfn);
+        const fext = path.extname(fname).toLowerCase();
+        if (durS) resDurMap[fname.toLowerCase()] = durS;
+        if (IMAGE_EXT.has(fext) || VIDEO_EXT.has(fext)) {
+          const itemKind = IMAGE_EXT.has(fext) ? 'image' : 'video';
+          const existsOnDisk = Boolean(resolved && fs.existsSync(resolved));
+          const screens = detectScreens(fname);
+          seededFromWesproj.push({
+            id: crypto.randomUUID(),
+            filename: fname,
+            path: existsOnDisk ? path.resolve(resolved) : (resolved || fname),
+            kind: itemKind,
+            screen: screens[0] || null,
+            screens,
+            duration: itemKind === 'video' ? (durS || 5.0) : null,
+            local_only: !existsOnDisk,
+          });
+        }
+      }
+    }
+    if (seededFromWesproj.length > 0) {
+      saveJson(pid, 'media.json', seededFromWesproj);
     }
 
     const tlInfos = wesprojData.timelineInfos || [];
@@ -5190,7 +5153,7 @@ async function handleOpenProjectFile(tempPath, origName) {
               is_poem: false,
               source: 'filmora',
             });
-          } else if (ttype === 2 && track.trackTag !== 1 && fn) {
+          } else if (ttype === 2 && fn && AUDIO_EXT.has(path.extname(fn).toLowerCase())) {
             voClipsRaw.push({
               path: fn,
               filename: path.basename(fn),
@@ -5220,55 +5183,37 @@ async function handleOpenProjectFile(tempPath, origName) {
     let voPath = null;
     if (voClipsRaw.length) {
       voClipsRaw.sort((a, b) => a.tl_b - b.tl_b);
-      for (let i = 0; i < voClipsRaw.length; i++) {
-        const vc = voClipsRaw[i];
+      const uniqueVoPaths = Array.from(new Set(voClipsRaw.map((v) => v.path)));
+      if (uniqueVoPaths.length === 1) {
+        voPath = uniqueVoPaths[0];
+        const fullDur =
+          resDurMap[path.basename(voPath).toLowerCase()] ||
+          Math.max(...voClipsRaw.map((v) => v.tl_e), ...voClipsRaw.map((v) => v.out_p), 10);
         voSlots.push({
-          slot: i + 1,
-          filename: vc.filename,
-          duration: vc.dur,
-          start_offset: vc.tl_b,
-          end_offset: vc.tl_e,
-          start: vc.tl_b,
-          end: vc.tl_e,
-          path: vc.path,
+          slot: 1,
+          filename: path.basename(voPath),
+          duration: fullDur,
+          start_offset: 0,
+          end_offset: fullDur,
+          start: 0,
+          end: fullDur,
+          path: voPath,
         });
-      }
-      if (voClipsRaw.length === 1 && voClipsRaw[0].in_p <= 0.05) {
-        voPath = voClipsRaw[0].path;
       } else {
-        const voDir = path.join(root, 'voiceover');
-        fs.mkdirSync(voDir, { recursive: true });
-        const mergedVo = path.join(voDir, 'merged_narration.mp3');
-        try {
-          const inputs = [];
-          const fparts = [];
-          const clabels = [];
-          let cursor = 0;
-          let segCount = 0;
-          for (let idxV = 0; idxV < voClipsRaw.length; idxV++) {
-            const vc = voClipsRaw[idxV];
-            if (vc.tl_b > cursor + 0.02) {
-              const gapD = vc.tl_b - cursor;
-              const glbl = `g${idxV}`;
-              fparts.push(`anullsrc=r=44100:cl=stereo,atrim=0:${gapD.toFixed(3)},asetpts=PTS-STARTPTS[${glbl}]`);
-              clabels.push(`[${glbl}]`);
-              segCount++;
-            }
-            inputs.push('-i', vc.path);
-            const albl = `a${idxV}`;
-            fparts.push(`[${idxV}:a]atrim=start=${vc.in_p.toFixed(3)}:end=${vc.out_p.toFixed(3)},asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo[${albl}]`);
-            clabels.push(`[${albl}]`);
-            segCount++;
-            cursor = vc.tl_e;
-          }
-          fparts.push(`${clabels.join('')}concat=n=${segCount}:v=0:a=1[aout]`);
-          await runFfmpeg(['-y', ...inputs, '-filter_complex', fparts.join(';'), '-map', '[aout]', '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', mergedVo]);
-          if (fs.existsSync(mergedVo) && fs.statSync(mergedVo).size > 256) {
-            voPath = mergedVo;
-          }
-        } catch {
-          voPath = voClipsRaw[0].path;
+        for (let i = 0; i < voClipsRaw.length; i++) {
+          const vc = voClipsRaw[i];
+          voSlots.push({
+            slot: i + 1,
+            filename: vc.filename,
+            duration: vc.dur,
+            start_offset: vc.tl_b,
+            end_offset: vc.tl_e,
+            start: vc.tl_b,
+            end: vc.tl_e,
+            path: vc.path,
+          });
         }
+        voPath = voClipsRaw[0].path;
       }
     }
 
@@ -5302,11 +5247,12 @@ async function handleOpenProjectFile(tempPath, origName) {
     saveJson(pid, 'last_export.json', { title });
     let voObj = null;
     if (voPath) {
-      const voLabel = voClipsRaw.length > 1 ? Array.from(new Set(voClipsRaw.map((v) => v.filename))).join(' + ') : path.basename(voPath);
+      const voLabel = voSlots.length > 1 ? Array.from(new Set(voSlots.map((v) => v.filename))).join(' + ') : path.basename(voPath);
+      const knownVoDur = resDurMap[path.basename(voPath).toLowerCase()] || voSlots[0]?.duration || totalDur;
       voObj = {
         path: voPath,
         filename: voLabel,
-        duration: (await probeDuration(voPath)) || totalDur,
+        duration: knownVoDur,
         kind: 'narration',
         slots: voSlots,
       };
