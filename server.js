@@ -58,6 +58,28 @@ const TICKS_PER_SEC = 10000000;
 const IMAGE_BASE_OFFSET_TICKS = 36000000000;
 const EXEC_OPTS = { timeout: 180000, maxBuffer: 50 * 1024 * 1024 };
 
+// Container-safe FFmpeg runner: caps decoder, filtergraph, and encoder threads to 1
+// so shared/containerized Linux environments never hit EAGAIN ("Resource temporarily unavailable")
+async function runFfmpeg(rawArgs, customOpts = {}) {
+  const args = ['-hide_banner', '-loglevel', 'error', '-filter_threads', '1', '-filter_complex_threads', '1'];
+  for (let i = 0; i < rawArgs.length; i++) {
+    const a = rawArgs[i];
+    if (a === '-hide_banner') continue;
+    if (a === '-loglevel') {
+      i++;
+      continue;
+    }
+    if (a === '-i') {
+      args.push('-threads', '1', '-i');
+    } else if (i === rawArgs.length - 1 && !String(a).startsWith('-')) {
+      args.push('-threads', '1', a);
+    } else {
+      args.push(a);
+    }
+  }
+  return await execFileAsync(FFMPEG_BIN, args, { ...EXEC_OPTS, ...customOpts });
+}
+
 const SUNDHARAM_BR = {
   format: 'mp4',
   resolution: '1920x1080',
@@ -562,10 +584,10 @@ async function detectSilences(audioPath) {
   if (!audioPath || !fs.existsSync(audioPath)) return [];
   try {
     const { stderr } = await execFileAsync(FFMPEG_BIN, [
-      '-hide_banner', '-nostats',
-      '-i', audioPath,
+      '-hide_banner', '-nostats', '-filter_threads', '1',
+      '-threads', '1', '-i', audioPath,
       '-af', 'silencedetect=noise=-34dB:d=0.18',
-      '-f', 'null', '-',
+      '-threads', '1', '-f', 'null', '-',
     ], { timeout: 90000, maxBuffer: 50 * 1024 * 1024 });
     const silences = [];
     let curStart = null;
@@ -993,7 +1015,7 @@ app.get('/api/projects/:id/media-thumb/:mediaId', async (req, res) => {
   const thumbFile = path.join(thumbDir, `${mediaId}.jpg`);
   if (!fs.existsSync(thumbFile)) {
     try {
-      await execFileAsync(FFMPEG_BIN, [
+      await runFfmpeg([
         '-y', '-ss', '0.1', '-i', item.path,
         '-frames:v', '1', '-vf', 'scale=320:-1',
         thumbFile,
@@ -1054,13 +1076,12 @@ app.post('/api/projects/:id/script', upload.single('file'), (req, res) => {
 
 async function normalizeVoSlotFile(srcPath, normPath) {
   try {
-    await execFileAsync(FFMPEG_BIN, [
-      '-y', '-hide_banner', '-loglevel', 'error',
-      '-i', srcPath,
+    await runFfmpeg([
+      '-y', '-i', srcPath,
       '-vn', '-ar', '44100', '-ac', '2',
       '-c:a', 'libmp3lame', '-b:a', '192k',
       normPath,
-    ], EXEC_OPTS);
+    ]);
     if (fs.existsSync(normPath) && fs.statSync(normPath).size > 256) {
       return normPath;
     }
@@ -1072,13 +1093,12 @@ async function ensureSilenceGapMp3(voDir) {
   const gapPath = path.join(voDir, 'silence_gap_500ms.mp3');
   if (fs.existsSync(gapPath) && fs.statSync(gapPath).size > 256) return gapPath;
   try {
-    await execFileAsync(FFMPEG_BIN, [
-      '-y', '-hide_banner', '-loglevel', 'error',
-      '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+    await runFfmpeg([
+      '-y', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
       '-t', '0.5',
       '-c:a', 'libmp3lame', '-b:a', '192k',
       gapPath,
-    ], EXEC_OPTS);
+    ]);
     if (fs.existsSync(gapPath)) return gapPath;
   } catch {}
   return null;
@@ -1144,13 +1164,12 @@ async function rebuildMergedVo(pid, slots) {
         }
       }
       fs.writeFileSync(concatListPath, lines.join('\n'), 'utf-8');
-      await execFileAsync(FFMPEG_BIN, [
-        '-y', '-hide_banner', '-loglevel', 'error',
-        '-f', 'concat', '-safe', '0',
+      await runFfmpeg([
+        '-y', '-f', 'concat', '-safe', '0',
         '-i', concatListPath,
         '-c', 'copy',
         mergedPath,
-      ], EXEC_OPTS);
+      ]);
       if (fs.existsSync(mergedPath) && fs.statSync(mergedPath).size > 256) {
         mergedOk = true;
       }
@@ -1173,14 +1192,13 @@ async function rebuildMergedVo(pid, slots) {
         }
       }
       filterParts.push(`${concatLabels.join('')}concat=n=${concatLabels.length}:v=0:a=1[aout]`);
-      await execFileAsync(FFMPEG_BIN, [
-        '-y', '-hide_banner', '-loglevel', 'error',
-        ...inputs,
+      await runFfmpeg([
+        '-y', ...inputs,
         '-filter_complex', filterParts.join(';'),
         '-map', '[aout]',
         '-vn', '-c:a', 'libmp3lame', '-b:a', '192k',
         mergedPath,
-      ], EXEC_OPTS);
+      ]);
       if (fs.existsSync(mergedPath) && fs.statSync(mergedPath).size > 256) {
         mergedOk = true;
       }
@@ -1693,8 +1711,10 @@ function buildVideoRateArgs(settings) {
     : ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'];
 
   let base = ['-c:v', vcodec];
-  if (vcodec === 'libx264' || vcodec === 'libx265') {
-    base.push('-preset', x264Preset);
+  if (vcodec === 'libx264') {
+    base.push('-preset', x264Preset, '-x264-params', 'threads=1:lookahead_threads=1');
+  } else if (vcodec === 'libx265') {
+    base.push('-preset', x264Preset, '-x265-params', 'pools=none:frame-threads=1');
   }
   base.push('-pix_fmt', 'yuv420p', ...colorSpace);
 
@@ -1767,18 +1787,16 @@ app.post('/api/projects/:id/export', async (req, res) => {
       const vfBase = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${fps},format=yuv420p`;
 
       if (!c.media_path || !fs.existsSync(c.media_path) || c.fit === 'missing') {
-        await execFileAsync(FFMPEG_BIN, [
-          '-y', '-hide_banner', '-loglevel', 'error',
-          '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:d=${clipDur}:r=${fps}`,
-          '-t', String(clipDur), '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-an', outPart,
-        ], EXEC_OPTS);
+        await runFfmpeg([
+          '-y', '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:d=${clipDur}:r=${fps}`,
+          '-t', String(clipDur), '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:lookahead_threads=1', '-pix_fmt', 'yuv420p', '-an', outPart,
+        ]);
       } else if (c.kind === 'image') {
-        await execFileAsync(FFMPEG_BIN, [
-          '-y', '-hide_banner', '-loglevel', 'error',
-          '-loop', '1', '-i', c.media_path,
+        await runFfmpeg([
+          '-y', '-loop', '1', '-i', c.media_path,
           '-t', String(clipDur), '-vf', vfBase,
-          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-pix_fmt', 'yuv420p', '-an', outPart,
-        ], EXEC_OPTS);
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:lookahead_threads=1', '-crf', '18', '-pix_fmt', 'yuv420p', '-an', outPart,
+        ]);
       } else {
         // Video clip: if source video is shorter than slot duration, freeze last frame with tpad
         const srcIn = Number(c.source_in || 0);
@@ -1790,12 +1808,11 @@ app.post('/api/projects/:id/export', async (req, res) => {
         const vfVideo = freeze > 0.05
           ? `${vfBase},tpad=stop_mode=clone:stop_duration=${freeze.toFixed(3)}`
           : vfBase;
-        await execFileAsync(FFMPEG_BIN, [
-          '-y', '-hide_banner', '-loglevel', 'error',
-          '-ss', String(srcIn), '-i', c.media_path,
+        await runFfmpeg([
+          '-y', '-ss', String(srcIn), '-i', c.media_path,
           '-t', String(clipDur), '-vf', vfVideo,
-          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-pix_fmt', 'yuv420p', '-an', outPart,
-        ], EXEC_OPTS);
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:lookahead_threads=1', '-crf', '18', '-pix_fmt', 'yuv420p', '-an', outPart,
+        ]);
       }
       partFiles.push(outPart);
     }
@@ -1804,10 +1821,9 @@ app.post('/api/projects/:id/export', async (req, res) => {
     const concatTxt = path.join(jobDir, 'concat.txt');
     fs.writeFileSync(concatTxt, partFiles.map((p) => `file '${p.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n'), 'utf-8');
     const silentMp4 = path.join(jobDir, 'silent.mp4');
-    await execFileAsync(FFMPEG_BIN, [
-      '-y', '-hide_banner', '-loglevel', 'error',
-      '-f', 'concat', '-safe', '0', '-i', concatTxt, '-c', 'copy', silentMp4,
-    ], EXEC_OPTS);
+    await runFfmpeg([
+      '-y', '-f', 'concat', '-safe', '0', '-i', concatTxt, '-c', 'copy', silentMp4,
+    ]);
 
     let videoSource = silentMp4;
     if (plan.logo_path && plan.logo_enabled !== false && fs.existsSync(plan.logo_path)) {
@@ -1816,12 +1832,11 @@ app.post('/api/projects/:id/export', async (req, res) => {
       const logoW = Math.max(90, Math.round(width * 0.1));
       const padX = Math.max(8, Math.round(width * 0.0078));
       const padY = Math.max(10, Math.round(height * 0.0176));
-      await execFileAsync(FFMPEG_BIN, [
-        '-y', '-hide_banner', '-loglevel', 'error',
-        '-i', silentMp4, '-i', plan.logo_path,
+      await runFfmpeg([
+        '-y', '-i', silentMp4, '-i', plan.logo_path,
         '-filter_complex', `[1:v]scale=${logoW}:-1[lg];[0:v][lg]overlay=W-w-${padX}:${padY}:format=auto,format=yuv420p[vout]`,
-        '-map', '[vout]', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-an', logoMp4,
-      ], EXEC_OPTS);
+        '-map', '[vout]', '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:lookahead_threads=1', '-crf', '18', '-an', logoMp4,
+      ]);
       videoSource = logoMp4;
     }
 
@@ -1832,6 +1847,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
       ? String(settings.format).toLowerCase()
       : 'mp4';
     const outPath = path.join(EXPORTS_DIR, pid, `${safeTitle}.${ext}`);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
     const movFlags = ext === 'mp4' || ext === 'mov' ? ['-movflags', '+faststart'] : [];
 
     const hasVo = Boolean(plan.voiceover_path && fs.existsSync(plan.voiceover_path) && !settings.export_video_only);
@@ -1845,7 +1861,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
     if (ext === 'mp3' || ext === 'wav') {
       const srcAudio = plan.voiceover_path || plan.poem_voiceover_path;
       if (srcAudio && fs.existsSync(srcAudio)) {
-        await execFileAsync(FFMPEG_BIN, ['-y', '-hide_banner', '-loglevel', 'error', '-i', srcAudio, ...aEncArgs, outPath], { timeout: 600000, maxBuffer: 50 * 1024 * 1024 });
+        await runFfmpeg(['-y', '-i', srcAudio, ...aEncArgs, outPath], { timeout: 600000 });
       }
     } else if (hasVo || hasPoem) {
       // Build narr_runs from (clip.start, clip.narration_in, clip.narration_out) so silent holds,
@@ -1913,8 +1929,8 @@ app.post('/api/projects/:id/export', async (req, res) => {
         filterComplex = `${filterParts.join(';')};${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:dropout_transition=0,volume=${mixLabels.length},apad=whole_dur=${totalTlDur.toFixed(3)}[aout]`;
       }
 
-      await execFileAsync(FFMPEG_BIN, [
-        '-y', '-hide_banner', '-loglevel', 'error',
+      await runFfmpeg([
+        '-y',
         '-i', videoSource,
         ...audioInputs,
         '-filter_complex', filterComplex,
@@ -1924,16 +1940,16 @@ app.post('/api/projects/:id/export', async (req, res) => {
         ...movFlags,
         '-t', totalTlDur.toFixed(3),
         outPath,
-      ], { timeout: 600000, maxBuffer: 50 * 1024 * 1024 });
+      ], { timeout: 600000 });
     } else {
-      await execFileAsync(FFMPEG_BIN, [
-        '-y', '-hide_banner', '-loglevel', 'error',
+      await runFfmpeg([
+        '-y',
         '-i', videoSource,
         ...vRateArgs,
         '-an',
         ...movFlags,
         outPath,
-      ], { timeout: 600000, maxBuffer: 50 * 1024 * 1024 });
+      ], { timeout: 600000 });
     }
 
     // Write sidecar SRT alongside export if requested
@@ -2064,13 +2080,12 @@ async function handleSceneVoFile(id, screen, tempPath, origName, queryParams = {
             concatLbls.push('[tail]');
           }
           filterParts.push(`${concatLbls.join('')}concat=n=${concatLbls.length}:v=0:a=1[aout]`);
-          await execFileAsync(FFMPEG_BIN, [
-            '-y', '-hide_banner', '-loglevel', 'error',
-            '-i', masterVo, '-i', dest,
+          await runFfmpeg([
+            '-y', '-i', masterVo, '-i', dest,
             '-filter_complex', filterParts.join(';'),
             '-map', '[aout]', '-vn', '-c:a', 'libmp3lame', '-b:a', '192k',
             splicedPath,
-          ], EXEC_OPTS);
+          ]);
           if (fs.existsSync(splicedPath) && fs.statSync(splicedPath).size > 256) {
             const newTotalVo = Number((await probeDuration(splicedPath)) || (totalVoDur + deltaNarr));
             tl.voiceover_path = splicedPath;
