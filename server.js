@@ -736,7 +736,8 @@ async function detectSilences(audioPath) {
     for (let attempt = 1; attempt <= 4; attempt++) {
       try {
         const { stderr } = await execFileAsync(FFMPEG_BIN, [
-          '-hide_banner', '-nostats',
+          '-hide_banner', '-nostats', '-loglevel', 'info',
+          '-filter_threads', '1', '-filter_complex_threads', '1',
           '-threads', '1', '-i', audioPath,
           '-af', 'silencedetect=noise=-32dB:d=0.20',
           '-threads', '1', '-f', 'null', '-',
@@ -1234,6 +1235,8 @@ app.get('/api/projects/recent', (req, res) => {
       const scenesRaw = loadJson(pid, 'script.json') || [];
       const clientMeta = loadJson(pid, 'client_meta.json') || {};
       if (!scenesRaw.length && !mediaRaw.length && !voMeta.path && !(tlRaw.clips && tlRaw.clips.length)) continue;
+      // Only include projects created/worked on by this individual PC (or legacy unclaimed projects)
+      if (reqClientId && clientMeta.client_id && clientMeta.client_id !== reqClientId) continue;
       let mtime = fs.statSync(path.join(PROJECTS_DIR, pid)).mtimeMs;
       for (const f of fs.readdirSync(metaDir)) {
         try { mtime = Math.max(mtime, fs.statSync(path.join(metaDir, f)).mtimeMs); } catch {}
@@ -1286,6 +1289,10 @@ app.delete('/api/projects/:id', (req, res) => {
 app.get('/api/projects/:id/load', (req, res) => {
   const pid = req.params.id;
   if (!fs.existsSync(projectRoot(pid))) return res.status(404).json({ detail: 'Project not found' });
+  const existingClient = loadJson(pid, 'client_meta.json') || {};
+  if (!existingClient.client_id) {
+    touchProjectClient(pid, req);
+  }
   const scriptMeta = loadJson(pid, 'script_meta.json') || {};
   const lastExp = loadJson(pid, 'last_export.json') || {};
   const title = lastExp.title || (scriptMeta.filename ? path.parse(scriptMeta.filename).name : `Project ${pid}`);
@@ -2027,6 +2034,11 @@ app.post('/api/projects/:id/build', async (req, res) => {
       }
     }
 
+    if (Array.isArray(req.body?.silences) && req.body.silences.length) {
+      voMeta.silences = req.body.silences;
+      saveJson(pid, 'voiceover.json', voMeta);
+    }
+
     // Auto-heal voMeta.duration === 0 or missing silences if VO file exists on disk
     if (voMeta.path && fs.existsSync(voMeta.path)) {
       if (!voMeta.duration || Number(voMeta.duration) <= 0) {
@@ -2080,9 +2092,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
         // Pure phonetic character + word + sentence-break weight for Marathi/Hindi (ignores flat 8s Excel placeholders)
         w = Math.max(1.2, devChars * 0.105 + words * 0.22 + sentBreaks * 0.25 + 0.25);
       } else if (voDur > 1) {
-        // Natural English instructional speaking duration (~0.31s/word + 0.36s/sentence + expressive sound repeat bonus)
+        // Natural English instructional speaking duration (~0.31s/word + 0.36s/sentence + expressive sound repeat + pause bonus)
+        const qPauseBonus = Math.min(2.2, questionPauseSeconds(s) * 0.45);
         w = words > 0
-          ? Math.max(1.1, words * 0.31 + sents * 0.36 + repMatches * 1.1 + 0.20)
+          ? Math.max(1.1, words * 0.31 + sents * 0.36 + repMatches * 1.1 + qPauseBonus + 0.20)
           : (Number(s.duration) || 2.0);
       } else {
         const wordEst = words > 0 ? Math.max(1.2, words * (isDevanagari ? 0.55 : 0.38) + 0.25) : (Number(s.duration) || 2.0);
@@ -2151,7 +2164,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
               const nextSec = k < narratedScenes.length
                 ? String(narratedScenes[k].section || '').split('|')[0].trim().toLowerCase()
                 : '';
-              const secBonus = (curSec && nextSec && curSec !== nextSec) ? 14 : 0;
+              const secBonus = (curSec && nextSec && curSec !== nextSec && diff < 35) ? 28 : 0;
               if (diff - secBonus < bestScore) {
                 bestScore = diff - secBonus;
                 bestIdx = k;
