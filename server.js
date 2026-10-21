@@ -411,19 +411,20 @@ async function reindexMedia(pid) {
     });
   }
 
-  // Preserve any local-only metadata items registered directly from the user's browser
+  // Preserve any external or local-only metadata items registered in media.json (e.g. from opened .wfp or browser)
   for (const m of existing) {
-    if (!m || !m.local_only) continue;
+    if (!m || !m.filename) continue;
     const nk = `${m.kind}:${String(m.filename || '').toLowerCase()}`;
     if (seenNameKind.has(nk)) continue;
     seenNameKind.add(nk);
+    const existsOnDisk = Boolean(m.path && fs.existsSync(m.path));
     const screens = Array.isArray(m.screens) && m.screens.length ? m.screens : detectScreens(m.filename);
     items.push({
       ...m,
       id: m.id || crypto.randomUUID(),
       screen: m.screen || screens[0] || null,
       screens,
-      local_only: true,
+      local_only: !existsOnDisk,
     });
   }
 
@@ -1856,11 +1857,39 @@ app.post('/api/projects/:id/poem-voiceover-meta', (req, res) => {
   }
 });
 
-app.get('/api/projects/:id/audio/:kind', (req, res) => {
-  const { id, kind } = req.params;
-  const meta = loadJson(id, kind === 'poem' ? 'poem_voiceover.json' : 'voiceover.json');
+async function serveProjectAudio(id, kind, res) {
+  let meta = loadJson(id, kind === 'poem' ? 'poem_voiceover.json' : 'voiceover.json');
+  if (kind !== 'poem' && (!meta || !meta.path || !fs.existsSync(meta.path)) && Array.isArray(meta?.slots)) {
+    const existingSlots = meta.slots.filter((s) => s && s.path && fs.existsSync(s.path));
+    if (existingSlots.length === 1) {
+      meta.path = existingSlots[0].path;
+      saveJson(id, 'voiceover.json', meta);
+    } else if (existingSlots.length > 1) {
+      meta = await rebuildMergedVo(id, meta.slots);
+    }
+  }
   if (!meta || !meta.path || !fs.existsSync(meta.path)) return res.status(404).end();
+  res.setHeader('Cache-Control', 'public, max-age=3600');
   res.sendFile(path.resolve(meta.path));
+}
+
+app.get('/api/projects/:id/audio/:kind', async (req, res) => {
+  await serveProjectAudio(req.params.id, req.params.kind, res);
+});
+app.get('/api/projects/:id/voiceover-audio', async (req, res) => {
+  await serveProjectAudio(req.params.id, 'narration', res);
+});
+app.get('/api/projects/:id/poem-audio', async (req, res) => {
+  await serveProjectAudio(req.params.id, 'poem', res);
+});
+app.get('/api/projects/:id/voiceover-slot/:slot', (req, res) => {
+  const { id, slot } = req.params;
+  const meta = loadJson(id, 'voiceover.json') || {};
+  const slotNum = Number(slot) || 1;
+  const entry = (meta.slots || []).find((s) => Number(s?.slot) === slotNum) || (slotNum === 1 ? meta : null);
+  if (!entry || !entry.path || !fs.existsSync(entry.path)) return res.status(404).end();
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.sendFile(path.resolve(entry.path));
 });
 
 function handleLogoFile(pid, tempPath, origName) {
@@ -1931,6 +1960,11 @@ app.post('/api/projects/:id/logo/toggle', (req, res) => {
 });
 
 app.get('/api/projects/:id/logo-file', (req, res) => {
+  const meta = loadJson(req.params.id, 'logo.json');
+  if (!meta || !meta.path || !fs.existsSync(meta.path)) return res.status(404).end();
+  res.sendFile(path.resolve(meta.path));
+});
+app.get('/api/projects/:id/logo', (req, res) => {
   const meta = loadJson(req.params.id, 'logo.json');
   if (!meta || !meta.path || !fs.existsSync(meta.path)) return res.status(404).end();
   res.sendFile(path.resolve(meta.path));
@@ -3750,7 +3784,9 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
 
   const registerMedia = (rawPath, kind, approxDurSec = 5.0) => {
     if (!rawPath) return ['', ''];
-    const p = path.resolve(rawPath);
+    const cleanRaw = normSlash(rawPath);
+    const existsOnServer = !cleanRaw.startsWith('local://') && fs.existsSync(cleanRaw);
+    const p = existsOnServer ? path.resolve(cleanRaw) : cleanRaw;
     const normAbs = normSlash(p);
     if (pathToMediaGuid.has(normAbs)) return pathToMediaGuid.get(normAbs);
 
@@ -3758,10 +3794,14 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     let fileSize = 512000;
     let md5Str = '';
     try {
-      const st = fs.statSync(p);
-      mtimeSec = Math.floor(st.mtimeMs / 1000);
-      fileSize = st.size;
-      md5Str = fileMd5Hex(p);
+      if (existsOnServer) {
+        const st = fs.statSync(p);
+        mtimeSec = Math.floor(st.mtimeMs / 1000);
+        fileSize = st.size;
+        md5Str = fileMd5Hex(p);
+      } else {
+        md5Str = crypto.createHash('md5').update(normAbs, 'utf-8').digest('hex');
+      }
     } catch {
       md5Str = crypto.createHash('md5').update(normAbs, 'utf-8').digest('hex');
     }
@@ -3770,15 +3810,16 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     const resUid = uidLower(`res:${pid}:${normAbs}`);
     const durSec = Math.max(0.5, Number(approxDurSec) || 5.0);
     const durTicks = kind === 'image' ? 0 : secToTicks(durSec);
+    const baseName = path.posix.basename(normAbs);
 
     // Ensure Windows-compatible drive path (never a Linux '/home/...' path that turns into 'file://home/...' UNC share on Windows!)
     const winDisplayPath = /^[A-Za-z]:\//.test(normAbs)
       ? normAbs
-      : `D:/AI Editor/data/projects/${pid}/${kind === 'image' ? 'media/images' : kind === 'video' ? 'media/videos' : 'voiceover'}/${path.basename(p)}`;
+      : `D:/AI Editor/data/projects/${pid}/${kind === 'image' ? 'media/images' : kind === 'video' ? 'media/videos' : 'voiceover'}/${baseName}`;
 
-    let clipRefPath = `%DOCUMENT_DIR%/Medias/${mid}/${path.basename(p)}`;
-    if (!archiveMode && relMap && (relMap[normAbs] || relMap[normSlash(rawPath)])) {
-      clipRefPath = relMap[normAbs] || relMap[normSlash(rawPath)];
+    let clipRefPath = `%DOCUMENT_DIR%/Medias/${mid}/${baseName}`;
+    if (!archiveMode && relMap && (relMap[normAbs] || relMap[cleanRaw])) {
+      clipRefPath = relMap[normAbs] || relMap[cleanRaw];
     }
 
     mediaIds.push(mid);
@@ -3790,7 +3831,7 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
       id: mid,
       media_type: mediaTypeNum,
       media_length: durTicks,
-      name: path.parse(p).name,
+      name: path.posix.parse(baseName).name,
       mediaCreationInfo: '{"creationType":0}',
       import_time: mtimeSec,
       src_md5: md5Str,
@@ -4211,6 +4252,14 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     return clipObj;
   };
 
+  // 0. Register all project library media items so all uploaded images & videos are preserved in Media Library & .wfpbundle
+  const allLibraryMedia = loadJson(pid, 'media.json') || [];
+  for (const m of allLibraryMedia) {
+    if (m && m.path && (m.kind === 'image' || m.kind === 'video')) {
+      registerMedia(m.path, m.kind, Math.max(Number(m.duration || 0), 5.0));
+    }
+  }
+
   // 1. Main visual scene clips
   const videoClipsTrack = [];
   for (let idx = 0; idx < (plan.clips || []).length; idx++) {
@@ -4379,7 +4428,7 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     currentTimelineId: 9,
     productName: 'Filmora',
     projectName: 'TLB',
-    projectVersion: '6,13,101,6',
+    projectVersion: '6, 13, 102, 19',
     resources,
     serialNumber: 16,
     serializationVersion: '28',
@@ -4427,15 +4476,15 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
   const safeName = String(title || `Project_${pid}`).trim().replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
   const coverBackupPath = `C:/Users/Kohin/AppData/Roaming/Wondershare/Wondershare Filmora/Backup/${projGuid}/ProjectFolder/Anon/Cover/cover_eFWdR.wfpbundle`;
   const projectInfo = {
-    vbl_modify_version: '8.6.2.8',
-    vbl_create_version: '8.6.2.8',
+    vbl_modify_version: '8.6.12.3',
+    vbl_create_version: '8.6.12.3',
     project_os_name: 'Windows',
     project_os_version: '',
     project_file_name: safeName,
     project_file_suffix: '.wfp',
     project_editor_name: 'Filmora',
-    project_editor_create_version: '15.6.4.11894',
-    project_editor_modify_version: '15.6.4.11894',
+    project_editor_create_version: '16.0.12.22388',
+    project_editor_modify_version: '16.0.12.22388',
     project_date_create: nowTs,
     project_date_modify: nowTs,
     project_timeline_duration: totalTicks,
@@ -4477,9 +4526,10 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
   const bundleRelMap = { ...(relMap || {}) };
   if (archiveMode) {
     for (const [mid, pAbs] of mediaGuidToPath.entries()) {
-      const relEntry = `Medias/${mid}/${path.basename(pAbs)}`;
-      bundleRelMap[normSlash(path.resolve(pAbs))] = relEntry;
-      bundleRelMap[normSlash(pAbs)] = relEntry;
+      const normP = normSlash(pAbs);
+      const relEntry = `Medias/${mid}/${path.posix.basename(normP)}`;
+      bundleRelMap[normSlash(path.resolve(normP))] = relEntry;
+      bundleRelMap[normP] = relEntry;
     }
   }
   const dgsBundle = buildDgsBundleDict(pid, title, Object.keys(bundleRelMap).length ? bundleRelMap : null);
@@ -4649,6 +4699,70 @@ app.get('/api/projects/:id/project-file/download', (req, res) => {
   res.download(path.resolve(meta.path), meta.filename);
 });
 
+// Fast WFP + Medias/{GUID} manifest so the browser can assemble .wfpbundle / .zip locally in ~1.5s without uploading 450MB to server
+app.get('/api/projects/:id/wfp-manifest', async (req, res) => {
+  try {
+    const pid = req.params.id;
+    if (!fs.existsSync(projectRoot(pid))) return res.status(404).json({ detail: 'Project not found' });
+    let plan = loadJson(pid, 'timeline.json');
+    if (plan) {
+      plan = await healTimelinePaths(pid, plan);
+      saveJson(pid, 'timeline.json', plan);
+    }
+    const rawTitle = String(req.query.title || `Project_${pid}`).trim();
+    const safeTitle = rawTitle.replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
+    const innerWfpName = `${safeTitle}.wfp`;
+    const { wfpBuffer, mediaGuidToPath, dgsComment } = buildWfpAndMediaMap(pid, rawTitle, {
+      wfpSavePath: `C:/Users/Kohin/Downloads/${innerWfpName}`,
+      archiveMode: true,
+    });
+    const mediaList = loadJson(pid, 'media.json') || [];
+    const voMeta = loadJson(pid, 'voiceover.json') || {};
+    const poemVoMeta = loadJson(pid, 'poem_voiceover.json') || {};
+    const logoMeta = loadJson(pid, 'logo.json') || {};
+    const entries = [];
+    for (const [mid, srcPath] of mediaGuidToPath.entries()) {
+      const normSrc = normSlash(srcPath);
+      const base = path.posix.basename(normSrc);
+      const baseLow = base.toLowerCase();
+      const fext = path.posix.extname(base).toLowerCase();
+      let kind = 'image';
+      if (VIDEO_EXT.has(fext)) kind = 'video';
+      else if (AUDIO_EXT.has(fext)) kind = 'audio';
+      const matchedMedia = mediaList.find(
+        (m) => (m.path && normSlash(m.path) === normSrc) || (String(m.filename || '').toLowerCase() === baseLow && m.kind === kind),
+      );
+      const matchedVoSlot = (voMeta.slots || []).find(
+        (s) => (s.path && normSlash(s.path) === normSrc) || baseLow === `slot_${s.slot}_${String(s.filename || '').toLowerCase()}` || String(s.filename || '').toLowerCase() === baseLow,
+      );
+      const isPoemVo = Boolean(poemVoMeta.path && (normSlash(poemVoMeta.path) === normSrc || String(poemVoMeta.filename || '').toLowerCase() === baseLow));
+      const isLogo = Boolean(logoMeta.path && (normSlash(logoMeta.path) === normSrc || String(logoMeta.filename || '').toLowerCase() === baseLow));
+      entries.push({
+        guid: mid,
+        filename: base,
+        entry_path: `Medias/${mid}/${base}`,
+        kind,
+        media_id: matchedMedia ? matchedMedia.id : null,
+        vo_slot: matchedVoSlot ? Number(matchedVoSlot.slot) : null,
+        orig_vo_filename: matchedVoSlot ? matchedVoSlot.filename : null,
+        is_poem_vo: isPoemVo,
+        is_logo: isLogo,
+        exists_on_server: Boolean(!normSrc.startsWith('local://') && fs.existsSync(srcPath) && fs.statSync(srcPath).isFile()),
+      });
+    }
+    res.json({
+      ok: true,
+      safe_title: safeTitle,
+      inner_wfp_name: innerWfpName,
+      wfp_base64: wfpBuffer.toString('base64'),
+      dgs_comment: dgsComment || '',
+      entries,
+    });
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
 // Collect & Pack portable ZIP + .wfpbundle
 app.get('/api/projects/:id/collect/status', (req, res) => {
   res.json(collectStatus[req.params.id] || { running: false, percent: 0, message: '' });
@@ -4785,11 +4899,11 @@ async function handleOpenProjectFile(tempPath, origName) {
     if (e.isDirectory) continue;
     const norm = e.entryName.replace(/\\/g, '/');
     if (
-      (norm.startsWith('Medias/') || norm.startsWith('Resources/') || norm.includes('/Media/') || norm.startsWith('Media/')) &&
+      (norm.startsWith('Medias/') || norm.includes('/Medias/') || norm.startsWith('Resources/') || norm.includes('/Media/') || norm.startsWith('Media/')) &&
       !norm.startsWith('ProjectFolder/') &&
+      !norm.includes('/ProjectFolder/') &&
       norm !== 'Medias/project_media.json'
     ) {
-      const parts = norm.split('/');
       const base = path.basename(norm);
       const fext = path.extname(base).toLowerCase();
       if (!IMAGE_EXT.has(fext) && !VIDEO_EXT.has(fext) && !AUDIO_EXT.has(fext)) continue;
@@ -4801,14 +4915,21 @@ async function handleOpenProjectFile(tempPath, origName) {
       fs.writeFileSync(destFile, e.getData());
       extractedMap[norm] = destFile;
       wfpbundleNameMap[base.toLowerCase()] = destFile;
-      if (norm.startsWith('Medias/') && parts.length >= 3) {
-        wfpbundleGuidMap[parts[1]] = destFile;
+      const mediasIdx = norm.indexOf('Medias/');
+      if (mediasIdx >= 0) {
+        const subParts = norm.slice(mediasIdx).split('/');
+        if (subParts.length >= 3 && subParts[1]) {
+          wfpbundleGuidMap[subParts[1]] = destFile;
+          extractedMap[subParts.slice(0, 3).join('/')] = destFile;
+        }
       }
     }
   }
 
   let wfpZip = outerZip;
-  const innerWfpEntry = entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp') && !e.entryName.includes('/'));
+  const innerWfpEntry =
+    entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp') && !e.entryName.includes('/')) ||
+    entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp'));
   if (innerWfpEntry) {
     wfpZip = new AdmZip(innerWfpEntry.getData());
   }
@@ -4851,10 +4972,10 @@ async function handleOpenProjectFile(tempPath, origName) {
       if (extractedMap[normS]) return extractedMap[normS];
     }
     if (extractedMap[normS]) return extractedMap[normS];
-    const baseLow = path.basename(normS).toLowerCase();
+    const baseLow = path.posix.basename(normS).toLowerCase();
     if (baseLow && wfpbundleNameMap[baseLow]) return wfpbundleNameMap[baseLow];
     if (fs.existsSync(s)) return path.resolve(s);
-    return s;
+    return normS;
   };
 
   // Path 1: Full DGS Bundle Restoration (`ProjectFolder/dgs_project.json` or `DGS1:` comment)
@@ -4886,11 +5007,32 @@ async function handleOpenProjectFile(tempPath, origName) {
       }
     }
 
-    // Pre-seed media.json with dgsData.media so:
+    // Pre-seed media.json with dgsData.media (or synthesize from dgsData.timeline.clips if dgsData.media was empty) so:
     // 1) reindexMedia reuses known durations & IDs (0 ffprobe calls on 30+ videos!)
     // 2) standalone .wfp files (where media is local on the user's PC) retain all media items!
-    if (Array.isArray(dgsData.media) && dgsData.media.length > 0) {
-      const seededMedia = dgsData.media.map((m) => {
+    let rawMediaList = Array.isArray(dgsData.media) && dgsData.media.length > 0 ? dgsData.media : [];
+    if (!rawMediaList.length && Array.isArray(dgsData.timeline?.clips)) {
+      const seenPaths = new Set();
+      for (const c of dgsData.timeline.clips) {
+        if (!c || !c.media_path) continue;
+        const fname = path.posix.basename(normSlash(c.media_path));
+        const key = `${c.kind || 'image'}:${fname.toLowerCase()}`;
+        if (seenPaths.has(key)) continue;
+        seenPaths.add(key);
+        const screens = c.screen ? [c.screen] : detectScreens(fname);
+        rawMediaList.push({
+          id: c.media_id || crypto.randomUUID(),
+          filename: fname,
+          path: c.media_path,
+          kind: c.kind === 'video' ? 'video' : 'image',
+          screen: screens[0] || null,
+          screens,
+          duration: c.kind === 'video' ? Math.max(Number(c.duration || 0), Number(c.source_out || 0), 5.0) : null,
+        });
+      }
+    }
+    if (rawMediaList.length > 0) {
+      const seededMedia = rawMediaList.map((m) => {
         const rp = resolveDocDirOrPath(m.path || m.filename || '');
         const existsOnDisk = Boolean(rp && fs.existsSync(rp));
         return {
@@ -5331,6 +5473,7 @@ app.post('/api/projects/open-file', upload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ detail: 'Missing project file' });
     const origName = path.basename(req.file.originalname || 'project.wfpbundle');
     const result = await handleOpenProjectFile(req.file.path, origName);
+    if (result?.project_id) touchProjectClient(result.project_id, req);
     res.json(result);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -5415,6 +5558,7 @@ async function processChunkUpload(req, res) {
     }
     if (target === 'open_file') {
       const result = await handleOpenProjectFile(partPath, origName);
+      if (result?.project_id) touchProjectClient(result.project_id, req);
       return res.json(result);
     }
 
