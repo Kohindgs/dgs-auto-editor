@@ -571,12 +571,26 @@ function onPoemTrack(scene) {
   return Boolean(scene.is_poem);
 }
 
-function isSpokenVo(scene) {
+function isIndicScript(scenes) {
+  const sample = (scenes || [])
+    .slice(0, 40)
+    .map((s) => String(s?.voiceover_text || s?.onscreen_text || s?.text || ''))
+    .join(' ');
+  const devMatches = sample.match(/[\u0900-\u097F]/g);
+  return Boolean(devMatches && devMatches.length >= 12);
+}
+
+function isSpokenVo(scene, opts = {}) {
   if (!scene || isInstrumentalScene(scene)) return false;
   const text = String(scene.voiceover_text || '').trim();
   if (!text || text === '—' || text === '-' || text === '–') return false;
   const low = text.toLowerCase();
   if (low.startsWith('instrumental')) return false;
+  if (low.startsWith('read exact') || low === 'read on-screen text' || low === 'read onscreen text') return false;
+  // For Marathi/Indic chapters without a separate Poem VO, poem lyrics are recorded inside the narration VO
+  if (opts.indic && !opts.hasPoemVo) {
+    return true;
+  }
   if (/suno\s*master|attached\s+poem\s+track/i.test(String(scene.voiceover_raw || ''))) return false;
   return true;
 }
@@ -762,6 +776,15 @@ function wrapTwoLines(text, width = 44) {
   return line2.length ? `${line1.join(' ')}\n${line2.join(' ')}` : line1.join(' ');
 }
 
+function readingCap(text) {
+  const words = (String(text || '').match(/[\u0900-\u097F]+|[\u0600-\u06FF]+|[^\W_]+(?:'[^\W_]+)?/g) || []).length;
+  const n = Math.max(1, words);
+  if (/[\u0900-\u097F]/.test(String(text || ''))) {
+    return Math.max(1.2, Math.min(12.0, n * 0.65 + 0.8));
+  }
+  return Math.max(0.8, Math.min(12.0, n * 0.38 + 0.4));
+}
+
 function buildSrtCues(clips, planOpts = {}) {
   const cues = [];
   const poemOk = Boolean(planOpts.poem_voiceover_path);
@@ -795,6 +818,7 @@ function buildSrtCues(clips, planOpts = {}) {
     } else if (!c.vo_text) {
       continue;
     }
+    end = Math.min(end, start + Math.max(readingCap(txt), end - start));
     if (end <= start + 0.2) continue;
 
     const sentences = txt.split(/(?<=[.!?।])\s+/).map((s) => s.trim()).filter(Boolean);
@@ -1389,27 +1413,37 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const voDur = Number(voMeta.duration || 0);
     const poemVoDur = Number(poemVoMeta.duration || 0);
     const hasPoemVo = Boolean(poemVoMeta.path && fs.existsSync(poemVoMeta.path));
+    const indic = isIndicScript(scenes);
     const silences = voMeta.path && fs.existsSync(voMeta.path) ? await detectSilences(voMeta.path) : [];
 
     // Separate scenes into spoken narration vs poem/instrumental so poem scenes do not eat narration VO
+    // Note: For Marathi/Indic chapters without a separate Poem VO (!hasPoemVo), poem lyrics live inside the narration VO!
     const speechScenes = scenes.filter((s) => {
       if (hasPoemVo && onPoemTrack(s)) return false;
-      if (s.audio_start != null && s.audio_end != null && onPoemTrack(s)) return false;
-      return isSpokenVo(s);
+      if (!indic && s.audio_start != null && s.audio_end != null && onPoemTrack(s)) return false;
+      return isSpokenVo(s, { indic, hasPoemVo });
     });
 
     const speechWeights = new Map();
     let totalSpeechWeight = 0;
     for (const s of speechScenes) {
-      const txt = String(s.voiceover_text || s.onscreen_text || '');
+      const txt = String(s.voiceover_text || s.onscreen_text || '').trim();
       const words = txt.split(/\s+/).filter(Boolean).length;
-      const isDevanagari = /[\u0900-\u097F]/.test(txt);
-      const wordEst = words > 0 ? Math.max(1.2, words * (isDevanagari ? 0.55 : 0.38) + 0.25) : (Number(s.duration) || 2.0);
-      const w = s.duration && Number(s.duration) > 0 ? 0.55 * wordEst + 0.45 * Number(s.duration) : wordEst;
+      const devChars = (txt.match(/[\u0900-\u097F]/g) || []).length;
+      const isDevanagari = devChars > 0;
+      const sentBreaks = Math.max(0, (txt.match(/[.!?।]/g) || []).length - 1);
+      let w;
+      if (isDevanagari && voDur > 1) {
+        // Pure phonetic character + word + sentence-break weight for Marathi/Hindi (ignores flat 8s Excel placeholders)
+        w = Math.max(1.2, devChars * 0.105 + words * 0.22 + sentBreaks * 0.25 + 0.25);
+      } else {
+        const wordEst = words > 0 ? Math.max(1.2, words * (isDevanagari ? 0.55 : 0.38) + 0.25) : (Number(s.duration) || 2.0);
+        w = s.duration && Number(s.duration) > 0 ? 0.55 * wordEst + 0.45 * Number(s.duration) : wordEst;
+      }
       speechWeights.set(s.screen, w);
       totalSpeechWeight += w;
     }
-    const scale = voDur > 1 && totalSpeechWeight > 0 ? voDur / totalSpeechWeight : 1;
+    let remainingSpeechWeight = totalSpeechWeight;
 
     const rawClips = [];
     let tlCursor = 0;
@@ -1422,8 +1456,9 @@ app.post('/api/projects/:id/build', async (req, res) => {
     // Group scenes into runs of 'poem' vs 'speech' when poem clock is active
     for (let i = 0; i < scenes.length; i++) {
       const s = scenes[i];
-      const isPoemScene = (hasPoemVo || (s.audio_start != null && s.audio_end != null)) && onPoemTrack(s);
+      const isPoemScene = (hasPoemVo || (!indic && s.audio_start != null && s.audio_end != null)) && onPoemTrack(s);
       const spoken = !isPoemScene && speechWeights.has(s.screen);
+      const isInst = isInstrumentalScene(s);
 
       let clipDur = 2.5;
       let narrIn = null;
@@ -1445,23 +1480,31 @@ app.post('/api/projects/:id/build', async (req, res) => {
         poemEndTime = Math.max(poemEndTime, tlCursor + clipDur);
       } else if (spoken) {
         const w = speechWeights.get(s.screen) || 2.0;
-        let spokenDur = Math.max(0.6, w * scale);
+        const isLastSpoken = s.screen === speechScenes[speechScenes.length - 1]?.screen;
+        const remVo = Math.max(0.5, voDur > 1 ? voDur - narrCursor : remainingSpeechWeight);
+        let spokenDur = isLastSpoken
+          ? remVo
+          : Math.max(0.6, (w / Math.max(0.1, remainingSpeechWeight)) * remVo);
         let narrEnd = narrCursor + spokenDur;
 
-        const isLastSpoken = s.screen === speechScenes[speechScenes.length - 1]?.screen;
         if (silences.length && !isLastSpoken) {
           let bestSilCut = null;
-          let bestDist = 1.25;
+          let bestScore = -999;
+          const searchWindow = indic ? Math.max(1.8, spokenDur * 0.38) : 1.25;
           for (const [ss, se] of silences) {
+            const sDur = se - ss;
             const mid = 0.5 * (ss + se);
             const dist = Math.abs(mid - narrEnd);
-            if (dist < bestDist && ss > narrCursor + 0.45) {
-              bestDist = dist;
-              // Cut ~0.14s before the next line's voice onset so no word is ever clipped or rushed
-              const hasPauseBreak = questionPauseSeconds(s) > 0;
-              bestSilCut = hasPauseBreak
-                ? Math.max(ss + 0.14, Math.min(se - 0.18, ss + Math.min(0.40, 0.48 * (se - ss))))
-                : Math.max(ss + 0.14, se - 0.14);
+            if (dist <= searchWindow && ss > narrCursor + (indic ? 0.6 : 0.45)) {
+              const score = indic ? (Math.min(1.2, sDur * 1.2) - dist * 0.65) : -dist;
+              if (score > bestScore) {
+                bestScore = score;
+                // Cut ~0.14s before the next line's voice onset so no word is ever clipped or rushed
+                const hasPauseBreak = questionPauseSeconds(s) > 0;
+                bestSilCut = hasPauseBreak
+                  ? Math.max(ss + 0.14, Math.min(se - 0.18, ss + Math.min(0.40, 0.48 * sDur)))
+                  : Math.max(ss + 0.14, se - 0.14);
+              }
             }
           }
           if (bestSilCut != null && bestSilCut > narrCursor + 0.35) {
@@ -1477,6 +1520,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
         narrOut = Math.round(narrEnd * 1000) / 1000;
         clipDur = Math.max(0.4, narrOut - narrIn);
         narrCursor = narrEnd;
+        remainingSpeechWeight = Math.max(0, remainingSpeechWeight - w);
       } else {
         // Silent title / instrumental card: use script duration without advancing narrCursor
         clipDur = Math.max(0.4, Number(s.duration) || 2.0);
@@ -1486,6 +1530,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       const { video, image } = pickMediaForScreen(s.screen, media, s.visual_direction || s.visual_type);
       const primary = video && image ? image : (image || video);
       const extraVid = video && image ? video : null;
+      const capTxt = isInst ? '' : (s.voiceover_text || s.onscreen_text || '');
 
       if (!primary) {
         rawClips.push({
@@ -1499,8 +1544,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
           source_in: 0,
           source_out: dur,
           script_text: s.text || s.voiceover_text || s.onscreen_text || s.screen,
-          vo_text: s.voiceover_text || '',
-          caption_text: s.voiceover_text || s.onscreen_text || '',
+          vo_text: isInst ? (s.voiceover_text || 'Instrumental.') : (s.voiceover_text || ''),
+          caption_text: capTxt,
           narration_in: narrIn,
           narration_out: narrOut,
           fit: 'missing',
@@ -1525,8 +1570,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
           source_in: 0,
           source_out: primary.kind === 'video' ? Math.min(dur, srcDur) : dur,
           script_text: s.text || s.voiceover_text || s.onscreen_text || s.screen,
-          vo_text: s.voiceover_text || '',
-          caption_text: s.voiceover_text || s.onscreen_text || '',
+          vo_text: isInst ? (s.voiceover_text || 'Instrumental.') : (s.voiceover_text || ''),
+          caption_text: capTxt,
           narration_in: narrIn,
           narration_out: narrOut,
           fit: fitMode,
@@ -2190,16 +2235,90 @@ app.post('/api/projects/:id/scenes/:screen/voiceover', upload.single('file'), as
   }
 });
 
-// Filmora 15.6.4 .wfp & .wfpbundle builder & parser
+// Genuine Wondershare Filmora 15.6.4 (.wfp & .wfpbundle) C++ archive builder & bidirectional importer
+const TIMELINE_MEDIA_ID = '{C955B34C-02D9-4f9e-BB82-6EF30033529E}';
+const TIMELINE_UUID = '{A8993E2F-2F41-40b5-9C9E-2BD2C11B4E6D}';
+const AUDIO_BUS_UID = 'ce4f3d0f-ca76-f111-af78-1893417a1d62';
+
+function makePngBuffer(width, height, rgb = [32, 43, 62]) {
+  const crcTable = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    crcTable[n] = c >>> 0;
+  }
+  const crc32 = (buf) => {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (tag, data) => {
+    const tagBuf = Buffer.from(tag, 'ascii');
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(data.length, 0);
+    const crcInput = Buffer.concat([tagBuf, data]);
+    const crcBuf = Buffer.alloc(4);
+    crcBuf.writeUInt32BE(crc32(crcInput), 0);
+    return Buffer.concat([lenBuf, tagBuf, data, crcBuf]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  const rowLen = 1 + width * 3;
+  const raw = Buffer.alloc(rowLen * height);
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * rowLen;
+    raw[rowStart] = 0;
+    for (let x = 0; x < width; x++) {
+      const px = rowStart + 1 + x * 3;
+      raw[px] = rgb[0];
+      raw[px + 1] = rgb[1];
+      raw[px + 2] = rgb[2];
+    }
+  }
+  const idat = zlib.deflateSync(raw, { level: 6 });
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', idat),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+const THUMB_320_180 = makePngBuffer(320, 180, [32, 43, 62]);
+const COVER_160_90 = makePngBuffer(160, 90, [24, 34, 52]);
+
+function filmoraGuid(seed) {
+  const h = crypto.createHash('md5').update(String(seed), 'utf-8').digest('hex');
+  return `{${h.slice(0, 8).toUpperCase()}-${h.slice(8, 12).toUpperCase()}-${h.slice(12, 16).toLowerCase()}-${h.slice(16, 20).toUpperCase()}-${h.slice(20, 32).toUpperCase()}}`;
+}
+function uidLower(seed) {
+  const h = crypto.createHash('md5').update(String(seed), 'utf-8').digest('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
 function wfpGuid() {
   return `{${crypto.randomUUID().toUpperCase()}}`;
 }
 function secToTicks(sec) {
   return Math.max(0, Math.round((Number(sec) || 0) * TICKS_PER_SEC));
 }
-function deflateRawJson(obj) {
-  const raw = Buffer.from(JSON.stringify(obj), 'utf-8');
-  return zlib.deflateRawSync(raw, { level: 6 });
+function normSlash(p) {
+  return String(p || '').replace(/\\/g, '/');
+}
+function fileMd5Hex(p) {
+  const h = crypto.createHash('md5');
+  try {
+    const fd = fs.openSync(p, 'r');
+    const buf = Buffer.alloc(65536);
+    const n = fs.readSync(fd, buf, 0, 65536, 0);
+    fs.closeSync(fd);
+    h.update(buf.subarray(0, n));
+  } catch {
+    h.update(String(p));
+  }
+  return h.digest('hex');
 }
 function inflateRawJson(buf) {
   try {
@@ -2212,152 +2331,1210 @@ function inflateRawJson(buf) {
     }
   }
 }
-function fileSha1Prefix(p) {
-  const h = crypto.createHash('sha1');
-  try {
-    const fd = fs.openSync(p, 'r');
-    const buf = Buffer.alloc(65536);
-    const bytesRead = fs.readSync(fd, buf, 0, 65536, 0);
-    fs.closeSync(fd);
-    h.update(buf.subarray(0, bytesRead));
-  } catch {
-    h.update(String(p));
-  }
-  return h.digest('hex');
+
+// Filmora 15 C++ userData helpers
+function udInt32(val, key) {
+  const b = Buffer.alloc(4);
+  b.writeInt32LE(Number(val) | 0, 0);
+  return { data: b.toString('base64'), key, type: 2 };
+}
+function udUint32(val, key) {
+  const b = Buffer.alloc(4);
+  b.writeUInt32LE(Number(val) >>> 0, 0);
+  return { data: b.toString('base64'), key, type: 3 };
+}
+function udFloat32(val, key) {
+  const b = Buffer.alloc(4);
+  b.writeFloatLE(Number(val) || 0, 0);
+  return { data: b.toString('base64'), key, type: 4 };
+}
+function udFloat64(val, key) {
+  const b = Buffer.alloc(8);
+  b.writeDoubleLE(Number(val) || 0, 0);
+  return { data: b.toString('base64'), key, type: 5 };
+}
+function udStr(text, key, nullTerm = false) {
+  const raw = Buffer.from(nullTerm ? `${text}\0` : String(text), 'utf-8');
+  return { data: raw.toString('base64'), key, type: 9 };
+}
+function udBytes(buf, key) {
+  return { data: Buffer.from(buf).toString('base64'), key, type: 10 };
+}
+function udGuid38(guidStr, key) {
+  const raw = Buffer.from(String(guidStr).slice(0, 38).padEnd(38, '\0'), 'ascii');
+  return { data: raw.toString('base64'), key, type: 10 };
+}
+function udGuid64(guidStr, key) {
+  const raw = Buffer.alloc(64, 0);
+  raw.write(String(guidStr).slice(0, 38), 0, 'ascii');
+  return { data: raw.toString('base64'), key, type: 10 };
 }
 
-function buildFilmoraWfpBuffer(plan, title, pathMap = {}) {
-  const mapPath = (orig) => (orig && pathMap[orig]) ? pathMap[orig] : (orig || '').replace(/\\/g, '/');
-  const fpsVal = 30.0;
-  const totalTicks = secToTicks(plan.total_duration || 10);
-  const tlUuid = wfpGuid();
-  const rootFolderId = wfpGuid();
-  const mainFolderId = wfpGuid();
-
-  const mediaItems = [];
-  const seenPaths = new Map();
-  const registerMedia = (filePath, kind, durSec) => {
-    if (!filePath) return null;
-    const mapped = mapPath(filePath);
-    if (seenPaths.has(mapped)) return seenPaths.get(mapped);
-    const mid = wfpGuid();
-    const mtype = kind === 'video' ? 1 : kind === 'image' ? 2 : 3;
-    const ticks = secToTicks(Math.max(1, durSec || 5));
-    const entry = {
-      id: mid,
-      type: mtype,
-      path: mapped,
-      title: path.basename(filePath),
-      parent_id: rootFolderId,
-      media_source_info: {
-        type: mtype,
-        file_path: mapped,
-        duration: ticks,
-        video_info: mtype !== 3 ? { width: 1920, height: 1080, frame_rate: fpsVal, duration: ticks } : undefined,
-        audio_info: mtype !== 2 ? { sample_rate: 44100, channels: 2, duration: ticks } : undefined,
-      },
-      extra: JSON.stringify({ dgs_path: mapped, dgs_kind: kind }),
-    };
-    mediaItems.push(entry);
-    seenPaths.set(mapped, entry);
-    return entry;
-  };
-
-  const videoClips = [];
-  for (const c of plan.clips || []) {
-    if (!c.media_path) continue;
-    const m = registerMedia(c.media_path, c.kind, c.duration);
-    const startTicks = secToTicks(c.start);
-    const durTicks = Math.max(TICKS_PER_SEC / 10, secToTicks(c.duration));
-    const trimStart = c.kind === 'image' ? IMAGE_BASE_OFFSET_TICKS : secToTicks(c.source_in || 0);
-    videoClips.push({
-      id: wfpGuid(),
-      title: path.basename(c.media_path),
-      type: c.kind === 'video' ? 1 : 2,
-      media_id: m ? m.id : '',
-      source_file: mapPath(c.media_path),
-      timeline_range: { start: startTicks, duration: durTicks },
-      trim_range: { start: trimStart, duration: durTicks },
-      enable: true,
-      speed: 10000,
-      extra: JSON.stringify({
-        screen: c.screen,
-        vo_text: c.vo_text || '',
-        script_text: c.script_text || '',
-        narration_in: c.narration_in,
-        narration_out: c.narration_out,
-      }),
-    });
-  }
-
-  const audioClips = [];
-  if (plan.voiceover_path) {
-    const voM = registerMedia(plan.voiceover_path, 'audio', plan.total_duration);
-    const voTicks = secToTicks(plan.total_duration || 10);
-    audioClips.push({
-      id: wfpGuid(),
-      title: path.basename(plan.voiceover_path),
-      type: 3,
-      media_id: voM ? voM.id : '',
-      source_file: mapPath(plan.voiceover_path),
-      timeline_range: { start: 0, duration: voTicks },
-      trim_range: { start: 0, duration: voTicks },
-      enable: true,
-      speed: 10000,
-    });
-  }
-
-  const timelineObj = {
-    version: '15.6.4',
-    title: title || 'DGS Auto Editor Project',
-    duration: totalTicks,
-    frame_rate: fpsVal,
-    ratio: { width: 1920, height: 1080 },
-    tracks: [
-      { id: wfpGuid(), type: 1, index: 0, clips: videoClips },
-      { id: wfpGuid(), type: 2, index: 0, clips: audioClips },
-    ],
-    dgs_plan_snapshot: {
-      total_duration: plan.total_duration,
-      clips: (plan.clips || []).map((c) => ({
-        ...c,
-        media_path: mapPath(c.media_path),
-      })),
-      voiceover_path: mapPath(plan.voiceover_path),
-      logo_path: mapPath(plan.logo_path),
-      logo_enabled: plan.logo_enabled,
-      srt_cues: plan.srt_cues || [],
+function imageMediaJson(absPath, mtimeSec, fileSize) {
+  const p = normSlash(absPath);
+  const name = path.basename(p);
+  return {
+    adjust_color_data_new: '',
+    ai_palette_property_info_data: '',
+    anchor_point: [0.0, 0.0],
+    attribute: 1,
+    audio_denoise_info: '',
+    audio_duck_info: '',
+    audio_info: null,
+    audio_voice_balance_info: '',
+    bModifyTitle: false,
+    built_in_color_type: -1,
+    cloud_file_download_state: 1,
+    cloud_file_type: -1,
+    cloud_from_type: -1,
+    composition_data: '',
+    compound_clip_version: 0,
+    custom_info: {},
+    custom_speed_Controller: '',
+    duration: 0,
+    file_create_time: mtimeSec,
+    file_modify_time: mtimeSec,
+    file_size: fileSize,
+    filename: p,
+    image_info: {
+      color_space: 0,
+      crop_bottom: 0.0,
+      crop_left: 0.0,
+      crop_right: 0.0,
+      crop_top: 0.0,
+      height: 1080,
+      orientation: 1,
+      raw_height: 1080,
+      raw_width: 1920,
+      rotation: 0,
+      size: fileSize,
+      stream_id: 200,
+      width: 1920,
     },
+    in_point: 0,
+    link_mattings: [],
+    media_tree_node_expand_status: false,
+    motion_blur_data: '',
+    name,
+    obj_detect_data: '',
+    orientation: 1,
+    original_frame_rate: [1, 1],
+    original_video_resolution: [0, 0],
+    out_point: 0,
+    PosScale: [1.0, 1.0],
+    preset_manger_data: '',
+    proxy_audio_info: null,
+    proxy_filename: '',
+    proxy_video_info: null,
+    retime_method: 1,
+    ReverseAudioInfo: null,
+    ReverseFileName: '',
+    ReverseVideoInfo: null,
+    RotateAngle: 0.0,
+    SilenceDetectArg: { dThreshold: 0.5, nMinContinueDuration: 500, nMiniVoicelessDuration: 500 },
+    solid_color_info: null,
+    source_count: 1,
+    stabilization_data: '',
+    strech_mode: 0,
+    text_info: null,
+    timeline_data_file: '',
+    timeline_extra_data_file: '',
+    title: name,
+    TransformPosition: [0.0, 0.0],
+    type: 1,
+    video_info: null,
+  };
+}
+
+function videoMediaJson(absPath, mtimeSec, fileSize, durTicks, fps = 30) {
+  const p = normSlash(absPath);
+  const name = path.basename(p);
+  const vinfo = {
+    bit_rate: 2500000,
+    color_primaries: 2,
+    color_range: 1,
+    color_space: 2,
+    color_trc: 2,
+    crop_bottom: 0.0,
+    crop_left: 0.0,
+    crop_right: 0.0,
+    crop_top: 0.0,
+    duration: durTicks,
+    file_fourcc: 875967080,
+    format: 0,
+    frame_rate: [fps, 1],
+    hdr_To_sdr_type: '',
+    hdr_data_describe: ' SDR ',
+    hdr_type: 0,
+    height: 1080,
+    mediacodec_10bit_decode: 0,
+    mediafoundation_10bit_decode: 1,
+    orientation: 0,
+    raw_height: 1080,
+    raw_width: 1920,
+    rotation: 0,
+    size: fileSize,
+    stream_fourcc: 875967080,
+    stream_id: 0,
+    time_base: [1, 15360],
+    vfr_type: 0,
+    video_codecid: 27,
+    videotoolbox_10bit_decode: 0,
+    width: 1920,
+  };
+  return {
+    adjust_color_data_new: '',
+    ai_palette_property_info_data: '',
+    anchor_point: [0.0, 0.0],
+    attribute: 1,
+    audio_denoise_info: '',
+    audio_duck_info: '',
+    audio_info: null,
+    audio_voice_balance_info: '',
+    bModifyTitle: false,
+    built_in_color_type: -1,
+    cloud_file_download_state: 1,
+    cloud_file_type: -1,
+    cloud_from_type: -1,
+    composition_data: '',
+    compound_clip_version: 0,
+    custom_info: {},
+    custom_speed_Controller: '',
+    duration: durTicks,
+    file_create_time: mtimeSec,
+    file_modify_time: mtimeSec,
+    file_size: fileSize,
+    filename: p,
+    image_info: null,
+    in_point: 0,
+    link_mattings: [],
+    media_tree_node_expand_status: false,
+    motion_blur_data: '',
+    name,
+    obj_detect_data: '',
+    orientation: 0,
+    original_frame_rate: [fps, 1],
+    original_video_resolution: [1920, 1080],
+    out_point: durTicks,
+    PosScale: [1.0, 1.0],
+    preset_manger_data: '',
+    proxy_audio_info: null,
+    proxy_filename: '',
+    proxy_video_info: null,
+    retime_method: 1,
+    ReverseAudioInfo: null,
+    ReverseFileName: '',
+    ReverseVideoInfo: null,
+    RotateAngle: 0.0,
+    SilenceDetectArg: { dThreshold: 0.5, nMinContinueDuration: 500, nMiniVoicelessDuration: 500 },
+    solid_color_info: null,
+    source_count: 1,
+    stabilization_data: '',
+    strech_mode: 0,
+    text_info: null,
+    timeline_data_file: '',
+    timeline_extra_data_file: '',
+    title: name,
+    TransformPosition: [0.0, 0.0],
+    type: 2,
+    video_info: vinfo,
+  };
+}
+
+function audioMediaJson(absPath, mtimeSec, fileSize, durTicks) {
+  const p = normSlash(absPath);
+  const name = path.basename(p);
+  return {
+    adjust_color_data_new: '',
+    ai_palette_property_info_data: '',
+    anchor_point: [0.0, 0.0],
+    attribute: 1,
+    audio_denoise_info: '',
+    audio_duck_info: '',
+    audio_info: {
+      bit_rate: 128000,
+      channels: 2,
+      duration: durTicks,
+      sample_format: 6,
+      sample_rate: 44100,
+      size: fileSize,
+      stream_fourcc: 0,
+      stream_id: 0,
+      time_base: [1, 14112000],
+    },
+    audio_voice_balance_info: '',
+    bModifyTitle: false,
+    built_in_color_type: -1,
+    cloud_file_download_state: 1,
+    cloud_file_type: -1,
+    cloud_from_type: -1,
+    composition_data: '',
+    compound_clip_version: 0,
+    custom_info: {},
+    custom_speed_Controller: '',
+    duration: durTicks,
+    file_create_time: mtimeSec,
+    file_modify_time: mtimeSec,
+    file_size: fileSize,
+    filename: p,
+    image_info: null,
+    in_point: 0,
+    link_mattings: [],
+    media_tree_node_expand_status: false,
+    motion_blur_data: '',
+    name,
+    obj_detect_data: '',
+    orientation: 0,
+    original_frame_rate: [1, 1],
+    original_video_resolution: [0, 0],
+    out_point: durTicks,
+    PosScale: [1.0, 1.0],
+    preset_manger_data: '',
+    proxy_audio_info: null,
+    proxy_filename: '',
+    proxy_video_info: null,
+    retime_method: 1,
+    ReverseAudioInfo: null,
+    ReverseFileName: '',
+    ReverseVideoInfo: null,
+    RotateAngle: 0.0,
+    SilenceDetectArg: { dThreshold: 0.5, nMinContinueDuration: 500, nMiniVoicelessDuration: 500 },
+    solid_color_info: null,
+    source_count: 1,
+    stabilization_data: '',
+    strech_mode: 0,
+    text_info: null,
+    timeline_data_file: '',
+    timeline_extra_data_file: '',
+    title: name,
+    TransformPosition: [0.0, 0.0],
+    type: 4,
+    video_info: null,
+  };
+}
+
+function formatMediasInfoJson(mediaIds, timelineMediaId, mediaItemsMeta) {
+  const folderPairs = [];
+  for (const mid of [...mediaIds, timelineMediaId]) {
+    folderPairs.push(`"media_item":${JSON.stringify(mid)}`);
+  }
+  const folderBody = folderPairs.join(',');
+  const itemsDict = {};
+  for (const mid of mediaIds) {
+    itemsDict[mid] = mediaItemsMeta[mid];
+  }
+  itemsDict[timelineMediaId] = {
+    cloud_file_type: -1,
+    cloud_from_type: -1,
+    data: `Medias/${timelineMediaId}/media.json`,
+    extra_data: `Medias/${timelineMediaId}/extra.json`,
+    media_attribute: 4,
+    media_missing: 0,
+    media_title: 'Project',
+    media_type: 32,
+    proxy_missing: 0,
+    src_filename: '',
+    src_md5: '',
+    thumbnail: `Medias/${timelineMediaId}/thumbnail.png`,
+    timeline_data: `Medias/${timelineMediaId}/timeline.wesproj`,
+    title_modified: false,
+  };
+  return `{"media_structure":{"Folder":{${folderBody}}},"media_items":${JSON.stringify(itemsDict)},"version":"1.0.1.0"}`;
+}
+
+function buildDgsBundleDict(pid, title, relMap = null) {
+  const scriptMeta = loadJson(pid, 'script_meta.json') || {};
+  const scenes = loadJson(pid, 'script.json') || [];
+  const media = (loadJson(pid, 'media.json') || []).map((m) => ({ ...m }));
+  const vo = loadJson(pid, 'voiceover.json') ? JSON.parse(JSON.stringify(loadJson(pid, 'voiceover.json'))) : null;
+  const poemVo = loadJson(pid, 'poem_voiceover.json') ? JSON.parse(JSON.stringify(loadJson(pid, 'poem_voiceover.json'))) : null;
+  const logo = loadJson(pid, 'logo.json') ? JSON.parse(JSON.stringify(loadJson(pid, 'logo.json'))) : null;
+  const plan = loadJson(pid, 'timeline.json') ? JSON.parse(JSON.stringify(loadJson(pid, 'timeline.json'))) : null;
+
+  const mapPath = (pStr) => {
+    if (!pStr || !relMap) return pStr;
+    const k1 = normSlash(path.resolve(pStr));
+    const k2 = normSlash(pStr);
+    return relMap[k1] || relMap[k2] || pStr;
   };
 
-  const projectMediaObj = {
-    version: '15.6.4',
-    folders: [
-      { id: rootFolderId, title: 'Root', parent_id: '' },
-      { id: mainFolderId, title: 'Project Media', parent_id: rootFolderId },
+  if (relMap) {
+    for (const m of media) {
+      if (m.path) m.path = mapPath(m.path);
+    }
+    if (vo) {
+      if (vo.path) vo.path = mapPath(vo.path);
+      if (Array.isArray(vo.slots)) {
+        for (const s of vo.slots) {
+          if (s && s.path) s.path = mapPath(s.path);
+        }
+      }
+    }
+    if (poemVo && poemVo.path) poemVo.path = mapPath(poemVo.path);
+    if (logo && logo.path) logo.path = mapPath(logo.path);
+    if (plan) {
+      if (plan.voiceover_path) plan.voiceover_path = mapPath(plan.voiceover_path);
+      if (plan.poem_voiceover_path) plan.poem_voiceover_path = mapPath(plan.poem_voiceover_path);
+      if (plan.logo_path) plan.logo_path = mapPath(plan.logo_path);
+      for (const c of plan.clips || []) {
+        if (c.media_path) c.media_path = mapPath(c.media_path);
+      }
+      for (const s of plan.voiceover_slots || []) {
+        if (s && s.path) s.path = mapPath(s.path);
+      }
+    }
+  }
+
+  return {
+    dgs_format: 'dgs_filmora_project_v2',
+    created_at: Math.floor(Date.now() / 1000),
+    project_id: pid,
+    title: title || scriptMeta.filename || `Project_${pid}`,
+    portable: Boolean(relMap),
+    script_meta: scriptMeta,
+    scenes,
+    media,
+    voiceover: vo,
+    poem_voiceover: poemVo,
+    logo,
+    timeline: plan,
+  };
+}
+
+function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
+  const { wfpSavePath = '', archiveMode = false, relMap = null } = opts;
+  const plan = loadJson(pid, 'timeline.json');
+  if (!plan) throw new Error('Build a timeline first before exporting .wfp');
+
+  const nowTs = Math.floor(Date.now() / 1000);
+  const fps = 30;
+  const projGuid = filmoraGuid(`proj:${pid}:${title}`);
+
+  const mediaIds = [];
+  const mediaItemsMeta = {};
+  const perMediaJson = {};
+  const mediaGuidToPath = new Map();
+  const pathToMediaGuid = new Map();
+  const resources = [];
+  const mediaClipsMap = {};
+  const beatDetectMap = {};
+
+  const registerMedia = (rawPath, kind, approxDurSec = 5.0) => {
+    if (!rawPath) return ['', ''];
+    const p = path.resolve(rawPath);
+    const normAbs = normSlash(p);
+    if (pathToMediaGuid.has(normAbs)) return pathToMediaGuid.get(normAbs);
+
+    let mtimeSec = nowTs;
+    let fileSize = 0;
+    let md5Str = '';
+    try {
+      const st = fs.statSync(p);
+      mtimeSec = Math.floor(st.mtimeMs / 1000);
+      fileSize = st.size;
+      md5Str = fileMd5Hex(p);
+    } catch {
+      md5Str = crypto.createHash('md5').update(normAbs, 'utf-8').digest('hex');
+    }
+
+    const mid = filmoraGuid(`media:${pid}:${normAbs}`);
+    const resUid = uidLower(`res:${pid}:${normAbs}`);
+    const durTicks = secToTicks(Math.max(0.5, Number(approxDurSec) || 5.0));
+
+    let normP = normAbs;
+    if (archiveMode) {
+      normP = `%DOCUMENT_DIR%/Medias/${mid}/${path.basename(p)}`;
+    } else if (relMap && (relMap[normAbs] || relMap[normSlash(rawPath)])) {
+      normP = relMap[normAbs] || relMap[normSlash(rawPath)];
+    }
+
+    mediaIds.push(mid);
+    mediaGuidToPath.set(mid, p);
+    mediaClipsMap[mid] = [];
+
+    if (kind === 'image') {
+      perMediaJson[mid] = imageMediaJson(normP, mtimeSec, fileSize);
+      mediaItemsMeta[mid] = {
+        cloud_file_type: -1,
+        cloud_from_type: -1,
+        data: `Medias/${mid}/media.json`,
+        media_attribute: 1,
+        media_missing: 0,
+        media_title: path.basename(p),
+        media_type: 1,
+        proxy_missing: 1,
+        src_filename: normP,
+        src_md5: md5Str,
+        thumbnail: `Medias/${mid}/thumbnail.png`,
+        title_modified: false,
+      };
+      resources.push({
+        duration: -1,
+        filename: normP,
+        sourceUuid: resUid,
+        streamIdx: 200,
+        tracks: [{ codec: 'image', height: 1080, index: 200, type: 1, width: 1920 }],
+        type: 3,
+        userData: [udInt32(0, 62)],
+      });
+    } else if (kind === 'video') {
+      perMediaJson[mid] = videoMediaJson(normP, mtimeSec, fileSize, durTicks, fps);
+      mediaItemsMeta[mid] = {
+        cloud_file_type: -1,
+        cloud_from_type: -1,
+        data: `Medias/${mid}/media.json`,
+        media_attribute: 1,
+        media_missing: 0,
+        media_title: path.basename(p),
+        media_type: 2,
+        proxy_missing: 1,
+        src_filename: normP,
+        src_md5: md5Str,
+        thumbnail: `Medias/${mid}/thumbnail.png`,
+        title_modified: false,
+      };
+      resources.push({
+        duration: durTicks,
+        filename: normP,
+        sourceUuid: resUid,
+        streamIdx: 0,
+        tracks: [
+          {
+            bitrate: 2500000,
+            codec: 'h264',
+            colorSpace: 'BT709',
+            duration: durTicks,
+            format: 'nv12',
+            frameRate: { den: 1, num: fps },
+            height: 1080,
+            index: 0,
+            timebase: { den: 15360, num: 1 },
+            type: 1,
+            width: 1920,
+          },
+        ],
+        type: 1,
+        userData: [udInt32(0, 62)],
+      });
+    } else {
+      perMediaJson[mid] = audioMediaJson(normP, mtimeSec, fileSize, durTicks);
+      mediaItemsMeta[mid] = {
+        cloud_file_type: -1,
+        cloud_from_type: -1,
+        data: `Medias/${mid}/media.json`,
+        media_attribute: 1,
+        media_missing: 0,
+        media_title: path.basename(p),
+        media_type: 4,
+        proxy_missing: 1,
+        src_filename: normP,
+        src_md5: md5Str,
+        title_modified: false,
+      };
+      beatDetectMap[mid] = {
+        bEnableMarkAdded: true,
+        beatInterval: 4,
+        beatModel: 1,
+        nHighlightOnly: 0,
+        strMusicAnalysisJsonPath: '',
+      };
+      resources.push({
+        duration: durTicks,
+        filename: normP,
+        sourceUuid: resUid,
+        streamIdx: 0,
+        tracks: [
+          {
+            bitrate: 128000,
+            channelLayout: 3,
+            channels: 2,
+            codec: 'mp3float',
+            duration: durTicks,
+            format: 'fltp',
+            index: 0,
+            sampleRate: 44100,
+            timebase: { den: 14112000, num: 1 },
+            type: 2,
+          },
+        ],
+        type: 2,
+        userData: [udInt32(0, 62)],
+      });
+    }
+
+    const pair = [mid, resUid];
+    pathToMediaGuid.set(normAbs, pair);
+    return pair;
+  };
+
+  const makeVisualClip = (clipKey, mid, resUid, filenameStr, kind, tlBeginTicks, tlEndTicks, srcInSec = 0, srcOutSec = null, customTransform = null) => {
+    const durTicks = Math.max(1, tlEndTicks - tlBeginTicks);
+    let inTicks;
+    let outTicks;
+    if (kind === 'image') {
+      inTicks = IMAGE_BASE_OFFSET_TICKS;
+      outTicks = IMAGE_BASE_OFFSET_TICKS + durTicks;
+    } else {
+      inTicks = secToTicks(srcInSec || 0);
+      outTicks = srcOutSec != null ? secToTicks(srcOutSec) : (inTicks + durTicks);
+      if (outTicks <= inTicks) outTicks = inTicks + durTicks;
+    }
+
+    const ctype = kind === 'image' ? 3 : 1;
+    const outerUid = uidLower(`vclip_out:${clipKey}`);
+    const innerUid = uidLower(`vclip_in:${clipKey}`);
+    const stabUid = uidLower(`vstab:${clipKey}`);
+    const outerGuid38 = `{${outerUid.toUpperCase()}}`;
+    const colorRangeXml = '<?xml version="1.0"?>\n<timeline_project name="ColorRangeFilter">\n\t<version>1</version>\n\t<Next FilterId="1001" />\n</timeline_project>\n';
+
+    const clipObj = {
+      anchorX: 0.0,
+      anchorY: 0.0,
+      applyDeinterlace: false,
+      audioChannelProcessIndex: 0,
+      auto_normalize_value: -1000,
+      bOpenAutoNormalize: false,
+      bSyncedATempo: true,
+      blendMode: 0,
+      blendVisible: true,
+      bottom: 0.0,
+      brightness: 0.0,
+      clipList: [
+        {
+          clipMaskList: [],
+          clipMode: 0,
+          contextType: 0,
+          customSpeedControllJson: '',
+          enable: true,
+          filename: filenameStr,
+          inPoint: inTicks,
+          locked: false,
+          name: '',
+          outPoint: outTicks,
+          retimeMethod: 1,
+          reverse: false,
+          source: resUid,
+          sourceUuid: resUid,
+          speed: 1.0,
+          strVariableSpeedInfo: '',
+          streamIdx: kind === 'image' ? 200 : 0,
+          sync: 0,
+          tlBegin: 0,
+          tlEnd: durTicks,
+          type: ctype,
+          uid: innerUid,
+          userData: [udInt32(0, 62)],
+          videostabilizer: {
+            bEdgeExtend: true,
+            bUseStabilizer: false,
+            enable: true,
+            fSmoothLevel: 0.20000000298023224,
+            filename: filenameStr,
+            inPoint: inTicks,
+            locked: false,
+            name: '',
+            outPoint: outTicks,
+            sourceUuid: resUid,
+            speed: 1.0,
+            tlBegin: 0,
+            tlEnd: durTicks,
+            type: 0,
+            uid: stabUid,
+            userData: [udInt32(0, 62)],
+          },
+        },
+      ],
+      clipMaskList: [],
+      clipMode: 0,
+      colorize: { bColorize: false, brightness: 50.0, hue: 180.0, opacity: 50.0, saturation: 50.0 },
+      contextType: 1,
+      contrast: 0.0,
+      cropMode: 0,
+      customSpeedControllJson: '',
+      denoiseLevel: 0,
+      displayMode: 0,
+      dropShadow: { angle: 60.0, bDropShadow: false, blur: 0.0, color: 0, distance: 0.0, opacity: 60, scale: 100.0 },
+      enable: true,
+      fadeInDuration: 0,
+      fadeOutDuration: 0,
+      fieldOrder: 0,
+      flipHorizontal: false,
+      flipVertical: false,
+      freezeDuration: 36000000000,
+      freezePosition: -1,
+      freezeScale: 0.0,
+      inPoint: inTicks,
+      left: 0.0,
+      locked: false,
+      lutStrength: 100.0,
+      matteMode: 0,
+      motionBlur: { bEnable: false, fPhase: 0.0, fShutterAngle: 180.0, nSamplesCount: 16 },
+      name: '',
+      opacity: 100,
+      outPoint: outTicks,
+      pitch: 0,
+      retimeMethod: 1,
+      reverse: false,
+      right: 0.0,
+      rotation: 0.0,
+      rotationX: 0.0,
+      rotationY: 0.0,
+      saturation: 0.0,
+      scaleX: customTransform ? customTransform.scaleX : 1.0,
+      scaleY: customTransform ? customTransform.scaleY : 1.0,
+      settingScaleToFit: 0,
+      sharpness: 0.0,
+      speed: 1.0,
+      strVariableSpeedInfo: '',
+      stretchMode: 0,
+      sync: 0,
+      tint: 0.0,
+      tlBegin: tlBeginTicks,
+      tlEnd: tlEndTicks,
+      top: 0.0,
+      transX: customTransform ? customTransform.transX : 0.0,
+      transY: customTransform ? customTransform.transY : 0.0,
+      type: ctype,
+      uid: outerUid,
+      userData: [
+        udStr(filenameStr, 30016),
+        udStr(path.basename(filenameStr), 50, true),
+        udGuid64(mid, 9),
+        udInt32(0, 29),
+        udInt32(0, 62),
+        udUint32(4294967295, 13000),
+        udFloat32(0.0, 22),
+        udFloat32(0.0, 120),
+        udGuid38(outerGuid38, 30309),
+        udBytes(Buffer.from([0x04]), 14002),
+        udStr('{"type":0,"version":1,"visible":true}', 30304),
+        udFloat64(0.0, 71),
+        udStr(colorRangeXml, 30059),
+      ],
+      volume: 0.0,
+    };
+    if (mediaClipsMap[mid]) mediaClipsMap[mid].push(outerGuid38);
+    return clipObj;
+  };
+
+  const makeAudioClip = (clipKey, mid, resUid, filenameStr, tlBeginTicks, tlEndTicks, srcInSec = 0, srcOutSec = null) => {
+    const durTicks = Math.max(1, tlEndTicks - tlBeginTicks);
+    const inTicks = secToTicks(srcInSec || 0);
+    let outTicks = srcOutSec != null ? secToTicks(srcOutSec) : (inTicks + durTicks);
+    if (outTicks <= inTicks) outTicks = inTicks + durTicks;
+
+    const outerUid = uidLower(`aclip_out:${clipKey}`);
+    const innerUid = uidLower(`aclip_in:${clipKey}`);
+    const outerGuid38 = `{${outerUid.toUpperCase()}}`;
+    const colorRangeXml = '<?xml version="1.0"?>\n<timeline_project name="ColorRangeFilter">\n\t<version>1</version>\n\t<Next FilterId="1001" />\n</timeline_project>\n';
+
+    const clipObj = {
+      anchorX: 0.0,
+      anchorY: 0.0,
+      applyDeinterlace: false,
+      audioChannelProcessIndex: 0,
+      auto_normalize_value: -1000,
+      bOpenAutoNormalize: false,
+      bSyncedATempo: true,
+      blendMode: 0,
+      blendVisible: true,
+      bottom: 0.0,
+      brightness: 0.0,
+      clipList: [
+        {
+          clipMaskList: [],
+          clipMode: 0,
+          contextType: 0,
+          customSpeedControllJson: '',
+          enable: true,
+          filename: filenameStr,
+          inPoint: inTicks,
+          locked: false,
+          name: '',
+          outPoint: outTicks,
+          retimeMethod: 1,
+          reverse: false,
+          source: resUid,
+          sourceUuid: resUid,
+          speed: 1.0,
+          strVariableSpeedInfo: '',
+          streamIdx: 0,
+          sync: 0,
+          tlBegin: 0,
+          tlEnd: durTicks,
+          type: 2,
+          uid: innerUid,
+          userData: [udInt32(0, 62)],
+        },
+      ],
+      clipMaskList: [],
+      clipMode: 0,
+      colorize: { bColorize: false, brightness: 50.0, hue: 180.0, opacity: 50.0, saturation: 50.0 },
+      contextType: 1,
+      contrast: 0.0,
+      cropMode: 0,
+      customSpeedControllJson: '',
+      denoiseLevel: 0,
+      displayMode: 0,
+      dropShadow: { angle: 60.0, bDropShadow: false, blur: 0.0, color: 0, distance: 0.0, opacity: 60, scale: 100.0 },
+      enable: true,
+      fadeInDuration: 0,
+      fadeOutDuration: 0,
+      fieldOrder: 0,
+      flipHorizontal: false,
+      flipVertical: false,
+      freezeDuration: 36000000000,
+      freezePosition: -1,
+      freezeScale: 0.0,
+      inPoint: inTicks,
+      left: 0.0,
+      locked: false,
+      lutStrength: 100.0,
+      matteMode: 0,
+      motionBlur: { bEnable: false, fPhase: 0.0, fShutterAngle: 180.0, nSamplesCount: 16 },
+      name: '',
+      opacity: 100,
+      outPoint: outTicks,
+      pitch: 0,
+      retimeMethod: 1,
+      reverse: false,
+      right: 0.0,
+      rotation: 0.0,
+      rotationX: 0.0,
+      rotationY: 0.0,
+      saturation: 0.0,
+      scaleX: 1.0,
+      scaleY: 1.0,
+      settingScaleToFit: 0,
+      sharpness: 0.0,
+      speed: 1.0,
+      strVariableSpeedInfo: '',
+      stretchMode: 0,
+      sync: 0,
+      tint: 0.0,
+      tlBegin: tlBeginTicks,
+      tlEnd: tlEndTicks,
+      top: 0.0,
+      transX: 0.0,
+      transY: 0.0,
+      type: 2,
+      uid: outerUid,
+      userData: [
+        udStr(filenameStr, 30016),
+        udStr(path.basename(filenameStr), 50, true),
+        udGuid64(mid, 9),
+        udInt32(0, 29),
+        udInt32(0, 62),
+        udUint32(4294967295, 13000),
+        udFloat32(0.0, 22),
+        udFloat32(0.0, 120),
+        udGuid38(outerGuid38, 30309),
+        udBytes(Buffer.from([0x04]), 14002),
+        udFloat64(0.0, 71),
+        udStr(colorRangeXml, 30059),
+      ],
+      volume: 0.0,
+    };
+    if (mediaClipsMap[mid]) mediaClipsMap[mid].push(outerGuid38);
+    return clipObj;
+  };
+
+  // 1. Main visual scene clips (Video Track 1)
+  const videoClipsTrack = [];
+  for (let idx = 0; idx < (plan.clips || []).length; idx++) {
+    const c = plan.clips[idx];
+    if (!c.media_path || !fs.existsSync(c.media_path)) continue;
+    const [mid, resUid] = registerMedia(c.media_path, c.kind, Math.max(Number(c.duration || 0), Number(c.source_out || 0), 5.0));
+    if (!mid) continue;
+    const tlBegin = secToTicks(c.start);
+    const tlEnd = Math.max(tlBegin + 1, secToTicks(c.end));
+    const clipFn = mediaItemsMeta[mid].src_filename;
+    videoClipsTrack.push(
+      makeVisualClip(`scene_${idx}_${c.screen}`, mid, resUid, clipFn, c.kind, tlBegin, tlEnd, c.source_in || 0, c.source_out),
+    );
+  }
+
+  // 2. Narration VO audio track
+  const voClipsTrack = [];
+  const slots = Array.isArray(plan.voiceover_slots) ? plan.voiceover_slots : [];
+  if (slots.length > 0 && slots.some((s) => s.path && fs.existsSync(s.path))) {
+    for (let idx = 0; idx < slots.length; idx++) {
+      const s = slots[idx];
+      if (!s.path || !fs.existsSync(s.path)) continue;
+      const [mid, resUid] = registerMedia(s.path, 'audio', Math.max(Number(s.duration || 0), 5.0));
+      if (!mid) continue;
+      const tlBegin = secToTicks(s.start);
+      const tlEnd = Math.max(tlBegin + 1, secToTicks(s.end));
+      const clipFn = mediaItemsMeta[mid].src_filename;
+      voClipsTrack.push(
+        makeAudioClip(`vo_slot_${idx}_${s.slot}`, mid, resUid, clipFn, tlBegin, tlEnd, 0.0, s.duration),
+      );
+    }
+  } else if (plan.voiceover_path && fs.existsSync(plan.voiceover_path)) {
+    const [mid, resUid] = registerMedia(plan.voiceover_path, 'audio', Math.max(Number(plan.total_duration || 10), 5.0));
+    if (mid) {
+      const clipFn = mediaItemsMeta[mid].src_filename;
+      const spokenClips = (plan.clips || []).filter((c) => c.narration_in != null && c.narration_out != null && c.narration_out > c.narration_in);
+      if (spokenClips.length) {
+        for (let idx = 0; idx < spokenClips.length; idx++) {
+          const c = spokenClips[idx];
+          const durN = Number(c.narration_out) - Number(c.narration_in);
+          const tlBegin = secToTicks(c.start);
+          const tlEnd = secToTicks(Number(c.start) + durN);
+          voClipsTrack.push(
+            makeAudioClip(`vo_seg_${idx}`, mid, resUid, clipFn, tlBegin, tlEnd, c.narration_in, c.narration_out),
+          );
+        }
+      } else {
+        voClipsTrack.push(
+          makeAudioClip('vo_full', mid, resUid, clipFn, 0, secToTicks(plan.total_duration || 10), 0.0, plan.total_duration),
+        );
+      }
+    }
+  }
+
+  // 3. Poem / Suno VO audio track
+  const poemClipsTrack = [];
+  if (plan.poem_voiceover_path && fs.existsSync(plan.poem_voiceover_path)) {
+    const pStart = Number(plan.poem_start_time || 0);
+    const pEnd = Number(plan.poem_end_time || 0) > pStart ? Number(plan.poem_end_time) : Number(plan.total_duration || 10);
+    const pDur = Math.max(1.0, pEnd - pStart);
+    const [mid, resUid] = registerMedia(plan.poem_voiceover_path, 'audio', pDur);
+    if (mid) {
+      const clipFn = mediaItemsMeta[mid].src_filename;
+      poemClipsTrack.push(
+        makeAudioClip('poem_vo', mid, resUid, clipFn, secToTicks(pStart), secToTicks(pEnd), 0.0, pDur),
+      );
+    }
+  }
+
+  // 4. Logo overlay track (top-right corner across entire timeline)
+  const logoClipsTrack = [];
+  const logoMeta = loadJson(pid, 'logo.json') || {};
+  const logoPath = plan.logo_path || logoMeta.path;
+  const logoEnabled = Boolean(plan.logo_enabled ?? logoMeta.enabled ?? true);
+  if (logoEnabled && logoPath && fs.existsSync(logoPath)) {
+    const [mid, resUid] = registerMedia(logoPath, 'image', Number(plan.total_duration || 10));
+    if (mid) {
+      const clipFn = mediaItemsMeta[mid].src_filename;
+      logoClipsTrack.push(
+        makeVisualClip(
+          'logo_overlay',
+          mid,
+          resUid,
+          clipFn,
+          'image',
+          0,
+          secToTicks(Math.max(1.0, Number(plan.total_duration || 10))),
+          0.0,
+          null,
+          { scaleX: 0.14, scaleY: 0.14, transX: 0.4, transY: -0.39 },
+        ),
+      );
+    }
+  }
+
+  // 5. Native Filmora 15 Subtitle track (`type: 22` with `subtitleSource` JSON) — supports English & Marathi Devanagari!
+  const cuesList = plan.srt_cues && plan.srt_cues.length ? plan.srt_cues : buildSrtCues(plan.clips || [], plan);
+  const subtitleClipsTrack = [];
+  const totalTicks = secToTicks(Math.max(1.0, Number(plan.total_duration || 10)));
+  if (cuesList.length) {
+    const subItems = [];
+    for (let idx = 0; idx < cuesList.length; idx++) {
+      const q = cuesList[idx];
+      const sSec = Number(q.start || 0);
+      const eSec = Number(q.end || 0);
+      const txt = String(q.text || '').trim();
+      if (!txt || eSec <= sSec) continue;
+      subItems.push({
+        Start: secToTicks(sSec),
+        End: secToTicks(eSec),
+        Content: txt,
+        Pos: [0.0, -0.38],
+        Scale: [1.0, 1.0],
+        Index: idx,
+      });
+    }
+    if (subItems.length) {
+      const subGuid = filmoraGuid(`sub_clip:${pid}`);
+      const subSourceJson = JSON.stringify({
+        Items: subItems,
+         FontInfo: {
+          FontName: 'Noto Sans Devanagari',
+          FontSize: 42,
+          TextColor: 4294967295,
+          IsBold: true,
+        },
+      }).replace('" FontInfo":', '"FontInfo":');
+      subtitleClipsTrack.push({
+        anchorX: 0.0,
+        anchorY: 0.0,
+        blendMode: 0,
+        blendVisible: true,
+        clipList: [],
+        clipMaskList: [],
+        clipMode: 0,
+        contextType: 0,
+        enable: true,
+        inPoint: 0,
+        locked: false,
+        name: 'Subtitles',
+        opacity: 100,
+        outPoint: totalTicks,
+        rotation: 0.0,
+        scaleX: 1.0,
+        scaleY: 1.0,
+        speed: 1.0,
+        subtitleSource: subSourceJson,
+        sync: 0,
+        tlBegin: 0,
+        tlEnd: totalTicks,
+        transX: 0.0,
+        transY: 0.0,
+        type: 22,
+        uid: uidLower(`sub_uid:${pid}`),
+        userData: [
+          udStr('Subtitles', 50, true),
+          udGuid38(subGuid, 30309),
+        ],
+      });
+    }
+  }
+
+  const tracks = [
+    {
+      clipList: videoClipsTrack,
+      trackTag: 1,
+      trackType: 1,
+      userData: [udInt32(0, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(54, 12000)],
+      uuid: uidLower('track_v_main'),
+    },
+    {
+      audioBusUid: AUDIO_BUS_UID,
+      balance: 0.5,
+      clipList: [],
+      gain: 0.0,
+      solo: false,
+      trackTag: 1,
+      trackType: 2,
+      userData: [udInt32(0, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(54, 12000)],
+      uuid: uidLower('track_a_default'),
+    },
+    {
+      audioBusUid: AUDIO_BUS_UID,
+      balance: 0.5,
+      clipList: voClipsTrack,
+      gain: 0.0,
+      solo: false,
+      trackTag: 2,
+      trackType: 2,
+      userData: [udInt32(1, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(54, 12000)],
+      uuid: uidLower('track_a_vo'),
+    },
+  ];
+
+  if (poemClipsTrack.length) {
+    tracks.push({
+      audioBusUid: AUDIO_BUS_UID,
+      balance: 0.5,
+      clipList: poemClipsTrack,
+      gain: 0.0,
+      solo: false,
+      trackTag: 4,
+      trackType: 2,
+      userData: [udInt32(2, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(54, 12000)],
+      uuid: uidLower('track_a_poem'),
+    });
+  }
+  if (subtitleClipsTrack.length) {
+    tracks.push({
+      clipList: subtitleClipsTrack,
+      trackTag: 4,
+      trackType: 1,
+      userData: [udInt32(1, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(32, 12000)],
+      uuid: uidLower('track_v_subtitles'),
+    });
+  }
+  if (logoClipsTrack.length) {
+    tracks.push({
+      clipList: logoClipsTrack,
+      trackTag: 6,
+      trackType: 1,
+      userData: [udInt32(1, 21), udBytes(Buffer.from([0x00]), 12001), udInt32(32, 12000)],
+      uuid: uidLower('track_v_logo'),
+    });
+  }
+
+  const tlPageJson = Buffer.from(JSON.stringify([{ index: 0, isActive: true, pageIndex: 1, timelineId: TIMELINE_UUID }]), 'utf-8');
+  const tlRangeJson = Buffer.from(JSON.stringify({ data: [0, totalTicks] }), 'utf-8');
+
+  const wesproj = {
+    currentTimelineId: 9,
+    productName: 'Filmora',
+    projectName: 'TLB',
+    projectVersion: '6,13,101,6',
+    resources,
+    serialNumber: 16,
+    serializationVersion: '28',
+    timelineInfos: [
+      {
+        aspectRatioX: 16,
+        aspectRatioY: 9,
+        audioBusInfos: [{ balance: 0.5, busUid: AUDIO_BUS_UID, gain: 0.0 }],
+        channels: 2,
+        format: 'f32',
+        frameRate: { den: 1, num: fps },
+        hdrMode: 0,
+        hdrMode_force_16bit: 0,
+        resolutionHeight: 1080,
+        resolutionWidth: 1920,
+        sampleRate: 44100,
+        timelineId: 9,
+        trackInfos: tracks,
+        type: 0,
+        userData: [
+          udStr('Untitle', 50, true),
+          udGuid64(TIMELINE_UUID, 11000),
+          udGuid64(filmoraGuid(`tl3:${pid}`), 3),
+          udGuid38(TIMELINE_UUID, 30309),
+          udStr(crypto.createHash('md5').update(`Filmora${TIMELINE_MEDIA_ID}`, 'utf-8').digest('hex'), 140),
+          udBytes(tlPageJson, 30306),
+          udInt32(0, 11003),
+          udBytes(tlRangeJson, 11001),
+        ],
+      },
     ],
-    medias: mediaItems,
-    timelines: [{ id: tlUuid, path: 'Timelines/timeline.json', title: title || 'Main Timeline' }],
   };
 
-  const projectInfoObj = {
-    version: '15.6.4',
-    product: 'Wondershare Filmora',
-    product_version: '15.6.4.16958',
-    project_id: plan.project_id,
-    title: title || 'DGS Project',
-    ratio: '16:9',
-    resolution: { width: 1920, height: 1080 },
-    frame_rate: fpsVal,
-    duration: totalTicks,
+  const extraJson = {
+    fontNameInfo: [],
+    usedBizFont: [],
+    usedTemplateResInfo: {},
+    mediaClipsMapInfo: mediaClipsMap,
+    allMarkersInfo: { beatDetectInfo: beatDetectMap },
+    pendingMarkersInfo: {},
+    highlightInfo: {},
+    TextSentence: { TextSentence: [] },
   };
+
+  const safeName = String(title || `Project_${pid}`).trim().replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
+  const coverBackupPath = `C:/Users/Kohin/AppData/Roaming/Wondershare/Wondershare Filmora/Backup/${projGuid}/ProjectFolder/Anon/Cover/cover_eFWdR.wfpbundle`;
+  const projectInfo = {
+    vbl_modify_version: '8.6.2.8',
+    vbl_create_version: '8.6.2.8',
+    project_os_name: 'Windows',
+    project_os_version: '',
+    project_file_name: safeName,
+    project_file_suffix: '.wfp',
+    project_editor_name: 'Filmora',
+    project_editor_create_version: '15.6.4.11894',
+    project_editor_modify_version: '15.6.4.11894',
+    project_date_create: nowTs,
+    project_date_modify: nowTs,
+    project_timeline_duration: totalTicks,
+    project_current_position: 0,
+    project_timeline_framerate: [fps, 1],
+    project_timeline_resolution: [1920, 1080],
+    project_timeline_ratio: [16, 9],
+    project_color_space: 0,
+    project_sample_rate: 44100,
+    project_audio_bitdepth: 1,
+    project_player_quality: 0,
+    project_player_zoom_level: 0,
+    project_player_safe_zone: false,
+    project_archive: Boolean(archiveMode),
+    project_storage: true,
+    project_backup: false,
+    project_cover: false,
+    project_custom_cover: false,
+    project_type: 0,
+    bRemoveProjectTypeForArchive: false,
+    bRemoveProjectTypeForSaveAs: false,
+    project_template_name: '',
+    timeline_mediaId: TIMELINE_MEDIA_ID,
+    project_guid: projGuid,
+    proj_zip_save_path: wfpSavePath ? normSlash(wfpSavePath) : `${safeName}.wfp`,
+    proj_cover_proj_path: coverBackupPath,
+    nSizeRatioType: 0,
+    project_source: crypto.createHash('md5').update(`Filmora${nowTs}`, 'utf-8').digest('hex'),
+    project_used_pack_list: [],
+    user_data: [
+      { key: 1, data: '1' },
+      { key: 2, data: '' },
+    ],
+  };
+
+  const bundleRelMap = { ...(relMap || {}) };
+  if (archiveMode) {
+    for (const [mid, pAbs] of mediaGuidToPath.entries()) {
+      const relEntry = `Medias/${mid}/${path.basename(pAbs)}`;
+      bundleRelMap[normSlash(path.resolve(pAbs))] = relEntry;
+      bundleRelMap[normSlash(pAbs)] = relEntry;
+    }
+  }
+  const dgsBundle = buildDgsBundleDict(pid, title, Object.keys(bundleRelMap).length ? bundleRelMap : null);
+  const rawDgs = JSON.stringify(dgsBundle);
+  let dgsComment = '';
+  try {
+    const cand = 'DGS1:' + zlib.deflateSync(Buffer.from(rawDgs, 'utf-8'), { level: 9 }).toString('base64');
+    if (cand.length <= 65000) dgsComment = cand;
+  } catch {}
 
   const zip = new AdmZip();
-  zip.addFile('PROJECTINFO', Buffer.from('Wondershare Filmora Project File\nVersion=15.6.4\n', 'utf-8'));
-  zip.addFile('project_info.json', deflateRawJson(projectInfoObj));
-  zip.addFile('Medias/project_media.json', deflateRawJson(projectMediaObj));
-  zip.addFile('Timelines/timeline.json', deflateRawJson(timelineObj));
-  return zip.toBuffer();
+  for (const [mid, mjson] of Object.entries(perMediaJson)) {
+    zip.addFile(`ProjectFolder/Medias/${mid}/media.json`, Buffer.from(JSON.stringify(mjson), 'utf-8'));
+    const metaEntry = mediaItemsMeta[mid] || {};
+    if (metaEntry.media_type !== 4) {
+      zip.addFile(`ProjectFolder/Medias/${mid}/thumbnail.png`, THUMB_320_180);
+    }
+  }
+  zip.addFile(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/thumbnail.png`, THUMB_320_180);
+  zip.addFile('ProjectFolder/Anon/AppData/Windows/functionExtraData.json', Buffer.from('{"9":"2"}', 'utf-8'));
+  zip.addFile('ProjectFolder/Medias/medias_info.json', Buffer.from(formatMediasInfoJson(mediaIds, TIMELINE_MEDIA_ID, mediaItemsMeta), 'utf-8'));
+  zip.addFile(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/extra.json`, Buffer.from(JSON.stringify(extraJson), 'utf-8'));
+  zip.addFile(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/timeline.wesproj`, Buffer.from(JSON.stringify(wesproj), 'utf-8'));
+  zip.addFile('ProjectFolder/project_info.json', Buffer.from(JSON.stringify(projectInfo, null, 4), 'utf-8'));
+  zip.addFile('ProjectFolder/Anon/Cover/thumb.fsthumb', COVER_160_90);
+  zip.addFile('ProjectFolder/dgs_project.json', Buffer.from(rawDgs, 'utf-8'));
+  if (dgsComment) {
+    zip.addZipComment(dgsComment);
+  }
+
+  return { wfpBuffer: zip.toBuffer(), mediaGuidToPath };
+}
+
+function buildWfpBundleFileOnDisk(pid, rawTitle, bundlePath, progressCb = null) {
+  const safeTitle = String(rawTitle || `Project_${pid}`).trim().replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
+  if (progressCb) progressCb(10, 'Building Filmora 15 .wfp archive metadata…');
+  const innerWfpName = `${safeTitle}.wfp`;
+  const { wfpBuffer, mediaGuidToPath } = buildWfpAndMediaMap(pid, rawTitle, {
+    wfpSavePath: path.join(path.dirname(bundlePath), innerWfpName),
+    archiveMode: true,
+  });
+
+  const bundleZip = new AdmZip();
+  const items = Array.from(mediaGuidToPath.entries());
+  const total = Math.max(1, items.length);
+  for (let idx = 0; idx < items.length; idx++) {
+    const [mid, srcPath] = items[idx];
+    if (progressCb) {
+      const pct = 15 + Math.round(((idx + 1) / total) * 75);
+      progressCb(pct, `Packing ${path.basename(srcPath)} into .wfpbundle (${idx + 1}/${total})…`);
+    }
+    if (fs.existsSync(srcPath) && fs.statSync(srcPath).isFile()) {
+      bundleZip.addLocalFile(srcPath, `Medias/${mid}`, path.basename(srcPath));
+      // Set STORED method on large media entries so Filmora 15 opens .wfpbundle directly
+      const entry = bundleZip.getEntry(`Medias/${mid}/${path.basename(srcPath)}`);
+      if (entry) entry.header.method = 0;
+    }
+  }
+  if (progressCb) progressCb(94, `Writing ${innerWfpName} into ${path.basename(bundlePath)}…`);
+  bundleZip.addFile(innerWfpName, wfpBuffer);
+  const wfpEntry = bundleZip.getEntry(innerWfpName);
+  if (wfpEntry) wfpEntry.header.method = 0;
+  fs.mkdirSync(path.dirname(bundlePath), { recursive: true });
+  bundleZip.writeZip(bundlePath);
+  return { bundlePath, fileCount: items.length + 1, innerWfpBuffer: wfpBuffer };
 }
 
 function generateProjectFileOnDisk(pid, rawTitle, fmt) {
@@ -2374,35 +3551,10 @@ function generateProjectFileOnDisk(pid, rawTitle, fmt) {
   let outPath = path.join(outDir, filename);
 
   if (fmt === 'wfp') {
-    const buf = buildFilmoraWfpBuffer(plan, rawTitle, {});
-    fs.writeFileSync(outPath, buf);
+    const { wfpBuffer } = buildWfpAndMediaMap(pid, rawTitle, { wfpSavePath: outPath, archiveMode: false });
+    fs.writeFileSync(outPath, wfpBuffer);
   } else if (fmt === 'wfpbundle') {
-    const bundleZip = new AdmZip();
-    const pathMap = {};
-    const resourceItems = [];
-    const allPaths = new Set();
-    for (const c of plan.clips || []) {
-      if (c.media_path && fs.existsSync(c.media_path)) allPaths.add(c.media_path);
-    }
-    if (plan.voiceover_path && fs.existsSync(plan.voiceover_path)) allPaths.add(plan.voiceover_path);
-    if (plan.logo_path && fs.existsSync(plan.logo_path)) allPaths.add(plan.logo_path);
-
-    for (const orig of allPaths) {
-      const ext = path.extname(orig);
-      const sha = fileSha1Prefix(orig);
-      const guidFolder = wfpGuid();
-      const baseName = path.basename(orig);
-      const rel = `Medias/${guidFolder}/${baseName}`;
-      pathMap[orig] = rel;
-      bundleZip.addLocalFile(orig, `Medias/${guidFolder}`, baseName);
-      bundleZip.addLocalFile(orig, 'Resources', `${sha}_1${ext}`);
-      resourceItems.push({ original_path: orig.replace(/\\/g, '/'), bundle_path: rel, sha1: sha });
-    }
-    const innerWfp = buildFilmoraWfpBuffer(plan, rawTitle, pathMap);
-    bundleZip.addFile(`${safeTitle}.wfp`, innerWfp);
-    bundleZip.addFile('project.wfp', innerWfp);
-    bundleZip.addFile('resource.json', deflateRawJson({ version: '15.6.4', resources: resourceItems }));
-    bundleZip.writeZip(outPath);
+    buildWfpBundleFileOnDisk(pid, rawTitle, outPath);
   } else if (fmt === 'fcpxml') {
     const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE fcpxml>\n<fcpxml version="1.9"><project name="${safeTitle}"/></fcpxml>\n`;
     fs.writeFileSync(outPath, xml, 'utf-8');
@@ -2481,16 +3633,11 @@ app.get('/api/projects/:id/collect/status', (req, res) => {
 
 app.post('/api/projects/:id/collect', async (req, res) => {
   const pid = req.params.id;
-  const plan = loadJson(pid, 'timeline.json') || {
-    project_id: pid,
-    total_duration: 10,
-    clips: [],
-  };
   const mode = String(req.body?.mode || req.query?.mode || 'wfpbundle').toLowerCase();
   const rawTitle = String(req.body?.title || req.query?.title || `Project_${pid}`).trim();
   const safeTitle = rawTitle.replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
 
-  collectStatus[pid] = { running: true, percent: 15, message: 'Packing Filmora 15 .wfpbundle & media…' };
+  collectStatus[pid] = { running: true, percent: 10, message: 'Packing Filmora 15 .wfpbundle & media…' };
   try {
     const outDir = path.join(EXPORTS_DIR, pid);
     fs.mkdirSync(outDir, { recursive: true });
@@ -2499,45 +3646,10 @@ app.post('/api/projects/:id/collect', async (req, res) => {
     const bundlePath = path.join(outDir, bundleFilename);
     const standaloneWfpPath = path.join(outDir, `${safeTitle}.wfp`);
 
-    const bundleZip = new AdmZip();
-    const pathMap = {};
-    const resourceItems = [];
-    const allPaths = new Set();
-    for (const c of plan.clips || []) {
-      if (c.media_path && fs.existsSync(c.media_path)) allPaths.add(c.media_path);
-    }
-    const mediaList = loadJson(pid, 'media.json') || [];
-    for (const m of mediaList) {
-      if (m.path && fs.existsSync(m.path)) allPaths.add(m.path);
-    }
-    if (plan.voiceover_path && fs.existsSync(plan.voiceover_path)) allPaths.add(plan.voiceover_path);
-    if (plan.logo_path && fs.existsSync(plan.logo_path)) allPaths.add(plan.logo_path);
-
-    let idx = 0;
-    const total = Math.max(1, allPaths.size);
-    for (const orig of allPaths) {
-      idx++;
-      collectStatus[pid] = {
-        running: true,
-        percent: 15 + Math.round((idx / total) * 70),
-        message: `Archiving ${path.basename(orig)} (${idx}/${total})…`,
-      };
-      const ext = path.extname(orig);
-      const sha = fileSha1Prefix(orig);
-      const guidFolder = wfpGuid();
-      const baseName = path.basename(orig);
-      const rel = `Medias/${guidFolder}/${baseName}`;
-      pathMap[orig] = rel;
-      bundleZip.addLocalFile(orig, `Medias/${guidFolder}`, baseName);
-      bundleZip.addLocalFile(orig, 'Resources', `${sha}_1${ext}`);
-      resourceItems.push({ original_path: orig.replace(/\\/g, '/'), bundle_path: rel, sha1: sha });
-    }
-    const innerWfp = buildFilmoraWfpBuffer(plan, rawTitle, pathMap);
-    fs.writeFileSync(standaloneWfpPath, innerWfp);
-    bundleZip.addFile(`${safeTitle}.wfp`, innerWfp);
-    bundleZip.addFile('project.wfp', innerWfp);
-    bundleZip.addFile('resource.json', deflateRawJson({ version: '15.6.4', resources: resourceItems }));
-    bundleZip.writeZip(bundlePath);
+    const { fileCount, innerWfpBuffer } = buildWfpBundleFileOnDisk(pid, rawTitle, bundlePath, (pct, msg) => {
+      collectStatus[pid] = { running: true, percent: pct, message: msg };
+    });
+    fs.writeFileSync(standaloneWfpPath, innerWfpBuffer);
 
     const sizeMb = Math.round((fs.statSync(bundlePath).size / (1024 * 1024)) * 100) / 100;
     const dlEndpoint = `/api/projects/${pid}/collect/download?kind=${extSuffix}`;
@@ -2550,7 +3662,7 @@ app.post('/api/projects/:id/collect', async (req, res) => {
       zip_path: bundlePath,
       folder_path: outDir,
       wfp_path: standaloneWfpPath,
-      file_count: allPaths.size + 1,
+      file_count: fileCount,
       saved_to: bundlePath,
       wfpbundle_saved_to: bundlePath,
       size_mb: sizeMb,
@@ -2580,10 +3692,33 @@ async function handleOpenProjectFile(tempPath, origName) {
   const projTitle = path.parse(origName).name.replace(/\.(wfpbundle|wfp|dgsproj)$/i, '') || `Project ${pid}`;
 
   if (ext === '.json' || ext === '.dgsproj') {
-    const plan = JSON.parse(fs.readFileSync(tempPath, 'utf-8'));
+    const rawObj = JSON.parse(fs.readFileSync(tempPath, 'utf-8'));
     try { fs.unlinkSync(tempPath); } catch {}
-    plan.project_id = pid;
-    saveJson(pid, 'timeline.json', plan);
+    if (rawObj.dgs_format && rawObj.timeline) {
+      rawObj.project_id = pid;
+      rawObj.timeline.project_id = pid;
+      if (rawObj.scenes) saveJson(pid, 'script.json', rawObj.scenes);
+      if (rawObj.script_meta) saveJson(pid, 'script_meta.json', rawObj.script_meta);
+      if (rawObj.media) saveJson(pid, 'media.json', rawObj.media);
+      if (rawObj.voiceover) saveJson(pid, 'voiceover.json', rawObj.voiceover);
+      if (rawObj.poem_voiceover) saveJson(pid, 'poem_voiceover.json', rawObj.poem_voiceover);
+      if (rawObj.logo) saveJson(pid, 'logo.json', rawObj.logo);
+      saveJson(pid, 'timeline.json', rawObj.timeline);
+      saveJson(pid, 'last_export.json', { title: rawObj.title || projTitle });
+      return {
+        project_id: pid,
+        title: rawObj.title || projTitle,
+        scenes: rawObj.scenes || [],
+        poem: rawObj.script_meta?.poem || { has_poem: false },
+        media: rawObj.media || [],
+        voiceover: rawObj.voiceover || null,
+        poem_voiceover: rawObj.poem_voiceover || null,
+        logo: rawObj.logo || null,
+        timeline: rawObj.timeline,
+      };
+    }
+    rawObj.project_id = pid;
+    saveJson(pid, 'timeline.json', rawObj);
     saveJson(pid, 'last_export.json', { title: projTitle });
     return {
       project_id: pid,
@@ -2594,7 +3729,7 @@ async function handleOpenProjectFile(tempPath, origName) {
       voiceover: null,
       poem_voiceover: null,
       logo: null,
-      timeline: plan,
+      timeline: rawObj,
     };
   }
 
@@ -2602,18 +3737,31 @@ async function handleOpenProjectFile(tempPath, origName) {
   const outerZip = new AdmZip(tempPath);
   try { fs.unlinkSync(tempPath); } catch {}
   const entries = outerZip.getEntries();
-  const entryMap = new Map(entries.map((e) => [e.entryName.replace(/\\/g, '/'), e]));
 
-  // Extract both Medias/{GUID}/* and Resources/* into project media folders
+  const parseDgsComment = (zObj) => {
+    try {
+      const c = String(zObj.getZipComment() || '');
+      if (c.startsWith('DGS1:')) {
+        const rawBuf = zlib.inflateSync(Buffer.from(c.slice(5), 'base64'));
+        return JSON.parse(rawBuf.toString('utf-8'));
+      }
+    } catch {}
+    return null;
+  };
+
+  // Extract Medias/{GUID}/<file>, Media/*, and Resources/* into standard project media/voiceover folders
   const extractedMap = {};
-  const extractedByBase = {};
+  const wfpbundleGuidMap = {};
+  const wfpbundleNameMap = {};
   for (const e of entries) {
     if (e.isDirectory) continue;
     const norm = e.entryName.replace(/\\/g, '/');
     if (
-      (norm.startsWith('Resources/') || norm.startsWith('Medias/')) &&
+      (norm.startsWith('Medias/') || norm.startsWith('Resources/') || norm.includes('/Media/') || norm.startsWith('Media/')) &&
+      !norm.startsWith('ProjectFolder/') &&
       norm !== 'Medias/project_media.json'
     ) {
+      const parts = norm.split('/');
       const base = path.basename(norm);
       const fext = path.extname(base).toLowerCase();
       if (!IMAGE_EXT.has(fext) && !VIDEO_EXT.has(fext) && !AUDIO_EXT.has(fext)) continue;
@@ -2624,21 +3772,445 @@ async function handleOpenProjectFile(tempPath, origName) {
       const destFile = path.join(targetDir, base);
       fs.writeFileSync(destFile, e.getData());
       extractedMap[norm] = destFile;
-      extractedByBase[base] = destFile;
+      wfpbundleNameMap[base.toLowerCase()] = destFile;
+      if (norm.startsWith('Medias/') && parts.length >= 3) {
+        wfpbundleGuidMap[parts[1]] = destFile;
+      }
     }
   }
 
   let wfpZip = outerZip;
-  const innerWfpEntry = entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp'));
+  const innerWfpEntry = entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp') && !e.entryName.includes('/'));
   if (innerWfpEntry) {
     wfpZip = new AdmZip(innerWfpEntry.getData());
   }
+
+  const wfpEntries = wfpZip.getEntries();
+  let dgsData = parseDgsComment(wfpZip) || parseDgsComment(outerZip);
+  const dgsEntry = wfpZip.getEntry('ProjectFolder/dgs_project.json');
+  if (!dgsData && dgsEntry) {
+    try { dgsData = JSON.parse(dgsEntry.getData().toString('utf-8')); } catch {}
+  }
+
+  let projInfoData = null;
+  const pInfoEntry = wfpZip.getEntry('ProjectFolder/project_info.json');
+  if (pInfoEntry) {
+    try { projInfoData = JSON.parse(pInfoEntry.getData().toString('utf-8')); } catch {}
+  }
+
+  let wesprojData = null;
+  const wesEntry = wfpEntries.find((e) => !e.isDirectory && e.entryName.replace(/\\/g, '/').endsWith('timeline.wesproj'));
+  if (wesEntry) {
+    try { wesprojData = JSON.parse(wesEntry.getData().toString('utf-8')); } catch {}
+  }
+
+  const resolveDocDirOrPath = (rawFn) => {
+    let s = String(rawFn || '').trim();
+    if (!s) return '';
+    while (s.startsWith('file:/')) {
+      s = s.startsWith('file://') ? s.slice(7) : s.slice(6);
+    }
+    const normS = s.replace(/\\/g, '/');
+    if (normS.includes('%DOCUMENT_DIR%/Medias/')) {
+      const after = normS.split('%DOCUMENT_DIR%/Medias/')[1];
+      const parts = after.split('/');
+      if (parts[0] && wfpbundleGuidMap[parts[0]]) return wfpbundleGuidMap[parts[0]];
+      if (extractedMap[`Medias/${after}`]) return extractedMap[`Medias/${after}`];
+    }
+    if (normS.startsWith('Medias/')) {
+      const parts = normS.split('/');
+      if (parts.length >= 2 && wfpbundleGuidMap[parts[1]]) return wfpbundleGuidMap[parts[1]];
+      if (extractedMap[normS]) return extractedMap[normS];
+    }
+    if (extractedMap[normS]) return extractedMap[normS];
+    const baseLow = path.basename(normS).toLowerCase();
+    if (baseLow && wfpbundleNameMap[baseLow]) return wfpbundleNameMap[baseLow];
+    if (fs.existsSync(s)) return path.resolve(s);
+    return s;
+  };
+
+  // Path 1: Full DGS Bundle Restoration (`ProjectFolder/dgs_project.json` or `DGS1:` comment)
+  if (dgsData && dgsData.timeline) {
+    const title = dgsData.title || projInfoData?.project_file_name || projTitle;
+    if (Array.isArray(dgsData.scenes)) saveJson(pid, 'script.json', dgsData.scenes);
+    if (dgsData.script_meta) saveJson(pid, 'script_meta.json', dgsData.script_meta);
+
+    if (dgsData.logo && dgsData.logo.path) {
+      const resolvedLogo = resolveDocDirOrPath(dgsData.logo.path);
+      if (resolvedLogo && fs.existsSync(resolvedLogo)) {
+        const logoDir = path.join(root, 'logo');
+        fs.mkdirSync(logoDir, { recursive: true });
+        const dstLogo = path.join(logoDir, path.basename(resolvedLogo));
+        if (path.resolve(resolvedLogo) !== path.resolve(dstLogo)) {
+          fs.copyFileSync(resolvedLogo, dstLogo);
+          if (resolvedLogo.includes(path.join('media', 'images'))) {
+            try { fs.unlinkSync(resolvedLogo); } catch {}
+          }
+        }
+        dgsData.logo.path = dstLogo;
+        saveJson(pid, 'logo.json', dgsData.logo);
+        if (dgsData.timeline) dgsData.timeline.logo_path = dstLogo;
+      }
+    }
+
+    const mediaItems = await reindexMedia(pid);
+    const mediaByPath = new Map(mediaItems.map((m) => [path.resolve(m.path), m]));
+    const mediaByName = new Map(mediaItems.map((m) => [m.filename.toLowerCase(), m]));
+
+    if (dgsData.voiceover) {
+      const vo = { ...dgsData.voiceover };
+      if (vo.path) vo.path = resolveDocDirOrPath(vo.path);
+      if (Array.isArray(vo.slots)) {
+        for (const s of vo.slots) {
+          if (s && s.path) s.path = resolveDocDirOrPath(s.path);
+        }
+        // If multi-slot VO was archived as individual slots without merged_narration.mp3, rebuild merged narration VO
+        if (vo.slots.length > 1 && (!vo.path || !fs.existsSync(vo.path))) {
+          const rebuilt = await rebuildMergedVo(pid, vo.slots);
+          vo.path = rebuilt.path;
+          vo.duration = rebuilt.duration;
+        }
+      }
+      saveJson(pid, 'voiceover.json', vo);
+      dgsData.voiceover = vo;
+    }
+
+    if (dgsData.poem_voiceover) {
+      const pvo = { ...dgsData.poem_voiceover };
+      if (pvo.path) pvo.path = resolveDocDirOrPath(pvo.path);
+      saveJson(pid, 'poem_voiceover.json', pvo);
+      dgsData.poem_voiceover = pvo;
+    }
+
+    const plan = dgsData.timeline;
+    plan.project_id = pid;
+    if (plan.voiceover_path) plan.voiceover_path = dgsData.voiceover?.path || resolveDocDirOrPath(plan.voiceover_path);
+    if (plan.poem_voiceover_path) plan.poem_voiceover_path = resolveDocDirOrPath(plan.poem_voiceover_path);
+    for (const c of plan.clips || []) {
+      if (c.media_path) {
+        const rp = resolveDocDirOrPath(c.media_path);
+        const found = (rp && mediaByPath.get(path.resolve(rp))) || mediaByName.get(path.basename(rp).toLowerCase());
+        c.media_path = found ? found.path : rp;
+        if (found) c.media_id = found.id;
+      }
+    }
+    for (const s of plan.voiceover_slots || []) {
+      if (s && s.path) s.path = resolveDocDirOrPath(s.path);
+    }
+    if (!plan.srt_cues || !plan.srt_cues.length) {
+      plan.srt_cues = buildSrtCues(plan.clips || [], plan);
+    }
+    saveJson(pid, 'timeline.json', plan);
+    saveJson(pid, 'last_export.json', { title });
+    return {
+      project_id: pid,
+      title,
+      scenes: loadJson(pid, 'script.json') || [],
+      poem: dgsData.script_meta?.poem || { has_poem: Boolean(plan.has_poem) },
+      media: mediaItems,
+      voiceover: loadJson(pid, 'voiceover.json'),
+      poem_voiceover: loadJson(pid, 'poem_voiceover.json'),
+      logo: loadJson(pid, 'logo.json'),
+      timeline: plan,
+    };
+  }
+
+  // Path 2: Native Wondershare Filmora 15/16 `.wfp` or `.wfpbundle` (`timeline.wesproj` created in Filmora 15!)
+  if (wesprojData) {
+    const title = projInfoData?.project_file_name || projTitle;
+    const resUidMap = {};
+    for (const rItem of wesprojData.resources || []) {
+      const ruid = String(rItem.sourceUuid || rItem.uid || '').trim();
+      const rfn = String(rItem.filename || '').trim();
+      if (ruid && rfn) resUidMap[ruid] = rfn;
+    }
+
+    const tlInfos = wesprojData.timelineInfos || [];
+    const clips = [];
+    const scenesList = [];
+    const voClipsRaw = [];
+    const srtCues = [];
+    let logoPath = null;
+
+    if (tlInfos.length) {
+      const allTracks = tlInfos[0].trackInfos || [];
+      let mainVidIdx = -1;
+      let maxVidCount = -1;
+      allTracks.forEach((tr, idx) => {
+        if (tr.trackType === 1 && (tr.clipList || []).some((c) => c.type === 1 || c.type === 3)) {
+          const cnt = (tr.clipList || []).length;
+          if (cnt > maxVidCount) {
+            maxVidCount = cnt;
+            mainVidIdx = idx;
+          }
+        }
+      });
+
+      // Pass 1: Extract embedded Filmora 15 subtitle cues (`type === 22` with `subtitleSource.Items`)
+      for (const track of allTracks) {
+        for (const c of track.clipList || []) {
+          if (c.type === 22 && c.subtitleSource) {
+            try {
+              const subSrc = typeof c.subtitleSource === 'string' ? JSON.parse(c.subtitleSource) : c.subtitleSource;
+              const clipTlB = Number(c.tlBegin || 0) / TICKS_PER_SEC;
+              for (const item of subSrc.Items || []) {
+                const txt = String(item.Content || '').trim();
+                if (!txt) continue;
+                const sSec = Math.round((clipTlB + Number(item.Start || 0) / TICKS_PER_SEC) * 1000) / 1000;
+                const eSec = Math.round((clipTlB + Number(item.End || 0) / TICKS_PER_SEC) * 1000) / 1000;
+                if (eSec > sSec) {
+                  srtCues.push({ index: srtCues.length + 1, screen: '', start: sSec, end: eSec, text: txt });
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // Pass 2: Extract video/image scenes, upper-track logo overlay, and audio VO clips
+      for (let idx = 0; idx < allTracks.length; idx++) {
+        const track = allTracks[idx];
+        const ttype = track.trackType;
+        for (const c of track.clipList || []) {
+          const subClips = c.clipList || [];
+          const suid = String(
+            c.sourceUuid || c.source || (subClips[0] && (subClips[0].sourceUuid || subClips[0].source)) || '',
+          ).trim();
+          const rawFn = String(
+            c.filename || (subClips[0] && subClips[0].filename) || resUidMap[suid] || '',
+          ).trim();
+          if (!rawFn) continue;
+          let fn = resolveDocDirOrPath(rawFn);
+          const tlB = Number(c.tlBegin || 0) / TICKS_PER_SEC;
+          const tlE = Number(c.tlEnd || 0) / TICKS_PER_SEC;
+          let inP = Number(c.inPoint || 0) / TICKS_PER_SEC;
+          let outP = Number(c.outPoint || 0) / TICKS_PER_SEC;
+          if (inP >= 3600.0) {
+            inP = Math.round((inP - 3600.0) * 1000) / 1000;
+            outP = Math.round((outP - 3600.0) * 1000) / 1000;
+          }
+          const dur = Math.max(0.1, Math.round((tlE - tlB) * 1000) / 1000);
+
+          if (ttype === 1 && (c.type === 1 || c.type === 3)) {
+            const fext = path.extname(fn).toLowerCase();
+            if (idx !== mainVidIdx && (track.clipList || []).length === 1 && IMAGE_EXT.has(fext)) {
+              const logoDir = path.join(root, 'logo');
+              fs.mkdirSync(logoDir, { recursive: true });
+              const dstLogo = path.join(logoDir, path.basename(fn));
+              if (fs.existsSync(fn)) {
+                try {
+                  if (path.resolve(fn) !== path.resolve(dstLogo)) {
+                    fs.copyFileSync(fn, dstLogo);
+                    if (fn.includes(path.join('media', 'images'))) {
+                      try { fs.unlinkSync(fn); } catch {}
+                    }
+                  }
+                  fn = dstLogo;
+                } catch {}
+              }
+              logoPath = fn;
+              continue;
+            }
+
+            const sceneIdx = clips.length + 1;
+            const detScr = detectScreens(path.basename(fn))[0];
+            const usedScreens = new Set(clips.map((ec) => ec.screen));
+            let screen = detScr && !usedScreens.has(detScr) ? detScr : `screen_${sceneIdx}`;
+            let candIdx = sceneIdx;
+            while (usedScreens.has(screen)) {
+              candIdx++;
+              screen = `screen_${candIdx}`;
+            }
+            const kind = IMAGE_EXT.has(fext) ? 'image' : 'video';
+
+            const matchedCues = [];
+            for (const cue of srtCues) {
+              const midT = 0.5 * (cue.start + cue.end);
+              if (tlB - 0.05 <= midT && midT <= tlE + 0.05) {
+                if (!cue.screen) cue.screen = screen;
+                matchedCues.push(cue);
+              }
+            }
+            const voTxt = matchedCues.map((q) => q.text).join(' ').trim();
+            const displayTxt = voTxt || path.parse(fn).name;
+
+            clips.push({
+              screen,
+              media_id: null,
+              media_path: fn,
+              kind,
+              start: Math.round(tlB * 1000) / 1000,
+              end: Math.round(tlE * 1000) / 1000,
+              duration: dur,
+              source_in: Math.round(inP * 1000) / 1000,
+              source_out: Math.round(outP * 1000) / 1000,
+              script_text: displayTxt,
+              vo_text: voTxt,
+              narration_in: Math.round(tlB * 1000) / 1000,
+              narration_out: Math.round(tlE * 1000) / 1000,
+              caption_in: matchedCues.length ? Math.round(matchedCues[0].start * 1000) / 1000 : null,
+              caption_out: matchedCues.length ? Math.round(matchedCues[matchedCues.length - 1].end * 1000) / 1000 : null,
+              caption_text: voTxt,
+              fit: kind === 'video' ? 'trim' : 'hold',
+            });
+            scenesList.push({
+              screen,
+              text: displayTxt,
+              index: sceneIdx,
+              scene_no: sceneIdx,
+              section: 'story',
+              duration: dur,
+              onscreen_text: voTxt,
+              voiceover_text: voTxt,
+              voiceover_raw: voTxt,
+              visual_type: kind === 'image' ? 'Image' : 'Video',
+              visual_direction: path.basename(fn),
+              audio_start: Math.round(tlB * 1000) / 1000,
+              audio_end: Math.round(tlE * 1000) / 1000,
+              is_poem: false,
+              source: 'filmora',
+            });
+          } else if (ttype === 2 && track.trackTag !== 1 && fn) {
+            voClipsRaw.push({
+              path: fn,
+              filename: path.basename(fn),
+              tl_b: Math.round(tlB * 1000) / 1000,
+              tl_e: Math.round(tlE * 1000) / 1000,
+              in_p: Math.round(inP * 1000) / 1000,
+              out_p: Math.round(outP * 1000) / 1000,
+              dur,
+            });
+          }
+        }
+      }
+    }
+
+    const mediaItems = await reindexMedia(pid);
+    const mediaByPath = new Map(mediaItems.map((m) => [path.resolve(m.path), m]));
+    const mediaByName = new Map(mediaItems.map((m) => [m.filename.toLowerCase(), m]));
+    for (const c of clips) {
+      const found = (c.media_path && mediaByPath.get(path.resolve(c.media_path))) || mediaByName.get(path.basename(c.media_path).toLowerCase());
+      if (found) {
+        c.media_id = found.id;
+        c.media_path = found.path;
+      }
+    }
+
+    const voSlots = [];
+    let voPath = null;
+    if (voClipsRaw.length) {
+      voClipsRaw.sort((a, b) => a.tl_b - b.tl_b);
+      for (let i = 0; i < voClipsRaw.length; i++) {
+        const vc = voClipsRaw[i];
+        voSlots.push({
+          slot: i + 1,
+          filename: vc.filename,
+          duration: vc.dur,
+          start_offset: vc.tl_b,
+          end_offset: vc.tl_e,
+          start: vc.tl_b,
+          end: vc.tl_e,
+          path: vc.path,
+        });
+      }
+      if (voClipsRaw.length === 1 && voClipsRaw[0].in_p <= 0.05) {
+        voPath = voClipsRaw[0].path;
+      } else {
+        const voDir = path.join(root, 'voiceover');
+        fs.mkdirSync(voDir, { recursive: true });
+        const mergedVo = path.join(voDir, 'merged_narration.mp3');
+        try {
+          const inputs = [];
+          const fparts = [];
+          const clabels = [];
+          let cursor = 0;
+          let segCount = 0;
+          for (let idxV = 0; idxV < voClipsRaw.length; idxV++) {
+            const vc = voClipsRaw[idxV];
+            if (vc.tl_b > cursor + 0.02) {
+              const gapD = vc.tl_b - cursor;
+              const glbl = `g${idxV}`;
+              fparts.push(`anullsrc=r=44100:cl=stereo,atrim=0:${gapD.toFixed(3)},asetpts=PTS-STARTPTS[${glbl}]`);
+              clabels.push(`[${glbl}]`);
+              segCount++;
+            }
+            inputs.push('-i', vc.path);
+            const albl = `a${idxV}`;
+            fparts.push(`[${idxV}:a]atrim=start=${vc.in_p.toFixed(3)}:end=${vc.out_p.toFixed(3)},asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo[${albl}]`);
+            clabels.push(`[${albl}]`);
+            segCount++;
+            cursor = vc.tl_e;
+          }
+          fparts.push(`${clabels.join('')}concat=n=${segCount}:v=0:a=1[aout]`);
+          await runFfmpeg(['-y', ...inputs, '-filter_complex', fparts.join(';'), '-map', '[aout]', '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', mergedVo]);
+          if (fs.existsSync(mergedVo) && fs.statSync(mergedVo).size > 256) {
+            voPath = mergedVo;
+          }
+        } catch {
+          voPath = voClipsRaw[0].path;
+        }
+      }
+    }
+
+    const totalDur = Math.max(
+      clips.reduce((acc, c) => Math.max(acc, c.end || 0), 0),
+      voSlots.reduce((acc, s) => Math.max(acc, s.end || 0), 0),
+      10,
+    );
+    const finalSrtCues = srtCues.length ? srtCues : buildSrtCues(clips);
+    const plan = {
+      project_id: pid,
+      total_duration: totalDur,
+      clips,
+      voiceover_path: voPath,
+      voiceover_slots: voSlots,
+      logo_path: logoPath,
+      logo_enabled: Boolean(logoPath),
+      language: 'en',
+      srt_cues: finalSrtCues,
+      qa_issues: [],
+      qa_summary: `Imported from Filmora 15 (${clips.length} scenes, ${finalSrtCues.length} captions)`,
+    };
+    saveJson(pid, 'script.json', scenesList);
+    saveJson(pid, 'script_meta.json', { format: 'imported_wfp', filename: `${title}.xlsx`, scene_count: scenesList.length, poem: { has_poem: false } });
+    saveJson(pid, 'last_export.json', { title });
+    let voObj = null;
+    if (voPath) {
+      const voLabel = voClipsRaw.length > 1 ? Array.from(new Set(voClipsRaw.map((v) => v.filename))).join(' + ') : path.basename(voPath);
+      voObj = {
+        path: voPath,
+        filename: voLabel,
+        duration: (await probeDuration(voPath)) || totalDur,
+        kind: 'narration',
+        slots: voSlots,
+      };
+      saveJson(pid, 'voiceover.json', voObj);
+    }
+    let logoObj = null;
+    if (logoPath) {
+      logoObj = { path: logoPath, filename: path.basename(logoPath), enabled: true };
+      saveJson(pid, 'logo.json', logoObj);
+    }
+    saveJson(pid, 'timeline.json', plan);
+    return {
+      project_id: pid,
+      title,
+      scenes: scenesList,
+      poem: { has_poem: false },
+      media: mediaItems,
+      voiceover: voObj,
+      poem_voiceover: null,
+      logo: logoObj,
+      timeline: plan,
+    };
+  }
+
+  // Path 3: Legacy `Timelines/timeline.json` fallback
   const tlEntry = wfpZip.getEntry('Timelines/timeline.json');
   if (!tlEntry) {
-    throw new Error('Invalid .wfp/.wfpbundle: missing Timelines/timeline.json');
+    throw new Error('Invalid .wfp/.wfpbundle: missing ProjectFolder/Medias/.../timeline.wesproj');
   }
   const tlObj = inflateRawJson(tlEntry.getData());
-
   const mediaItems = await reindexMedia(pid);
   const mediaByPath = new Map(mediaItems.map((m) => [path.resolve(m.path), m]));
   const mediaByName = new Map(mediaItems.map((m) => [m.filename.toLowerCase(), m]));
@@ -2646,11 +4218,10 @@ async function handleOpenProjectFile(tempPath, origName) {
   let clips = [];
   if (tlObj.dgs_plan_snapshot && Array.isArray(tlObj.dgs_plan_snapshot.clips)) {
     clips = tlObj.dgs_plan_snapshot.clips.map((c, idx) => {
-      const normRef = String(c.media_path || '').replace(/\\/g, '/');
-      const localPath = extractedMap[normRef] || extractedByBase[path.basename(normRef)] || c.media_path || '';
+      const localPath = resolveDocDirOrPath(c.media_path);
       const found =
         (localPath && mediaByPath.get(path.resolve(localPath))) ||
-        mediaByName.get(path.basename(normRef).toLowerCase());
+        mediaByName.get(path.basename(localPath || '').toLowerCase());
       return {
         ...c,
         media_id: found ? found.id : c.media_id,
@@ -2658,88 +4229,12 @@ async function handleOpenProjectFile(tempPath, origName) {
         screen: c.screen || `screen_${idx + 1}`,
       };
     });
-  } else if (Array.isArray(tlObj.tracks)) {
-    const vTrack = tlObj.tracks.find((t) => t.type === 1) || tlObj.tracks[0];
-    let cursor = 0;
-    for (let i = 0; i < (vTrack?.clips || []).length; i++) {
-      const vc = vTrack.clips[i];
-      const dur = (vc.timeline_range?.duration || TICKS_PER_SEC * 3) / TICKS_PER_SEC;
-      const srcRel = String(vc.source_file || '').replace(/\\/g, '/');
-      const localPath = extractedMap[srcRel] || extractedByBase[path.basename(srcRel)] || srcRel;
-      const found =
-        (localPath && mediaByPath.get(path.resolve(localPath))) ||
-        mediaByName.get(path.basename(srcRel).toLowerCase());
-      let extra = {};
-      try { if (vc.extra) extra = JSON.parse(vc.extra); } catch {}
-      clips.push({
-        screen: extra.screen || `screen_${i + 1}`,
-        media_id: found ? found.id : null,
-        media_path: found ? found.path : localPath,
-        kind: found ? found.kind : (vc.type === 1 ? 'video' : 'image'),
-        start: Math.round(cursor * 1000) / 1000,
-        end: Math.round((cursor + dur) * 1000) / 1000,
-        duration: Math.round(dur * 1000) / 1000,
-        source_in: 0,
-        source_out: Math.round(dur * 1000) / 1000,
-        script_text: extra.script_text || vc.title || `screen_${i + 1}`,
-        vo_text: extra.vo_text || '',
-        narration_in: extra.narration_in ?? null,
-        narration_out: extra.narration_out ?? null,
-        fit: 'hold',
-      });
-      cursor += dur;
-    }
   }
-
-  // Check extracted voiceover
-  const voDir = path.join(root, 'voiceover');
-  let voPath = null;
-  let voMeta = null;
-  if (fs.existsSync(voDir)) {
-    const voFiles = fs.readdirSync(voDir).filter((f) => AUDIO_EXT.has(path.extname(f).toLowerCase()));
-    if (voFiles.length) {
-      voPath = path.join(voDir, voFiles[0]);
-      const voDur = (await probeDuration(voPath)) || 0;
-      voMeta = {
-        path: voPath,
-        filename: voFiles[0],
-        duration: voDur,
-        kind: 'narration',
-        slots: [{ slot: 1, filename: voFiles[0], path: voPath, duration: voDur, start_offset: 0, end_offset: voDur }],
-      };
-      saveJson(pid, 'voiceover.json', voMeta);
-    }
-  }
-
-  const scenes = clips.map((c, idx) => ({
-    screen: c.screen || `screen_${idx + 1}`,
-    index: idx + 1,
-    scene_no: idx + 1,
-    section: 'story',
-    visual_type: c.kind === 'video' ? 'Video' : 'Image',
-    visual_direction: c.script_text || '',
-    onscreen_text: '',
-    voiceover_text: c.vo_text || c.script_text || '',
-    text: c.vo_text || c.script_text || c.screen,
-    duration: c.duration,
-    is_poem: false,
-  }));
-  saveJson(pid, 'script.json', scenes);
-  saveJson(pid, 'script_meta.json', {
-    format: 'imported_wfp',
-    filename: origName,
-    scene_count: scenes.length,
-    poem: { has_poem: false },
-  });
-  saveJson(pid, 'last_export.json', { title: projTitle });
-
-  const totalDur = clips.reduce((acc, c) => Math.max(acc, c.end || 0), 0) || (voMeta?.duration || 10);
+  const totalDur = clips.reduce((acc, c) => Math.max(acc, c.end || 0), 0) || 10;
   const plan = {
     project_id: pid,
     total_duration: totalDur,
     clips,
-    voiceover_path: voPath,
-    voiceover_slots: voMeta?.slots || [],
     srt_cues: buildSrtCues(clips),
     qa_issues: [],
     qa_summary: `Imported ${clips.length} clips from ${origName}`,
@@ -2748,10 +4243,10 @@ async function handleOpenProjectFile(tempPath, origName) {
   return {
     project_id: pid,
     title: projTitle,
-    scenes,
+    scenes: [],
     poem: { has_poem: false },
     media: mediaItems,
-    voiceover: voMeta,
+    voiceover: null,
     poem_voiceover: null,
     logo: null,
     timeline: plan,
