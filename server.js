@@ -1399,6 +1399,11 @@ async function handleVoiceoverFile(pid, slot, tempPath, origName) {
   }
   slots = slots.filter((s) => Number(s.slot) !== slot);
   slots.push({ slot, filename: origName, path: dest, norm_path: normPath, duration });
+  const sm = loadJson(pid, 'script_meta.json');
+  if (sm && sm.imported_bundle) {
+    sm.imported_bundle = false;
+    saveJson(pid, 'script_meta.json', sm);
+  }
   return await rebuildMergedVo(pid, slots);
 }
 
@@ -1423,6 +1428,11 @@ app.delete('/api/projects/:id/voiceover/:slot', async (req, res) => {
     const slot = parseInt(req.params.slot, 10);
     const existing = loadJson(pid, 'voiceover.json') || {};
     const slots = (existing.slots || []).filter((s) => Number(s.slot) !== slot);
+    const sm = loadJson(pid, 'script_meta.json');
+    if (sm && sm.imported_bundle) {
+      sm.imported_bundle = false;
+      saveJson(pid, 'script_meta.json', sm);
+    }
     const meta = await rebuildMergedVo(pid, slots);
     res.json(meta);
   } catch (e) {
@@ -1536,6 +1546,70 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const voMeta = loadJson(pid, 'voiceover.json') || {};
     const poemVoMeta = loadJson(pid, 'poem_voiceover.json') || {};
     const logoMeta = loadJson(pid, 'logo.json') || {};
+    const scriptMeta = loadJson(pid, 'script_meta.json') || {};
+    const existingTl = loadJson(pid, 'timeline.json');
+
+    // If project was imported from a .wfpbundle / .wfp and neither script nor master VO was replaced,
+    // preserve the bundle's exact clip timings/alignment while refreshing newly uploaded media, captions, logo, and QA!
+    if (scriptMeta.imported_bundle && !req.body?.force_realign && existingTl && Array.isArray(existingTl.clips) && existingTl.clips.length) {
+      const sceneMap = new Map(scenes.map((s) => [normScreenId(s.screen), s]));
+      for (const c of existingTl.clips) {
+        const s = sceneMap.get(normScreenId(c.screen));
+        const picked = pickMediaForScreen(c.screen, media, s?.visual_direction || '');
+        const primary = picked.video || picked.image || null;
+        if (primary) {
+          c.media_id = primary.id;
+          c.media_path = primary.path;
+          c.kind = primary.kind;
+          c.fit = primary.kind === 'video' ? 'trim' : 'hold';
+        } else if (c.media_path && !fs.existsSync(c.media_path)) {
+          c.fit = 'missing';
+        }
+        if (s) {
+          const isInst = isInstrumentalScene(s);
+          const cap = isInst ? '' : cleanCaptionText(s.onscreen_text || s.voiceover_text || c.caption_text || '');
+          c.caption_text = cap;
+          if (s.voiceover_text) c.vo_text = isInst ? '' : s.voiceover_text;
+          if (s.text) c.script_text = s.text;
+        }
+      }
+      existingTl.logo_path = logoMeta.path || existingTl.logo_path || null;
+      existingTl.logo_enabled = logoMeta.enabled !== false && Boolean(existingTl.logo_path);
+      if (voMeta.path) existingTl.voiceover_path = voMeta.path;
+      if (poemVoMeta.path) existingTl.poem_voiceover_path = poemVoMeta.path;
+      existingTl.srt_cues = buildSrtCues(existingTl.clips, existingTl);
+      saveJson(pid, 'subtitles.srt', formatSrt(existingTl.srt_cues));
+
+      const qaIssues = [];
+      for (const c of existingTl.clips) {
+        if (c.fit === 'missing' || !c.media_path || !fs.existsSync(c.media_path)) {
+          const mNum = String(c.screen || '').match(/(\d+)$/);
+          const imgNo = mNum ? parseInt(mNum[1], 10) : null;
+          const sSec = Math.max(0, Math.floor(Number(c.start || 0)));
+          const eSec = Math.max(0, Math.floor(Number(c.end || 0)));
+          const tc = `${String(Math.floor(sSec / 60)).padStart(2, '0')}:${String(sSec % 60).padStart(2, '0')}–${String(Math.floor(eSec / 60)).padStart(2, '0')}:${String(eSec % 60).padStart(2, '0')}`;
+          qaIssues.push({
+            kind: 'missing_card',
+            severity: 'error',
+            screen: c.screen,
+            image_no: imgNo,
+            time: Number(c.start || 0),
+            end: Number(c.end || 0),
+            timecode: tc,
+            message: `Image ${imgNo || c.screen}: blank on Video 1 · no card/video at ${tc}. Drop ${imgNo || c.screen}.png or Scene ${imgNo || c.screen}.mp4 in the media folder.`,
+          });
+        }
+      }
+      const errCount = qaIssues.filter((i) => i.severity === 'error').length;
+      const warnCount = qaIssues.filter((i) => i.severity === 'warning').length;
+      existingTl.qa_issues = qaIssues;
+      existingTl.qa_summary = qaIssues.length
+        ? `Bundle alignment preserved · ${errCount} missing · ${warnCount} warnings · ${existingTl.clips.length} scenes`
+        : `Bundle alignment preserved · no issues · ${existingTl.clips.length} scenes checked`;
+      saveJson(pid, 'timeline.json', existingTl);
+      saveJson(pid, 'qa.json', { summary: existingTl.qa_summary, issues: qaIssues });
+      return res.json(existingTl);
+    }
 
     const voDur = Number(voMeta.duration || 0);
     const poemVoDur = Number(poemVoMeta.duration || 0);
@@ -4000,7 +4074,10 @@ async function handleOpenProjectFile(tempPath, origName) {
   if (dgsData && dgsData.timeline) {
     const title = dgsData.title || projInfoData?.project_file_name || projTitle;
     if (Array.isArray(dgsData.scenes)) saveJson(pid, 'script.json', dgsData.scenes);
-    if (dgsData.script_meta) saveJson(pid, 'script_meta.json', dgsData.script_meta);
+    saveJson(pid, 'script_meta.json', {
+      ...(dgsData.script_meta || { format: 'imported_wfpbundle', filename: `${title}.xlsx` }),
+      imported_bundle: true,
+    });
 
     if (dgsData.logo && dgsData.logo.path) {
       const resolvedLogo = resolveDocDirOrPath(dgsData.logo.path);
@@ -4339,7 +4416,13 @@ async function handleOpenProjectFile(tempPath, origName) {
       qa_summary: `Imported from Filmora 15 (${clips.length} scenes, ${finalSrtCues.length} captions)`,
     };
     saveJson(pid, 'script.json', scenesList);
-    saveJson(pid, 'script_meta.json', { format: 'imported_wfp', filename: `${title}.xlsx`, scene_count: scenesList.length, poem: { has_poem: false } });
+    saveJson(pid, 'script_meta.json', {
+      format: 'imported_wfp',
+      imported_bundle: true,
+      filename: `${title}.xlsx`,
+      scene_count: scenesList.length,
+      poem: { has_poem: false },
+    });
     saveJson(pid, 'last_export.json', { title });
     let voObj = null;
     if (voPath) {
