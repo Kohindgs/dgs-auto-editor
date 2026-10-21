@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "echo 'Frontend pre-built in public/'",
-    "start": "node server.js"
+    "start": "UV_THREADPOOL_SIZE=1 node --v8-pool-size=1 server.js"
   },
   "dependencies": {
     "@ffprobe-installer/ffprobe": "^2.1.2",

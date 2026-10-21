@@ -1,3 +1,4 @@
+process.env.UV_THREADPOOL_SIZE = '1';
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -1712,7 +1713,7 @@ function buildVideoRateArgs(settings) {
 
   let base = ['-c:v', vcodec];
   if (vcodec === 'libx264') {
-    base.push('-preset', x264Preset, '-x264-params', 'threads=1:lookahead_threads=1');
+    base.push('-preset', x264Preset, '-x264-params', 'threads=1:sync-lookahead=0:sliced-threads=1');
   } else if (vcodec === 'libx265') {
     base.push('-preset', x264Preset, '-x265-params', 'pools=none:frame-threads=1');
   }
@@ -1784,18 +1785,19 @@ app.post('/api/projects/:id/export', async (req, res) => {
         message: `Rendering scene ${i + 1}/${plan.clips.length} (${c.screen})…`,
       };
       const outPart = path.join(partsDir, `part_${String(i).padStart(4, '0')}.mp4`);
-      const vfBase = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${fps},format=yuv420p`;
+      const vfBase = `scale=${width}:${height}:force_original_aspect_ratio=decrease:threads=1,format=yuv420p,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${fps}`;
+      const x264SingleThread = ['-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:sync-lookahead=0:sliced-threads=1', '-crf', '18', '-pix_fmt', 'yuv420p', '-an'];
 
       if (!c.media_path || !fs.existsSync(c.media_path) || c.fit === 'missing') {
         await runFfmpeg([
           '-y', '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:d=${clipDur}:r=${fps}`,
-          '-t', String(clipDur), '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:lookahead_threads=1', '-pix_fmt', 'yuv420p', '-an', outPart,
+          '-t', String(clipDur), ...x264SingleThread, outPart,
         ]);
       } else if (c.kind === 'image') {
         await runFfmpeg([
-          '-y', '-loop', '1', '-i', c.media_path,
+          '-y', '-loop', '1', '-framerate', String(fps), '-i', c.media_path,
           '-t', String(clipDur), '-vf', vfBase,
-          '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:lookahead_threads=1', '-crf', '18', '-pix_fmt', 'yuv420p', '-an', outPart,
+          ...x264SingleThread, outPart,
         ]);
       } else {
         // Video clip: if source video is shorter than slot duration, freeze last frame with tpad
@@ -1811,7 +1813,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
         await runFfmpeg([
           '-y', '-ss', String(srcIn), '-i', c.media_path,
           '-t', String(clipDur), '-vf', vfVideo,
-          '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:lookahead_threads=1', '-crf', '18', '-pix_fmt', 'yuv420p', '-an', outPart,
+          ...x264SingleThread, outPart,
         ]);
       }
       partFiles.push(outPart);
@@ -1834,8 +1836,8 @@ app.post('/api/projects/:id/export', async (req, res) => {
       const padY = Math.max(10, Math.round(height * 0.0176));
       await runFfmpeg([
         '-y', '-i', silentMp4, '-i', plan.logo_path,
-        '-filter_complex', `[1:v]scale=${logoW}:-1[lg];[0:v][lg]overlay=W-w-${padX}:${padY}:format=auto,format=yuv420p[vout]`,
-        '-map', '[vout]', '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:lookahead_threads=1', '-crf', '18', '-an', logoMp4,
+        '-filter_complex', `[1:v]scale=${logoW}:-1:threads=1[lg];[0:v][lg]overlay=W-w-${padX}:${padY}:format=auto,format=yuv420p[vout]`,
+        '-map', '[vout]', '-c:v', 'libx264', '-preset', 'ultrafast', '-x264-params', 'threads=1:sync-lookahead=0:sliced-threads=1', '-crf', '18', '-an', logoMp4,
       ]);
       videoSource = logoMp4;
     }
@@ -1864,8 +1866,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
         await runFfmpeg(['-y', '-i', srcAudio, ...aEncArgs, outPath], { timeout: 600000 });
       }
     } else if (hasVo || hasPoem) {
-      // Build narr_runs from (clip.start, clip.narration_in, clip.narration_out) so silent holds,
-      // action videos, and poem blocks never cause narration drift!
+      // Step A: Build synchronized audio track in an audio-only (-vn) pass to minimize container threads
       const narrRuns = [];
       for (const c of plan.clips) {
         if (c.narration_in == null || c.narration_out == null) continue;
@@ -1887,10 +1888,10 @@ app.post('/api/projects/:id/export', async (req, res) => {
       const audioInputs = [];
       const filterParts = [];
       const mixLabels = [];
-      let nextInputIdx = 1; // 0 is videoSource
+      let nextAudioIdx = 0;
 
       if (hasVo) {
-        const voIdx = nextInputIdx++;
+        const voIdx = nextAudioIdx++;
         audioInputs.push('-i', plan.voiceover_path);
         if (narrRuns.length) {
           for (let rIdx = 0; rIdx < narrRuns.length; rIdx++) {
@@ -1909,7 +1910,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
       }
 
       if (hasPoem) {
-        const poemIdx = nextInputIdx++;
+        const poemIdx = nextAudioIdx++;
         audioInputs.push('-i', plan.poem_voiceover_path);
         const pStart = Number(plan.poem_start_time || 0);
         const pEnd = Number(plan.poem_end_time || 0);
@@ -1929,18 +1930,42 @@ app.post('/api/projects/:id/export', async (req, res) => {
         filterComplex = `${filterParts.join(';')};${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:dropout_transition=0,volume=${mixLabels.length},apad=whole_dur=${totalTlDur.toFixed(3)}[aout]`;
       }
 
+      const audioExt = settings.audio_encoder === 'mp3' ? 'mp3' : settings.audio_encoder === 'pcm' ? 'wav' : 'm4a';
+      const mixedAudioPath = path.join(jobDir, `mixed_audio.${audioExt}`);
+      await runFfmpeg([
+        '-y',
+        ...audioInputs,
+        '-filter_complex', filterComplex,
+        '-map', '[aout]',
+        '-vn',
+        ...aEncArgs,
+        '-t', totalTlDur.toFixed(3),
+        mixedAudioPath,
+      ], { timeout: 300000 });
+
+      // Step B: Encode video-only track with target compression settings
+      exportStatus[pid] = { running: true, percent: 93, message: 'Applying video compression…' };
+      const encodedVideoPath = path.join(jobDir, 'video_encoded.mp4');
       await runFfmpeg([
         '-y',
         '-i', videoSource,
-        ...audioInputs,
-        '-filter_complex', filterComplex,
-        '-map', '0:v:0', '-map', '[aout]',
         ...vRateArgs,
-        ...aEncArgs,
-        ...movFlags,
+        '-an',
         '-t', totalTlDur.toFixed(3),
-        outPath,
+        encodedVideoPath,
       ], { timeout: 600000 });
+
+      // Step C: Ultra-lightweight stream-copy mux of encoded video + synced audio
+      exportStatus[pid] = { running: true, percent: 97, message: 'Finalizing MP4 container…' };
+      await runFfmpeg([
+        '-y',
+        '-i', encodedVideoPath,
+        '-i', mixedAudioPath,
+        '-map', '0:v:0', '-map', '1:a:0',
+        '-c', 'copy',
+        ...movFlags,
+        outPath,
+      ], { timeout: 120000 });
     } else {
       await runFfmpeg([
         '-y',
