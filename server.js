@@ -450,10 +450,11 @@ function cleanVoText(raw, onscreenText = '') {
     text = voBlocks.join(' ');
   }
   text = text
+    // If a pause tag is between words inside a fill-in-the-blank prompt, keep '...' so the blank is visible
+    .replace(/(\w)\s*\[\s*\d+\s*[- ]?(?:second|sec)[^\]]*pause[^\]]*\]\s*(\w)/gi, '$1 ... $2')
     .replace(/\[[^\]]*\]/g, ' ')
-    .replace(/(?:narrator|teacher|child|kid|speaker|voice|audio)\s*(?:\([^)]*\))?\s*:\s*/gi, ' ')
+    .replace(/^(?:\s*)(?:narrator|teacher|child|kid|speaker|voice|audio)\s*(?:\([^)]*\))?\s*:\s*/gim, '')
     .replace(/\([^)]*(?:pause|beat|sfx|music|laughter|excited|warm|soft|tone|voice|whisper|sound|chuckle|sigh|gasp)[^)]*\)/gi, ' ')
-    .replace(/^[A-Za-z][A-Za-z\s]{0,18}:\s*/gm, '')
     .replace(/^["“”'\s]+|["“”'\s]+$/g, '')
     .replace(/["“”]/g, '')
     .replace(/\s+/g, ' ')
@@ -732,30 +733,162 @@ async function detectSilences(audioPath) {
   return await withMediaLock(async () => {
     const reaped = reapExtraNodeWorkers(false);
     if (reaped.length) await sleepMs(60);
-    try {
-      const { stderr } = await execFileAsync(FFMPEG_BIN, [
-        '-hide_banner', '-nostats', '-filter_threads', '1',
-        '-threads', '1', '-thread_type', 'slice', '-i', audioPath,
-        '-af', 'silencedetect=noise=-34dB:d=0.18',
-        '-threads', '1', '-f', 'null', '-',
-      ], { timeout: 90000, maxBuffer: 50 * 1024 * 1024 });
-      const silences = [];
-      let curStart = null;
-      for (const line of String(stderr).split(/\r?\n/)) {
-        const ms = line.match(/silence_start:\s*([0-9.]+)/);
-        if (ms) curStart = parseFloat(ms[1]);
-        const me = line.match(/silence_end:\s*([0-9.]+)/);
-        if (me && curStart != null) {
-          const end = parseFloat(me[1]);
-          if (end > curStart) silences.push([curStart, end]);
-          curStart = null;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        const { stderr } = await execFileAsync(FFMPEG_BIN, [
+          '-hide_banner', '-nostats',
+          '-threads', '1', '-i', audioPath,
+          '-af', 'silencedetect=noise=-32dB:d=0.20',
+          '-threads', '1', '-f', 'null', '-',
+        ], { timeout: 90000, maxBuffer: 50 * 1024 * 1024 });
+        const silences = [];
+        let curStart = null;
+        for (const line of String(stderr).split(/\r?\n/)) {
+          const ms = line.match(/silence_start:\s*([0-9.]+)/);
+          if (ms) curStart = parseFloat(ms[1]);
+          const me = line.match(/silence_end:\s*([0-9.]+)/);
+          if (me && curStart != null) {
+            const end = parseFloat(me[1]);
+            if (end > curStart) silences.push([curStart, end]);
+            curStart = null;
+          }
+        }
+        return silences;
+      } catch (err) {
+        const msg = String((err && err.stderr) || (err && err.message) || '');
+        if (/pthread_create|Resource temporarily unavailable|EAGAIN/i.test(msg) && attempt < 4) {
+          reapExtraNodeWorkers(true);
+          await sleepMs(300 * attempt);
+          continue;
+        }
+        return [];
+      }
+    }
+    return [];
+  });
+}
+
+// Globally optimal monotonic dynamic programming alignment of scenes to acoustic silence boundaries
+function alignScenesWithGlobalDP(segScenes, speechWeights, segStart, segEnd, silences, indic) {
+  const result = new Map();
+  const M = segScenes.length;
+  const segDur = Math.max(0.5, segEnd - segStart);
+  if (!M) return result;
+  if (M === 1) {
+    result.set(segScenes[0].screen, [
+      Math.round(segStart * 1000) / 1000,
+      Math.round(segEnd * 1000) / 1000,
+    ]);
+    return result;
+  }
+
+  const rawW = segScenes.map((s) => Math.max(0.8, Number(speechWeights.get(s.screen) || 2.0)));
+  const sumW = rawW.reduce((a, b) => a + b, 0) || 1;
+  const expDurs = rawW.map((w) => (w / sumW) * segDur);
+
+  // Filter silence cuts strictly inside (segStart + 0.35, segEnd - 0.35)
+  const cuts = [{ t: segStart, dur: 1.0 }];
+  for (const pair of silences || []) {
+    if (!Array.isArray(pair) || pair.length < 2) continue;
+    const ss = Number(pair[0]);
+    const se = Number(pair[1]);
+    if (!(se > ss)) continue;
+    const cutT = Math.max(ss + 0.12, se - 0.12);
+    if (cutT > segStart + 0.38 && cutT < segEnd - 0.38) {
+      if (cutT - cuts[cuts.length - 1].t >= 0.22) {
+        cuts.push({ t: cutT, dur: se - ss });
+      }
+    }
+  }
+  cuts.push({ t: segEnd, dur: 1.0 });
+
+  const K = cuts.length;
+  // Use Global DP when enough silence candidates exist
+  if (K >= M + 1) {
+    const dp = Array.from({ length: M + 1 }, () => new Float64Array(K).fill(1e12));
+    const parent = Array.from({ length: M + 1 }, () => new Int32Array(K).fill(-1));
+    dp[0][0] = 0;
+
+    let cumExp = segStart;
+    const maxDrift = Math.max(16, segDur * 0.18);
+    for (let i = 1; i <= M; i++) {
+      const d = expDurs[i - 1];
+      cumExp += d;
+      for (let k = i; k < K; k++) {
+        if (i === M && k !== K - 1) continue;
+        if (i < M && k === K - 1) continue;
+        if (Math.abs(cuts[k].t - cumExp) > maxDrift) continue;
+        const pauseBonus = Math.min(0.55, cuts[k].dur * (indic ? 1.1 : 0.9));
+        for (let p = i - 1; p < k; p++) {
+          if (dp[i - 1][p] >= 1e11) continue;
+          const actual = cuts[k].t - cuts[p].t;
+          if (actual < 0.60 || actual > Math.max(d * 2.7 + 2.5, 14)) continue;
+          const relErr = (actual - d) / Math.max(1.0, Math.sqrt(d));
+          const cost = dp[i - 1][p] + relErr * relErr - pauseBonus;
+          if (cost < dp[i][k]) {
+            dp[i][k] = cost;
+            parent[i][k] = p;
+          }
         }
       }
-      return silences;
-    } catch {
-      return [];
     }
-  });
+
+    if (dp[M][K - 1] < 1e11) {
+      const chosen = new Array(M + 1);
+      let curK = K - 1;
+      let ok = true;
+      for (let i = M; i >= 0; i--) {
+        if (curK < 0) { ok = false; break; }
+        chosen[i] = cuts[curK].t;
+        curK = parent[i][curK];
+      }
+      if (ok) {
+        for (let i = 0; i < M; i++) {
+          result.set(segScenes[i].screen, [
+            Math.round(chosen[i] * 1000) / 1000,
+            Math.round(chosen[i + 1] * 1000) / 1000,
+          ]);
+        }
+        return result;
+      }
+    }
+  }
+
+  // Fallback: proportional step with local silence snapping
+  let cursor = segStart;
+  let remW = sumW;
+  for (let i = 0; i < M; i++) {
+    const s = segScenes[i];
+    const w = rawW[i];
+    const isLast = i === M - 1;
+    const remVo = Math.max(0.4, segEnd - cursor);
+    const expDur = isLast ? remVo : Math.max(0.65, (w / Math.max(0.1, remW)) * remVo);
+    let targetEnd = isLast ? segEnd : cursor + expDur;
+    if (!isLast && cuts.length > 2) {
+      let bestCut = null;
+      let bestScore = -999;
+      const win = Math.max(1.5, expDur * 0.4);
+      for (let cIdx = 1; cIdx < cuts.length - 1; cIdx++) {
+        const c = cuts[cIdx];
+        const dist = Math.abs(c.t - targetEnd);
+        if (dist <= win && c.t > cursor + 0.55) {
+          const score = Math.min(0.45, c.dur * 0.85) - dist;
+          if (score > bestScore) {
+            bestScore = score;
+            bestCut = c.t;
+          }
+        }
+      }
+      if (bestCut != null) targetEnd = bestCut;
+    }
+    result.set(s.screen, [
+      Math.round(cursor * 1000) / 1000,
+      Math.round(targetEnd * 1000) / 1000,
+    ]);
+    cursor = targetEnd;
+    remW = Math.max(0.1, remW - w);
+  }
+  return result;
 }
 
 function normScreenId(screen) {
@@ -1868,6 +2001,32 @@ app.post('/api/projects/:id/build', async (req, res) => {
       return res.json(existingTl);
     }
 
+    // Auto-recover any slot_<N>_* VO files sitting on disk that were not yet saved into voiceover.json
+    const voDirDisk = path.join(projectRoot(pid), 'voiceover');
+    if (fs.existsSync(voDirDisk) && !voMeta.local_only) {
+      const existingSlots = Array.isArray(voMeta.slots) ? [...voMeta.slots] : [];
+      const knownSlotNums = new Set(existingSlots.map((s) => Number(s.slot)));
+      let addedOrphan = false;
+      for (const fname of fs.readdirSync(voDirDisk)) {
+        const mSlot = fname.match(/^slot_(\d+)_(?!norm\.mp3$)(.+\.(?:mp3|wav|m4a|aac|ogg|flac))$/i);
+        if (mSlot) {
+          const sNum = parseInt(mSlot[1], 10);
+          const origLabel = mSlot[2];
+          const fullP = path.join(voDirDisk, fname);
+          if (!knownSlotNums.has(sNum) && fs.statSync(fullP).size > 256) {
+            const dur = (await probeDuration(fullP)) || 0;
+            existingSlots.push({ slot: sNum, filename: origLabel, path: fullP, duration: dur });
+            knownSlotNums.add(sNum);
+            addedOrphan = true;
+          }
+        }
+      }
+      if (addedOrphan) {
+        const rebuilt = await rebuildMergedVo(pid, existingSlots);
+        Object.assign(voMeta, rebuilt);
+      }
+    }
+
     // Auto-heal voMeta.duration === 0 or missing silences if VO file exists on disk
     if (voMeta.path && fs.existsSync(voMeta.path)) {
       if (!voMeta.duration || Number(voMeta.duration) <= 0) {
@@ -1914,10 +2073,17 @@ app.post('/api/projects/:id/build', async (req, res) => {
       const devChars = (txt.match(/[\u0900-\u097F]/g) || []).length;
       const isDevanagari = devChars > 0;
       const sentBreaks = Math.max(0, (txt.match(/[.!?।]/g) || []).length - 1);
+      const sents = Math.max(1, (txt.match(/[.!?।]+/g) || []).length);
+      const repMatches = (txt.match(/\b([a-zA-Z]{2,})[,\s]+\1\b/gi) || []).length;
       let w;
       if (isDevanagari && voDur > 1) {
         // Pure phonetic character + word + sentence-break weight for Marathi/Hindi (ignores flat 8s Excel placeholders)
         w = Math.max(1.2, devChars * 0.105 + words * 0.22 + sentBreaks * 0.25 + 0.25);
+      } else if (voDur > 1) {
+        // Natural English instructional speaking duration (~0.31s/word + 0.36s/sentence + expressive sound repeat bonus)
+        w = words > 0
+          ? Math.max(1.1, words * 0.31 + sents * 0.36 + repMatches * 1.1 + 0.20)
+          : (Number(s.duration) || 2.0);
       } else {
         const wordEst = words > 0 ? Math.max(1.2, words * (isDevanagari ? 0.55 : 0.38) + 0.25) : (Number(s.duration) || 2.0);
         w = s.duration && Number(s.duration) > 0 ? 0.55 * wordEst + 0.45 * Number(s.duration) : wordEst;
@@ -1925,11 +2091,87 @@ app.post('/api/projects/:id/build', async (req, res) => {
       speechWeights.set(s.screen, w);
       totalSpeechWeight += w;
     }
-    let remainingSpeechWeight = totalSpeechWeight;
+
+    // Precompute exact [narrIn, narrOut] per spoken scene using Global DP over acoustic silences.
+    // Also detect if only a partial VO (e.g., VO 1 covering Story Scenes 1..37 out of 97 scenes) is uploaded so far,
+    // or if multiple VO slots (VO 1, VO 2, ...) should be partitioned at section boundaries.
+    const alignedSpeechMap = new Map();
+    let coveredSpokenCount = speechScenes.length;
+
+    if (voDur > 1 && speechScenes.length > 0) {
+      const activeSlots = Array.isArray(voMeta.slots) && voMeta.slots.length > 1
+        ? voMeta.slots.filter((sl) => Number(sl.duration || 0) > 0.5)
+        : [];
+
+      // Check if uploaded VO only covers a prefix of the script (e.g., VO 1 = 162s while full 97-scene script needs ~340s)
+      if (speechScenes.length >= 8 && voDur < totalSpeechWeight * 0.72) {
+        let bestCount = speechScenes.length;
+        let bestDiff = Infinity;
+        let cumW = 0;
+        for (let k = 1; k <= speechScenes.length; k++) {
+          cumW += speechWeights.get(speechScenes[k - 1].screen) || 2.0;
+          const rawDiff = Math.abs(cumW - voDur);
+          // Give a strong preference to major section transitions (e.g., Scene 37 Story -> Scene 38 Read and learn)
+          const curSec = String(speechScenes[k - 1].section || '').split('|')[0].trim().toLowerCase();
+          const nextSec = k < speechScenes.length
+            ? String(speechScenes[k].section || '').split('|')[0].trim().toLowerCase()
+            : '';
+          const isSecBoundary = k < speechScenes.length && curSec && nextSec && curSec !== nextSec;
+          const scoreDiff = isSecBoundary ? rawDiff - Math.min(18, voDur * 0.10) : rawDiff;
+          if (scoreDiff < bestDiff) {
+            bestDiff = scoreDiff;
+            bestCount = k;
+          }
+        }
+        coveredSpokenCount = Math.max(1, Math.min(speechScenes.length, bestCount));
+      }
+
+      const narratedScenes = speechScenes.slice(0, coveredSpokenCount);
+      if (activeSlots.length > 1 && narratedScenes.length >= activeSlots.length) {
+        // Partition narratedScenes across VO slots proportionally to slot durations, snapping to section boundaries
+        const totalNarrW = narratedScenes.reduce((acc, s) => acc + (speechWeights.get(s.screen) || 2.0), 0) || 1;
+        let startIdx = 0;
+        let cumSlotDur = 0;
+        for (let sIdx = 0; sIdx < activeSlots.length; sIdx++) {
+          const sl = activeSlots[sIdx];
+          const slStart = Number(sl.start_offset || 0);
+          const slEnd = Number(sl.end_offset || (slStart + Number(sl.duration || 0)));
+          cumSlotDur += Number(sl.duration || 0);
+          let endIdx = narratedScenes.length;
+          if (sIdx < activeSlots.length - 1) {
+            const targetW = (cumSlotDur / Math.max(1, voDur)) * totalNarrW;
+            let bestIdx = startIdx + 1;
+            let bestScore = Infinity;
+            let runW = 0;
+            for (let k = 1; k <= narratedScenes.length - (activeSlots.length - 1 - sIdx); k++) {
+              runW += speechWeights.get(narratedScenes[k - 1].screen) || 2.0;
+              if (k <= startIdx) continue;
+              const diff = Math.abs(runW - targetW);
+              const curSec = String(narratedScenes[k - 1].section || '').split('|')[0].trim().toLowerCase();
+              const nextSec = k < narratedScenes.length
+                ? String(narratedScenes[k].section || '').split('|')[0].trim().toLowerCase()
+                : '';
+              const secBonus = (curSec && nextSec && curSec !== nextSec) ? 14 : 0;
+              if (diff - secBonus < bestScore) {
+                bestScore = diff - secBonus;
+                bestIdx = k;
+              }
+            }
+            endIdx = bestIdx;
+          }
+          const subScenes = narratedScenes.slice(startIdx, endIdx);
+          const subMap = alignScenesWithGlobalDP(subScenes, speechWeights, slStart, slEnd, silences, indic);
+          for (const [k, v] of subMap.entries()) alignedSpeechMap.set(k, v);
+          startIdx = endIdx;
+        }
+      } else {
+        const subMap = alignScenesWithGlobalDP(narratedScenes, speechWeights, 0, voDur, silences, indic);
+        for (const [k, v] of subMap.entries()) alignedSpeechMap.set(k, v);
+      }
+    }
 
     const rawClips = [];
     let tlCursor = 0;
-    let narrCursor = 0;
     let poemStartTime = 0;
     let poemEndTime = 0;
     let inPoemBlock = false;
@@ -1960,49 +2202,14 @@ app.post('/api/projects/:id/build', async (req, res) => {
           clipDur = Math.max(1.5, poemVoDur / poemCount);
         }
         poemEndTime = Math.max(poemEndTime, tlCursor + clipDur);
-      } else if (spoken) {
-        const w = speechWeights.get(s.screen) || 2.0;
-        const isLastSpoken = s.screen === speechScenes[speechScenes.length - 1]?.screen;
-        const remVo = Math.max(0.5, voDur > 1 ? voDur - narrCursor : remainingSpeechWeight);
-        let spokenDur = isLastSpoken
-          ? remVo
-          : Math.max(0.6, (w / Math.max(0.1, remainingSpeechWeight)) * remVo);
-        let narrEnd = narrCursor + spokenDur;
-
-        if (silences.length && !isLastSpoken) {
-          let bestSilCut = null;
-          let bestScore = -999;
-          const searchWindow = indic ? Math.max(1.8, spokenDur * 0.38) : 1.25;
-          for (const [ss, se] of silences) {
-            const sDur = se - ss;
-            const mid = 0.5 * (ss + se);
-            const dist = Math.abs(mid - narrEnd);
-            if (dist <= searchWindow && ss > narrCursor + (indic ? 0.6 : 0.45)) {
-              const score = indic ? (Math.min(1.2, sDur * 1.2) - dist * 0.65) : -dist;
-              if (score > bestScore) {
-                bestScore = score;
-                // Cut ~0.14s before the next line's voice onset so no word is ever clipped or rushed
-                const hasPauseBreak = questionPauseSeconds(s) > 0;
-                bestSilCut = hasPauseBreak
-                  ? Math.max(ss + 0.14, Math.min(se - 0.18, ss + Math.min(0.40, 0.48 * sDur)))
-                  : Math.max(ss + 0.14, se - 0.14);
-              }
-            }
-          }
-          if (bestSilCut != null && bestSilCut > narrCursor + 0.35) {
-            narrEnd = bestSilCut;
-            spokenDur = narrEnd - narrCursor;
-          }
-        } else if (isLastSpoken && voDur > narrCursor + 0.2) {
-          narrEnd = voDur;
-          spokenDur = Math.max(0.5, narrEnd - narrCursor);
-        }
-
-        narrIn = Math.round(narrCursor * 1000) / 1000;
-        narrOut = Math.round(narrEnd * 1000) / 1000;
+      } else if (spoken && alignedSpeechMap.has(s.screen)) {
+        const [ni, no] = alignedSpeechMap.get(s.screen);
+        narrIn = ni;
+        narrOut = no;
         clipDur = Math.max(0.4, narrOut - narrIn);
-        narrCursor = narrEnd;
-        remainingSpeechWeight = Math.max(0, remainingSpeechWeight - w);
+      } else if (spoken) {
+        // Scene beyond partial VO coverage (waiting for VO 2+): use natural speaking duration
+        clipDur = Math.max(1.2, speechWeights.get(s.screen) || Number(s.duration) || 2.5);
       } else {
         // Silent title / instrumental card: use script duration without advancing narrCursor
         clipDur = Math.max(0.4, Number(s.duration) || 2.0);
@@ -2014,7 +2221,11 @@ app.post('/api/projects/:id/build', async (req, res) => {
       // and NEVER append a separate unaligned 10s silent "Action Video" clip that interrupts VO playback!
       const primary = video || image;
       const extraVid = null;
-      const capTxt = isInst ? '' : (s.voiceover_text || s.onscreen_text || '');
+      const ostTxt = String(s.onscreen_text || '').trim();
+      const voTxt = String(s.voiceover_text || '').trim();
+      // Preserve fill-in-the-blank dots ('....') or full heading text ('For the Teacher :') from onscreen_text when present
+      const preferOst = ostTxt && (/\.{3,}|_{3,}|—/.test(ostTxt) || (ostTxt.length > voTxt.length && ostTxt.toLowerCase().startsWith(voTxt.toLowerCase())));
+      const capTxt = isInst ? '' : (preferOst ? ostTxt : (voTxt || ostTxt || ''));
 
       if (!primary) {
         rawClips.push({
@@ -2154,9 +2365,12 @@ app.post('/api/projects/:id/build', async (req, res) => {
     }
     const errCount = qaIssues.filter((i) => i.severity === 'error').length;
     const warnCount = qaIssues.filter((i) => i.severity === 'warning').length;
+    const partialVoNote = (voDur > 1 && coveredSpokenCount < speechScenes.length)
+      ? ` · VO covers Scenes 1–${coveredSpokenCount} (add VO 2 for Scenes ${coveredSpokenCount + 1}–${speechScenes.length})`
+      : '';
     const qaSummary = qaIssues.length
-      ? `Align scan: ${errCount} missing · ${warnCount} warnings · ${clips.length} pictures on the timeline`
-      : `Align scan: no issues · ${clips.length} pictures checked`;
+      ? `Align scan: ${errCount} missing · ${warnCount} warnings · ${clips.length} pictures${partialVoNote}`
+      : `Align scan: no issues · ${clips.length} pictures checked${partialVoNote}`;
 
     const headClips = clips.filter((c) => c.narration_in != null && (!planOpts.has_poem || c.start < planOpts.poem_start_time - 0.02));
     const tailClips = planOpts.has_poem
