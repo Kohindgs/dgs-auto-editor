@@ -204,7 +204,7 @@ const SUNDHARAM_BR = {
   audio_sample_rate: 44100,
   audio_channels: 'stereo',
   color_space: 'bt709',
-  advanced_compression: false,
+  advanced_compression: true,
   export_multitrack: false,
   export_video_only: false,
   backup_to_cloud: false,
@@ -2587,7 +2587,7 @@ function computeBitrateSummary(settings, totalDur = 0, actualSizeMb = null) {
   const baseVideoKbps = Math.max(500, Number(settings.video_bitrate_kbps) || 20000);
   const compActive = Boolean(settings.advanced_compression && settings.compression_mode !== 'none');
   const compQuality = Math.max(10, Math.min(95, Number(settings.compression_quality) || 70));
-  const keepRatio = compActive ? Math.max(0.05, (100 - compQuality) / 100.0) : 1.0;
+  const keepRatio = compActive ? Math.max(0.1, Math.min(0.95, compQuality / 100.0)) : 1.0;
   const targetVideoKbps = compActive
     ? Math.max(400, Math.round(baseVideoKbps * keepRatio))
     : baseVideoKbps;
@@ -2662,11 +2662,11 @@ function buildVideoRateArgs(settings, fps = 30) {
   base.push('-pix_fmt', 'yuv420p', ...colorSpace);
 
   const q = Math.max(10, Math.min(95, Number(settings.compression_quality) || 70));
-  const keepRatio = Math.max(0.05, (100 - q) / 100.0);
+  const keepRatio = Math.max(0.1, Math.min(0.95, q / 100.0));
   let effectiveKbps = Math.max(500, Number(settings.video_bitrate_kbps) || 20000);
 
   if (settings.advanced_compression && settings.compression_mode === 'by_quality') {
-    const crf = Math.max(18, Math.min(36, Math.round(18 + (q / 100.0) * 18)));
+    const crf = Math.max(18, Math.min(34, Math.round(18 + ((100 - q) / 100.0) * 14)));
     const capKbps = Math.max(400, Math.round(effectiveKbps * keepRatio));
     if (vcodec === 'libx264' || vcodec === 'libx265') {
       return [...base, '-crf', String(crf), '-maxrate', `${capKbps}k`, '-bufsize', `${capKbps * 2}k`];
