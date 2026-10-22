@@ -6197,9 +6197,23 @@ app.post('/api/projects/:id/upload-chunk', upload.single('chunk'), processChunkU
 // Serve built React frontend
 const PUBLIC_DIR = path.join(ROOT, 'public');
 if (fs.existsSync(PUBLIC_DIR)) {
-  app.use(express.static(PUBLIC_DIR));
+  app.use(
+    express.static(PUBLIC_DIR, {
+      setHeaders(res, filePath) {
+        if (filePath.endsWith('index.html')) {
+          res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+          res.setHeader('Pragma', 'no-cache');
+          res.setHeader('Expires', '0');
+        }
+      },
+    }),
+  );
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api/')) return next();
+    if (req.path.startsWith('/assets/')) return res.status(404).end();
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
     res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
   });
 }
