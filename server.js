@@ -3118,18 +3118,37 @@ app.post('/api/projects/:id/clips/:screen/replace-media', upload.single('file'),
     const screen = req.params.screen;
     const file = req.file;
     if (!file) return res.status(400).json({ detail: 'No file uploaded' });
-    const mediaDir = path.join(projectDir(pid), 'media');
+    const root = projectRoot(pid);
+    if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
+
+    const origName = path.basename(file.originalname || `${screen}.png`);
+    const ext = path.extname(origName).toLowerCase() || '.png';
+    const isVid = VIDEO_EXT.has(ext);
+    const folder = isVid ? 'videos' : 'images';
+    const mediaDir = path.join(root, 'media', folder);
     fs.mkdirSync(mediaDir, { recursive: true });
-    const safeName = path.basename(file.originalname || `${screen}.png`);
-    const dest = path.join(mediaDir, safeName);
+
+    // Match the canonical scene filename in the project (e.g. "5.png" or "Scene 5.mp4") so the folder stays numbered cleanly
+    const existingMedia = loadJson(pid, 'media.json') || [];
+    const numMatch = /(\d+)$/.exec(String(screen || ''));
+    const sceneNum = numMatch ? parseInt(numMatch[1], 10) : null;
+    let targetName = origName;
+    if (sceneNum != null) {
+      const sameKindNames = existingMedia.filter((m) => m.kind === (isVid ? 'video' : 'image')).map((m) => String(m.filename || ''));
+      const hasScenePrefix = sameKindNames.some((n) => /^scene[\s_-]*\d+/i.test(n));
+      targetName = hasScenePrefix ? `Scene ${sceneNum}${ext}` : `${sceneNum}${ext}`;
+    }
+
+    const dest = path.join(mediaDir, targetName);
     fs.copyFileSync(file.path, dest);
     try { fs.unlinkSync(file.path); } catch (_) {}
 
     const mediaItems = await reindexMedia(pid);
-    const matched = mediaItems.find((m) => m.path === dest || m.filename === safeName);
+    const matched = mediaItems.find((m) => m.path === dest || m.filename.toLowerCase() === targetName.toLowerCase());
     const plan = loadJson(pid, 'timeline.json');
     if (!plan) return res.status(404).json({ detail: 'Timeline not built yet' });
     const clipIndex = req.body && req.body.clip_index != null ? parseInt(req.body.clip_index, 10) : null;
+    let updatedAny = false;
     if (Array.isArray(plan.clips)) {
       plan.clips.forEach((c, idx) => {
         if ((clipIndex != null && idx === clipIndex) || (clipIndex == null && c.screen === screen)) {
@@ -3138,18 +3157,43 @@ app.post('/api/projects/:id/clips/:screen/replace-media', upload.single('file'),
             c.media_path = matched.path;
             c.filename = matched.filename;
             c.kind = matched.kind;
-            c.fit = matched.kind === 'video' ? 'trim' : 'hold';
+            c.fit = matched.kind === 'video' ? 'passthrough' : 'hold';
             c.missing_words = [];
+            updatedAny = true;
           }
         }
       });
+      if (!updatedAny && matched) {
+        const seg = (plan.narration_segments || []).find((s) => s.screen === screen);
+        const startT = seg ? Number(seg.start || 0) : 0;
+        const endT = seg ? Number(seg.end || startT + 3) : startT + 3;
+        plan.clips.push({
+          screen,
+          media_id: matched.id,
+          media_path: matched.path,
+          filename: matched.filename,
+          kind: matched.kind,
+          start: startT,
+          end: endT,
+          duration: Math.max(0.2, Math.round((endT - startT) * 1000) / 1000),
+          source_in: 0,
+          source_out: Math.max(0.2, Math.round((endT - startT) * 1000) / 1000),
+          fit: matched.kind === 'video' ? 'passthrough' : 'hold',
+          script_text: seg?.script_text || '',
+          vo_text: seg?.vo_text || '',
+          narration_in: seg?.narration_in ?? null,
+          narration_out: seg?.narration_out ?? null,
+        });
+        plan.clips.sort((a, b) => Number(a.start || 0) - Number(b.start || 0));
+      }
     }
     plan.manual_override = true;
-    const scenes = loadJson(pid, 'scenes.json') || [];
+    const scenes = loadJson(pid, 'script.json') || [];
     const qaIssues = scanTimelineQA(plan, scenes);
     plan.qa_issues = qaIssues;
+    plan.srt_cues = buildSrtCues(plan.clips || [], plan);
     saveJson(pid, 'timeline.json', plan);
-    res.json({ plan, media: mediaItems });
+    res.json({ plan, timeline: plan, replaced_item: matched || null, media: mediaItems });
   } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
@@ -3735,6 +3779,82 @@ app.get('/api/projects/:id/download', (req, res) => {
   res.download(path.resolve(meta.path), meta.filename);
 });
 
+function updateScriptWorkbookOnDisk(pid, scenes) {
+  const meta = loadJson(pid, 'script_meta.json');
+  if (!meta || !meta.filename) return null;
+  const scriptPath = path.join(projectRoot(pid), 'script', meta.filename);
+  if (!fs.existsSync(scriptPath)) return null;
+  const ext = path.extname(scriptPath).toLowerCase();
+  if (ext !== '.xlsx' && ext !== '.xlsm' && ext !== '.xls') return scriptPath;
+  try {
+    const wb = XLSX.readFile(scriptPath);
+    const byNum = new Map();
+    for (const s of scenes || []) {
+      const m = /(\d+)$/.exec(String(s.screen || ''));
+      if (m) byNum.set(parseInt(m[1], 10), s);
+    }
+    for (const sheetName of wb.SheetNames) {
+      const ws = wb.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+      let headerIdx = -1;
+      const colMap = {};
+      for (let r = 0; r < Math.min(rows.length, 25); r++) {
+        const row = rows[r].map((c) => String(c || '').replace(/\s+/g, ' ').trim().toLowerCase());
+        const shortNonEmpty = row.filter((c) => c.length > 0 && c.length < 60).length;
+        const hasScene = row.some((c) => c.length < 40 && (c.includes('scene') || c.includes('screen') || c === 'sr. no' || c === 's.no'));
+        const hasAudioOrText = row.some((c) => c.length < 55 && (c.includes('audio') || c.includes('voice') || c.includes('narration') || c.includes('script') || c === 'vo' || c.includes('on-screen') || c.includes('onscreen')));
+        if (shortNonEmpty >= 3 && hasScene && hasAudioOrText) {
+          headerIdx = r;
+          row.forEach((c, idx) => {
+            if (c.includes('scene') || c.includes('screen') || c === 'no' || c.includes('sr')) colMap.scene = colMap.scene ?? idx;
+            if (!c.includes('section') && (c.includes('duration') || /\bsec(?:s|onds)?\b/.test(c) || c === 'time')) colMap.duration = colMap.duration ?? idx;
+            if (c.includes('on-screen') || c.includes('onscreen') || c.includes('text on screen') || c.includes('ost')) colMap.onscreen = colMap.onscreen ?? idx;
+            if (c.includes('voice') || c.includes('audio') || c.includes('narration') || c === 'vo' || c.includes('script')) colMap.vo = colMap.vo ?? idx;
+            if (!(c.includes('visual') && c.includes('type')) && (c.includes('visual') || c.includes('animation') || c.includes('image') || c.includes('action'))) colMap.visual = colMap.visual ?? idx;
+          });
+          break;
+        }
+      }
+      if (headerIdx < 0) continue;
+      for (let r = headerIdx + 1; r < rows.length; r++) {
+        const row = rows[r];
+        if (!row || !row.length) continue;
+        const rawScene = String(row[colMap.scene ?? 0] || '').trim();
+        const numMatch = rawScene.match(/(\d{1,3})/);
+        if (!numMatch) continue;
+        const sceneNo = parseInt(numMatch[1], 10);
+        const sc = byNum.get(sceneNo);
+        if (!sc) continue;
+        const setCell = (colIdx, val) => {
+          if (colIdx == null || val === undefined || val === null) return;
+          const addr = XLSX.utils.encode_cell({ r, c: colIdx });
+          ws[addr] = { t: typeof val === 'number' ? 'n' : 's', v: val };
+        };
+        if (colMap.vo != null && sc.voiceover_text !== undefined) setCell(colMap.vo, sc.voiceover_text);
+        if (colMap.onscreen != null && sc.onscreen_text !== undefined) setCell(colMap.onscreen, sc.onscreen_text);
+        if (colMap.visual != null && sc.visual_description !== undefined) setCell(colMap.visual, sc.visual_description);
+        if (colMap.duration != null && sc.duration != null) setCell(colMap.duration, sc.duration);
+      }
+    }
+    XLSX.writeFile(wb, scriptPath);
+    return scriptPath;
+  } catch (e) {
+    console.error('updateScriptWorkbookOnDisk error:', e);
+    return null;
+  }
+}
+
+app.get('/api/projects/:id/script/download', (req, res) => {
+  const { id } = req.params;
+  const meta = loadJson(id, 'script_meta.json');
+  if (!meta || !meta.filename) return res.status(404).json({ detail: 'No script file found' });
+  const scenes = loadJson(id, 'script.json') || [];
+  updateScriptWorkbookOnDisk(id, scenes);
+  const scriptPath = path.join(projectRoot(id), 'script', meta.filename);
+  if (!fs.existsSync(scriptPath)) return res.status(404).json({ detail: 'Script file missing on disk' });
+  res.download(path.resolve(scriptPath), meta.filename);
+});
+
 // Scene edit & custom scene voiceover
 app.put('/api/projects/:id/scenes/:screen', (req, res) => {
   const { id, screen } = req.params;
@@ -3744,6 +3864,7 @@ app.put('/api/projects/:id/scenes/:screen', (req, res) => {
     if (s.screen === screen) {
       if (req.body.voiceover_text !== undefined) {
         s.voiceover_text = String(req.body.voiceover_text);
+        s.voiceover_raw = String(req.body.voiceover_text);
         s.text = String(req.body.voiceover_text) || s.onscreen_text || s.screen;
       }
       if (req.body.visual_description !== undefined) s.visual_description = String(req.body.visual_description);
@@ -3753,6 +3874,7 @@ app.put('/api/projects/:id/scenes/:screen', (req, res) => {
     }
   }
   saveJson(id, 'script.json', scenes);
+  updateScriptWorkbookOnDisk(id, scenes);
   const tl = loadJson(id, 'timeline.json');
   if (tl && Array.isArray(tl.clips)) {
     for (const c of tl.clips) {
@@ -3765,7 +3887,15 @@ app.put('/api/projects/:id/scenes/:screen', (req, res) => {
     saveJson(id, 'timeline.json', tl);
   }
   const voMeta = loadJson(id, 'voiceover.json');
-  res.json({ ok: true, scene: updated, scenes, voiceover: voMeta, timeline: tl });
+  const scriptMeta = loadJson(id, 'script_meta.json');
+  res.json({
+    ok: true,
+    scene: updated,
+    scenes,
+    voiceover: voMeta,
+    timeline: tl,
+    script_filename: scriptMeta?.filename || null,
+  });
 });
 
 async function handleSceneVoFile(id, screen, tempPath, origName, queryParams = {}) {
