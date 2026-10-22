@@ -921,16 +921,11 @@ function captionForScene(scene, isInst, marathi) {
   const voTxt = String(scene?.voiceover_text || '').trim();
   if (isInst) return '';
   const ostIsPlaceholder = !ostTxt || /^[—–\-]+$/.test(ostTxt);
-  const isBlankPrompt = /\.{3,}|_{3,}|……/.test(ostTxt);
-  if (marathi) {
-    if (isBlankPrompt) return ostTxt;
-    return voTxt || (!ostIsPlaceholder ? ostTxt : '');
+  // Script spoken voiceover is the master dialogue text for SRT subtitles
+  if (voTxt && voTxt !== '-' && voTxt !== '—' && voTxt !== '–') {
+    return voTxt;
   }
-  const preferOst = !ostIsPlaceholder && (
-    isBlankPrompt
-    || (ostTxt.length > voTxt.length && ostTxt.toLowerCase().startsWith(voTxt.toLowerCase()))
-  );
-  return preferOst ? ostTxt : (voTxt || ostTxt || '');
+  return !ostIsPlaceholder ? ostTxt : '';
 }
 
 function isSpokenVo(scene, opts = {}) {
@@ -1735,7 +1730,7 @@ function buildSrtCues(clips, planOpts = {}) {
     const spokenRaw = String(c.vo_text || '');
     const capRaw = String(c.caption_text || '');
     const capIsPlaceholder = !capRaw.trim() || /^[—–\-]+$/.test(capRaw.trim());
-    const txt = cleanCaptionText(marathi ? (spokenRaw || (capIsPlaceholder ? '' : capRaw)) : (capIsPlaceholder ? spokenRaw : (capRaw || spokenRaw)));
+    const txt = cleanCaptionText(spokenRaw || (!capIsPlaceholder ? capRaw : ''));
     if (!txt) continue;
     let start = Number(c.start || 0);
     let end = Number(c.end || 0);
@@ -1744,7 +1739,6 @@ function buildSrtCues(clips, planOpts = {}) {
       c.narration_out != null &&
       Number(c.narration_out) - Number(c.narration_in) >= 0.2;
     const inPoem =
-      poemOk &&
       hasPoem &&
       start + 0.05 >= poemStart &&
       start < poemEnd + 0.05;
