@@ -1049,6 +1049,80 @@ function alignScenesWithGlobalDP(segScenes, speechWeights, segStart, segEnd, sil
   return result;
 }
 
+/** Flat 6s/8s sheet values are a template, not a measured narration clock. */
+function scriptDurationsAreMeasured(list) {
+  const vals = (list || []).map((s) => Number(s && s.duration)).filter((d) => d > 0.4 && d < 180);
+  if (!list || !list.length || vals.length < list.length * 0.75) return false;
+  const uniq = new Set(vals.map((v) => Math.round(v * 10) / 10));
+  if (uniq.size <= 3) return false;
+  return Math.max(...vals) - Math.min(...vals) >= 4;
+}
+
+/**
+ * Marathi only. Walk the VO in script order.
+ * Each line gets its Devanagari share of the recording, and the cut sits on the
+ * silence just after that share — a tight window, so a breath cannot pull the
+ * next picture several seconds early. English keeps alignScenesWithGlobalDP.
+ */
+function alignMarathiBySpeech(segScenes, speechWeights, segStart, segEnd, silences) {
+  const result = new Map();
+  const M = segScenes.length;
+  const segDur = Math.max(0.4, segEnd - segStart);
+  if (!M) return result;
+  if (M === 1) {
+    result.set(segScenes[0].screen, [
+      Math.round(segStart * 1000) / 1000,
+      Math.round(segEnd * 1000) / 1000,
+    ]);
+    return result;
+  }
+  const rawW = segScenes.map((s) => Math.max(0.8, Number(speechWeights.get(s.screen) || 2.0)));
+  const sumW = rawW.reduce((a, b) => a + b, 0) || 1;
+  const cuts = [];
+  for (const pair of silences || []) {
+    if (!Array.isArray(pair) || pair.length < 2) continue;
+    const ss = Number(pair[0]);
+    const se = Number(pair[1]);
+    if (!(se > ss) || se - ss < 0.12) continue;
+    // silence_start is where the previous word finished. Do not cut at silence_end.
+    const cutT = ss + 0.1;
+    if (cutT > segStart + 0.3 && cutT < segEnd - 0.2) cuts.push(cutT);
+  }
+  cuts.sort((a, b) => a - b);
+
+  let cursor = segStart;
+  let remW = sumW;
+  for (let i = 0; i < M; i++) {
+    const isLast = i === M - 1;
+    const w = rawW[i];
+    const rem = Math.max(0.35, segEnd - cursor);
+    const expDur = isLast ? rem : Math.max(0.65, (w / Math.max(0.1, remW)) * rem);
+    let target = isLast ? segEnd : cursor + expDur;
+    if (!isLast) {
+      const win = Math.max(0.45, Math.min(1.15, expDur * 0.22));
+      let best = null;
+      let bestDist = win + 0.001;
+      for (const t of cuts) {
+        if (t <= cursor + 0.4) continue;
+        if (t > target + win) break;
+        const dist = Math.abs(t - target);
+        if (dist <= win && dist < bestDist) {
+          bestDist = dist;
+          best = t;
+        }
+      }
+      if (best != null) target = best;
+    }
+    result.set(segScenes[i].screen, [
+      Math.round(cursor * 1000) / 1000,
+      Math.round(target * 1000) / 1000,
+    ]);
+    cursor = target;
+    remW = Math.max(0.1, remW - w);
+  }
+  return result;
+}
+
 function normScreenId(screen) {
   if (!screen) return '';
   const m = String(screen).trim().match(/^screen_0*(\d+)$/i);
@@ -2279,7 +2353,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
 
     // If project was imported from a .wfpbundle / .wfp and neither script nor master VO was replaced,
     // preserve the bundle's exact clip timings/alignment while refreshing newly uploaded media, captions, logo, and QA!
-    if (scriptMeta.imported_bundle && !req.body?.force_realign && existingTl && Array.isArray(existingTl.clips) && existingTl.clips.length) {
+    const explicitAlign = Boolean(req.body && (req.body.language || req.body.force_realign));
+    if (scriptMeta.imported_bundle && !explicitAlign && existingTl && Array.isArray(existingTl.clips) && existingTl.clips.length) {
       const sceneMap = new Map(scenes.map((s) => [normScreenId(s.screen), s]));
       for (const c of existingTl.clips) {
         const s = sceneMap.get(normScreenId(c.screen));
@@ -2415,6 +2490,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       return isSpokenVo(s, { indic, hasPoemVo });
     });
 
+    const measuredScriptClock = marathi && scriptDurationsAreMeasured(speechScenes);
     const speechWeights = new Map();
     let totalSpeechWeight = 0;
     for (const s of speechScenes) {
@@ -2432,7 +2508,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
       const listItems = commas + sents;
       const isWordBank = !marathi && !isDevanagari && ((commas >= 3 && words <= commas * 2.5) || (sents >= 4 && words <= sents * 1.8));
       let w;
-      if ((marathi || isDevanagari) && voDur > 1) {
+      if (marathi && measuredScriptClock && Number(s.duration) > 0.4) {
+        // Real per-scene times from the workbook. Flat 6s/8s templates never reach here.
+        w = Number(s.duration);
+      } else if ((marathi || isDevanagari) && voDur > 1) {
         // Marathi/Hindi: Devanagari character + word + danda weights. Never the English word-bank / repeat-word clock.
         w = Math.max(1.2, (devChars || words) * 0.105 + words * 0.22 + sentBreaks * 0.25 + 0.25);
       } else if (voDur > 1) {
@@ -2520,12 +2599,12 @@ app.post('/api/projects/:id/build', async (req, res) => {
             endIdx = bestIdx;
           }
           const subScenes = narratedScenes.slice(startIdx, endIdx);
-          const subMap = alignScenesWithGlobalDP(subScenes, speechWeights, slStart, slEnd, silences, indic);
+          const subMap = (marathi ? alignMarathiBySpeech : alignScenesWithGlobalDP)(subScenes, speechWeights, slStart, slEnd, silences, indic);
           for (const [k, v] of subMap.entries()) alignedSpeechMap.set(k, v);
           startIdx = endIdx;
         }
       } else {
-        const subMap = alignScenesWithGlobalDP(narratedScenes, speechWeights, 0, voDur, silences, indic);
+        const subMap = (marathi ? alignMarathiBySpeech : alignScenesWithGlobalDP)(narratedScenes, speechWeights, 0, voDur, silences, indic);
         for (const [k, v] of subMap.entries()) alignedSpeechMap.set(k, v);
       }
     }
@@ -2621,12 +2700,14 @@ app.post('/api/projects/:id/build', async (req, res) => {
         tlCursor += dur;
       } else {
         const srcDur = primary.kind === 'video' ? Number(primary.duration || dur) : dur;
-        const fitMode =
+          const fitMode =
           primary.kind === 'image'
             ? 'hold'
             : srcDur >= dur - 0.05
               ? 'trim'
-              : 'passthrough';
+              : marathi
+                ? 'hold'
+                : 'passthrough';
         rawClips.push({
           screen: s.screen,
           media_id: primary.id,
@@ -2762,7 +2843,9 @@ app.post('/api/projects/:id/build', async (req, res) => {
       language: langRes.language,
       align_engine: langRes.engine,
       align_note: marathi
-        ? 'Marathi engine: Devanagari character weights + FFmpeg silence cuts. Live Hostinger has no Whisper language pack — word-level matching is local Python only.'
+        ? (measuredScriptClock
+          ? 'Marathi engine: workbook scene times, snapped to the silence after each line. English Suno path was not used.'
+          : 'Marathi engine: the sheet durations are a 6s/8s template, not a narration clock. Cuts follow Devanagari line length and the silence after each line. English Suno path was not used.')
         : 'English engine: Suno poem clock + English word/silence alignment.',
       srt_cues: srtCues,
       qa_issues: [],
