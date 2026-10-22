@@ -680,7 +680,7 @@ function isSpokenHeadingOrActivityScene(section, visualType, voiceoverRaw, audio
   if (/suno|original\s+song|poem\s*\/\s*original\s+song|attached\s+poem\s+track|instrumental/i.test(`${sec} ${vtype} ${raw}`)) {
     return false;
   }
-  if (/\b(heading|lead[- ]?in|attribution|author|poet|question|answer|vocabulary|exercise|activity|glossary|comprehension|summary|instruction|title)\b/i.test(`${sec} ${vtype}`)) {
+  if (/\b(heading|lead[- ]?in|attribution|author|poet|question|answer|vocabulary|exercise|activity|glossary|comprehension|summary|instruction|title|prompt|recap|task|guidance|challenge|discussion|statement|draw|label|write|true\s*\/\s*false|talk\s+on)\b/i.test(`${sec} ${vtype}`)) {
     return true;
   }
   return false;
@@ -782,19 +782,19 @@ function parseProductionXlsx(filePath) {
       const ostClean = rawOstCell || extractOnscreenText(rawVoCell);
       const voClean = cleanVoText(rawVoCell, ostClean);
       const combined = `${rawScene} ${currentSection} ${rawVoCell} ${rawVisCell} ${rawTypeCell}`.toLowerCase();
-      const spokenHeading = isSpokenHeadingOrActivityScene(currentSection, rawTypeCell, rawVoCell, audioStart);
+      const spokenHeading = isSpokenHeadingOrActivityScene(currentSection, rawTypeCell || rawVisCell, rawVoCell, audioStart);
+      const isPoemCandidate = (
+        /\bpoem\b/i.test(currentSection) ||
+        /\bpoem\s+visual\b/i.test(`${rawTypeCell} ${rawVisCell}`) ||
+        /\b(stanza|couplet|lines?\s*\d+[-–—]\d+)\b/i.test(currentSection) ||
+        /\b(song\s+intro|full\s+poem\s+song|poem\s*\/\s*original\s+song|attached\s+poem\s+track|poem\s+recitation|suno)\b/i.test(combined)
+      );
       const isPoem = poemTimings.size > 0
         ? Boolean(pCue || isSuno || audioStart != null)
         : !spokenHeading && (
             isSuno ||
             audioStart != null ||
-            combined.includes('poem recitation') ||
-            combined.includes('suno') ||
-            combined.includes('full poem song') ||
-            combined.includes('poem / original song') ||
-            combined.includes('attached poem track') ||
-            currentSection.toLowerCase().startsWith('poem') ||
-            currentSection.toLowerCase().includes('song intro')
+            isPoemCandidate
           );
       const vType = /video|mp4|anim/i.test(rawTypeCell || rawVisCell) ? 'Video' : 'Image';
 
@@ -843,7 +843,7 @@ function parsePlainScript(raw) {
         visual_type: 'Image',
         visual_direction: '',
         text: vo || m[2],
-        is_poem: /poem|suno/i.test(m[2]),
+        is_poem: /\b(poem|suno|stanza|couplet)\b/i.test(m[2]),
         source: 'text',
       });
     }
@@ -887,7 +887,7 @@ function onPoemTrack(scene) {
   if (text.startsWith('instrumental') || isInstrumentalScene(scene)) return true;
   if (scene.audio_start != null) return true;
   if (/suno\s*master|original\s+suno|attached\s+poem\s+track/i.test(raw)) return true;
-  if (sec.startsWith('poem') || sec.includes('song intro')) return true;
+  if (/\bpoem\b/i.test(sec) || sec.includes('song intro')) return true;
   return Boolean(scene.is_poem);
 }
 
@@ -2284,6 +2284,25 @@ app.post('/api/projects/:id/poem-voiceover-meta', (req, res) => {
       local_only: true,
     };
     saveJson(pid, 'poem_voiceover.json', meta);
+
+    const scriptMeta = loadJson(pid, 'script_meta.json');
+    if (scriptMeta) {
+      if (!scriptMeta.poem || !scriptMeta.poem.has_poem) {
+        scriptMeta.poem = { ...(scriptMeta.poem || {}), has_poem: true };
+        saveJson(pid, 'script_meta.json', scriptMeta);
+      }
+    }
+    const tl = loadJson(pid, 'timeline.json');
+    if (tl) {
+      tl.poem_voiceover_path = localPath;
+      tl.has_poem = true;
+      if (tl.poem) {
+        tl.poem.has_poem = true;
+        tl.poem.poem_uploaded = true;
+      }
+      saveJson(pid, 'timeline.json', tl);
+    }
+
     res.json(meta);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
