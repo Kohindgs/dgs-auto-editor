@@ -59,6 +59,76 @@ const TICKS_PER_SEC = 10000000;
 const IMAGE_BASE_OFFSET_TICKS = 36000000000;
 const EXEC_OPTS = { timeout: 180000, maxBuffer: 50 * 1024 * 1024 };
 
+const DEFAULT_LOGO_FILE = path.join(ROOT, 'public', 'eclass-logo.png');
+const DEFAULT_LOGO_TRANSFORM = {
+  scale_w: 10.0,
+  scale_h: 10.0,
+  lock_aspect: true,
+  pos_x: 1034.21,
+  pos_y: 565.98,
+  anchor_x: 1900.0,
+  anchor_y: 1065.0,
+  rotate: 0.0,
+};
+
+function normalizeLogoTransform(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const sw = Number(r.scale_w);
+  const sh = Number(r.scale_h);
+  const px = Number(r.pos_x);
+  const py = Number(r.pos_y);
+  const ax = Number(r.anchor_x);
+  const ay = Number(r.anchor_y);
+  const rot = Number(r.rotate);
+  return {
+    scale_w: Number.isFinite(sw) && sw > 0.5 && sw <= 200 ? Math.round(sw * 100) / 100 : DEFAULT_LOGO_TRANSFORM.scale_w,
+    scale_h: Number.isFinite(sh) && sh > 0.5 && sh <= 200 ? Math.round(sh * 100) / 100 : DEFAULT_LOGO_TRANSFORM.scale_h,
+    lock_aspect: typeof r.lock_aspect === 'boolean' ? r.lock_aspect : DEFAULT_LOGO_TRANSFORM.lock_aspect,
+    pos_x: Number.isFinite(px) ? Math.round(px * 100) / 100 : DEFAULT_LOGO_TRANSFORM.pos_x,
+    pos_y: Number.isFinite(py) ? Math.round(py * 100) / 100 : DEFAULT_LOGO_TRANSFORM.pos_y,
+    anchor_x: Number.isFinite(ax) ? Math.round(ax * 100) / 100 : DEFAULT_LOGO_TRANSFORM.anchor_x,
+    anchor_y: Number.isFinite(ay) ? Math.round(ay * 100) / 100 : DEFAULT_LOGO_TRANSFORM.anchor_y,
+    rotate: Number.isFinite(rot) ? Math.round(rot * 100) / 100 : DEFAULT_LOGO_TRANSFORM.rotate,
+  };
+}
+
+function getEffectiveLogoMeta(pid, plan = null) {
+  const meta = loadJson(pid, 'logo.json') || {};
+  const enabled =
+    plan && typeof plan.logo_enabled === 'boolean'
+      ? plan.logo_enabled
+      : typeof meta.enabled === 'boolean'
+        ? meta.enabled
+        : true;
+  const transform = normalizeLogoTransform((plan && plan.logo_transform) || meta.transform);
+  if (meta.path && fs.existsSync(meta.path)) {
+    return {
+      path: meta.path,
+      filename: meta.filename || path.basename(meta.path),
+      enabled,
+      transform,
+      is_default: Boolean(meta.is_default),
+    };
+  }
+  if (meta.local_only && meta.path) {
+    return {
+      path: meta.path,
+      filename: meta.filename || path.basename(meta.path),
+      enabled,
+      transform,
+      local_only: true,
+    };
+  }
+  const fallbackPath = fs.existsSync(DEFAULT_LOGO_FILE) ? DEFAULT_LOGO_FILE : (meta.path || '');
+  return {
+    path: fallbackPath,
+    filename: meta.filename || 'E-Class Logo.png (Default)',
+    enabled,
+    transform,
+    is_default: true,
+  };
+}
+
 function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1600,6 +1670,13 @@ app.get('/api/projects/:id/load', (req, res) => {
   const { scenes, scriptMeta } = refreshScriptFromWorkbookIfNeeded(pid);
   const lastExp = loadJson(pid, 'last_export.json') || {};
   const title = lastExp.title || (scriptMeta.filename ? path.parse(scriptMeta.filename).name : `Project ${pid}`);
+  const tl = loadJson(pid, 'timeline.json');
+  const effLogo = getEffectiveLogoMeta(pid, tl);
+  if (tl) {
+    if (typeof tl.logo_enabled !== 'boolean') tl.logo_enabled = effLogo.enabled;
+    tl.logo_transform = effLogo.transform;
+    if (!tl.logo_path && effLogo.path) tl.logo_path = effLogo.path;
+  }
   res.json({
     project_id: pid,
     title,
@@ -1608,8 +1685,8 @@ app.get('/api/projects/:id/load', (req, res) => {
     media: loadJson(pid, 'media.json') || [],
     voiceover: loadJson(pid, 'voiceover.json'),
     poem_voiceover: loadJson(pid, 'poem_voiceover.json'),
-    logo: loadJson(pid, 'logo.json'),
-    timeline: loadJson(pid, 'timeline.json'),
+    logo: effLogo,
+    timeline: tl,
   });
 });
 
@@ -2255,12 +2332,15 @@ function handleLogoFile(pid, tempPath, origName) {
   const dest = path.join(logoDir, origName);
   fs.copyFileSync(tempPath, dest);
   try { fs.unlinkSync(tempPath); } catch {}
-  const meta = { path: dest, filename: origName, enabled: true };
+  const prevMeta = loadJson(pid, 'logo.json') || {};
+  const transform = normalizeLogoTransform(prevMeta.transform);
+  const meta = { path: dest, filename: origName, enabled: true, transform };
   saveJson(pid, 'logo.json', meta);
   const tl = loadJson(pid, 'timeline.json');
   if (tl) {
     tl.logo_path = dest;
     tl.logo_enabled = true;
+    tl.logo_transform = transform;
     saveJson(pid, 'timeline.json', tl);
   }
   return meta;
@@ -2287,12 +2367,15 @@ app.post('/api/projects/:id/logo-meta', (req, res) => {
     if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
     const origName = path.basename(String(req.body?.filename || 'logo.png'));
     const localPath = String(req.body?.local_path || '').trim() || path.join(root, 'logo', origName);
-    const meta = { path: localPath, filename: origName, enabled: true, local_only: true };
+    const prevMeta = loadJson(pid, 'logo.json') || {};
+    const transform = normalizeLogoTransform(req.body?.transform || prevMeta.transform);
+    const meta = { path: localPath, filename: origName, enabled: true, local_only: true, transform };
     saveJson(pid, 'logo.json', meta);
     const tl = loadJson(pid, 'timeline.json');
     if (tl) {
       tl.logo_path = localPath;
       tl.logo_enabled = true;
+      tl.logo_transform = transform;
       saveJson(pid, 'timeline.json', tl);
     }
     res.json(meta);
@@ -2306,24 +2389,36 @@ app.post('/api/projects/:id/logo/toggle', (req, res) => {
   const enabled = String(req.query.enabled) !== 'false';
   const meta = loadJson(pid, 'logo.json') || {};
   meta.enabled = enabled;
+  if (req.body && req.body.transform) {
+    meta.transform = normalizeLogoTransform(req.body.transform);
+  } else {
+    meta.transform = normalizeLogoTransform(meta.transform);
+  }
+  if (!meta.path && fs.existsSync(DEFAULT_LOGO_FILE)) {
+    meta.path = DEFAULT_LOGO_FILE;
+    meta.filename = meta.filename || 'E-Class Logo.png (Default)';
+    meta.is_default = true;
+  }
   saveJson(pid, 'logo.json', meta);
   const tl = loadJson(pid, 'timeline.json');
   if (tl) {
     tl.logo_enabled = enabled;
+    tl.logo_transform = meta.transform;
+    if (!tl.logo_path && meta.path) tl.logo_path = meta.path;
     saveJson(pid, 'timeline.json', tl);
   }
   res.json(meta);
 });
 
 app.get('/api/projects/:id/logo-file', (req, res) => {
-  const meta = loadJson(req.params.id, 'logo.json');
-  if (!meta || !meta.path || !fs.existsSync(meta.path)) return res.status(404).end();
-  res.sendFile(path.resolve(meta.path));
+  const eff = getEffectiveLogoMeta(req.params.id);
+  if (!eff || !eff.path || !fs.existsSync(eff.path)) return res.status(404).end();
+  res.sendFile(path.resolve(eff.path));
 });
 app.get('/api/projects/:id/logo', (req, res) => {
-  const meta = loadJson(req.params.id, 'logo.json');
-  if (!meta || !meta.path || !fs.existsSync(meta.path)) return res.status(404).end();
-  res.sendFile(path.resolve(meta.path));
+  const eff = getEffectiveLogoMeta(req.params.id);
+  if (!eff || !eff.path || !fs.existsSync(eff.path)) return res.status(404).end();
+  res.sendFile(path.resolve(eff.path));
 });
 
 app.post('/api/projects/:id/build', async (req, res) => {
@@ -2379,8 +2474,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
           if (s.text) c.script_text = s.text;
         }
       }
-      existingTl.logo_path = logoMeta.path || existingTl.logo_path || null;
-      existingTl.logo_enabled = logoMeta.enabled !== false && Boolean(existingTl.logo_path);
+      const effLogo = getEffectiveLogoMeta(pid, existingTl);
+      existingTl.logo_path = effLogo.path || existingTl.logo_path || null;
+      existingTl.logo_enabled = effLogo.enabled;
+      existingTl.logo_transform = effLogo.transform;
       if (voMeta.path) existingTl.voiceover_path = voMeta.path;
       if (poemVoMeta.path) existingTl.poem_voiceover_path = poemVoMeta.path;
       existingTl.srt_cues = buildSrtCues(existingTl.clips, existingTl);
@@ -2821,6 +2918,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       ? clips.filter((c) => c.narration_in != null && c.start >= planOpts.poem_end_time - 0.05)
       : [];
 
+    const effLogo = getEffectiveLogoMeta(pid, existingTl);
     const plan = {
       project_id: pid,
       total_duration: Math.round(tlCursor * 1000) / 1000,
@@ -2838,8 +2936,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
       narration_head_out: headClips.length ? Math.max(...headClips.map((c) => Number(c.narration_out || 0))) : null,
       narration_tail_in: tailClips.length ? Math.min(...tailClips.map((c) => Number(c.narration_in || 0))) : null,
       narration_tail_out: tailClips.length ? Math.max(...tailClips.map((c) => Number(c.narration_out || 0))) : null,
-      logo_path: logoMeta.path || null,
-      logo_enabled: logoMeta.enabled !== false && Boolean(logoMeta.path),
+      logo_path: effLogo.path || null,
+      logo_enabled: effLogo.enabled,
+      logo_transform: effLogo.transform,
+      ignored_qa_keys: Array.isArray(existingTl?.ignored_qa_keys) ? existingTl.ignored_qa_keys : [],
       language: langRes.language,
       align_engine: langRes.engine,
       align_note: marathi
@@ -3039,10 +3139,12 @@ async function healTimelinePaths(pid, plan) {
   } else if (poemVoMeta.path && !plan.poem_voiceover_path) {
     plan.poem_voiceover_path = poemVoMeta.path;
   }
-  if (logoMeta.path && !logoMeta.local_only && fs.existsSync(logoMeta.path)) {
-    plan.logo_path = logoMeta.path;
-    if (plan.logo_enabled === undefined) plan.logo_enabled = logoMeta.enabled !== false;
+  const effLogo = getEffectiveLogoMeta(pid, plan);
+  if (effLogo.path && (!plan.logo_path || !fs.existsSync(plan.logo_path))) {
+    plan.logo_path = effLogo.path;
   }
+  plan.logo_enabled = effLogo.enabled;
+  plan.logo_transform = effLogo.transform;
 
   if (Array.isArray(plan.clips) && mediaItems.length) {
     const byId = new Map(mediaItems.map((m) => [m.id, m]));
@@ -3092,6 +3194,13 @@ app.put('/api/projects/:id/timeline', async (req, res) => {
       }
     }
     await healTimelinePaths(pid, plan);
+    const curLogoMeta = loadJson(pid, 'logo.json') || {};
+    curLogoMeta.enabled = plan.logo_enabled !== false;
+    curLogoMeta.transform = normalizeLogoTransform(plan.logo_transform || curLogoMeta.transform);
+    saveJson(pid, 'logo.json', curLogoMeta);
+    if (!Array.isArray(plan.ignored_qa_keys) && Array.isArray(existing.ignored_qa_keys)) {
+      plan.ignored_qa_keys = existing.ignored_qa_keys;
+    }
     if (Array.isArray(plan.clips)) {
       plan.srt_cues = buildSrtCues(plan.clips, plan);
       saveSrt(pid, 'subtitles.srt', formatSrt(plan.srt_cues));
@@ -3438,20 +3547,28 @@ app.post('/api/projects/:id/export', async (req, res) => {
         }
       } else {
         // Pre-scale logo ONCE so it is composited on each scene without a second full-video re-encode pass
+        const effLogo = getEffectiveLogoMeta(pid, plan);
+        const logoFilePath = (plan.logo_path && fs.existsSync(plan.logo_path)) ? plan.logo_path : effLogo.path;
         const useLogo = Boolean(
-          plan.logo_path &&
+          logoFilePath &&
           plan.logo_enabled !== false &&
           settings.include_logo !== false &&
-          fs.existsSync(plan.logo_path),
+          fs.existsSync(logoFilePath),
         );
-        const logoW = Math.max(90, Math.round(width * 0.1));
-        const padX = Math.max(8, Math.round(width * 0.0078));
-        const padY = Math.max(10, Math.round(height * 0.0176));
+        const lt = effLogo.transform;
+        const sx = lt.scale_w / 100;
+        const sy = lt.scale_h / 100;
+        const centerX1920 = 960 + lt.pos_x - lt.anchor_x * sx;
+        const centerY1080 = 540 - lt.pos_y + lt.anchor_y * sy;
+        const logoW = Math.max(28, Math.round(width * sx));
+        const estLogoH = Math.max(12, Math.round(logoW * (203 / 549) * (lt.scale_h / Math.max(1, lt.scale_w))));
+        const overlayX = Math.max(0, Math.min(width - logoW, Math.round((centerX1920 - 960 * sx) * (width / 1920))));
+        const overlayY = Math.max(0, Math.min(height - estLogoH, Math.round(centerY1080 * (height / 1080) - estLogoH / 2)));
         let logoScaledPath = null;
         if (useLogo) {
           const candidateLogo = path.join(jobDir, 'logo_scaled.png');
           try {
-            await runFfmpeg(['-y', '-i', plan.logo_path, '-vf', `scale=${logoW}:-1`, candidateLogo], { skipReap: true });
+            await runFfmpeg(['-y', '-i', logoFilePath, '-vf', `scale=${logoW}:${estLogoH}`, candidateLogo], { skipReap: true });
             if (fs.existsSync(candidateLogo)) logoScaledPath = candidateLogo;
           } catch {}
         }
@@ -3466,7 +3583,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
 
           if (!c.media_path || !fs.existsSync(c.media_path) || c.fit === 'missing') {
             if (logoScaledPath) {
-              const fg = `[0:v][1:v]overlay=W-w-${padX}:${padY}:format=auto,format=yuv420p,loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
+              const fg = `[0:v][1:v]overlay=${overlayX}:${overlayY}:format=auto,format=yuv420p,loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
               await runFfmpeg([
                 '-y', '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:r=${fps}:d=0.04`,
                 '-i', logoScaledPath,
@@ -3484,7 +3601,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
           } else if (c.kind === 'image') {
             // Decode still image ONCE, scale/pad/logo 1 frame, then loop in memory for ultra-fast P_SKIP encoding
             if (logoScaledPath) {
-              const fg = `[0:v]${scalePad}[bg];[bg][1:v]overlay=W-w-${padX}:${padY}:format=auto,format=yuv420p,loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
+              const fg = `[0:v]${scalePad}[bg];[bg][1:v]overlay=${overlayX}:${overlayY}:format=auto,format=yuv420p,loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
               await runFfmpeg([
                 '-y', '-i', c.media_path, '-i', logoScaledPath,
                 '-filter_complex', fg, '-map', '[vout]',
@@ -3511,7 +3628,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
               ? `${scalePad},fps=${fps},tpad=stop_mode=clone:stop_duration=${freeze.toFixed(3)}`
               : `${scalePad},fps=${fps}`;
             if (logoScaledPath) {
-              const fgVid = `[0:v]${vfVidBase}[bg];[bg][1:v]overlay=W-w-${padX}:${padY}:eof_action=repeat:format=auto,format=yuv420p[vout]`;
+              const fgVid = `[0:v]${vfVidBase}[bg];[bg][1:v]overlay=${overlayX}:${overlayY}:eof_action=repeat:format=auto,format=yuv420p[vout]`;
               await runFfmpeg([
                 '-y', '-ss', String(srcIn), '-i', c.media_path, '-i', logoScaledPath,
                 '-t', String(clipDur), '-filter_complex', fgVid, '-map', '[vout]',
@@ -4836,6 +4953,26 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     });
 
     const clipTitle = path.parse(filenameStr).name || 'Clip';
+    const isLogoClip = clipKey === 'logo_overlay';
+    const lt = normalizeLogoTransform(plan.logo_transform);
+    const transformParams = isLogoClip
+      ? [
+          { fxParam: { paramType: 5, unValue: 1186339 }, name: 'dwValue' },
+          { fxParam: { paramType: 3, unValue: Number(lt.scale_w) }, name: 'Scale_x' },
+          { fxParam: { paramType: 3, unValue: Number(lt.scale_h) }, name: 'Scale_y' },
+          { fxParam: { paramType: 3, unValue: (Number(lt.pos_x) + 960.0) / 1920.0 }, name: 'Position_x' },
+          { fxParam: { paramType: 3, unValue: (540.0 - Number(lt.pos_y)) / 1080.0 }, name: 'Position_y' },
+          { fxParam: { paramType: 3, unValue: (Number(lt.anchor_x) + 960.0) / 1920.0 }, name: '_Anchor_x' },
+          { fxParam: { paramType: 3, unValue: (540.0 - Number(lt.anchor_y)) / 1080.0 }, name: '_Anchor_y' },
+          ...(Math.abs(Number(lt.rotate || 0)) > 0.001
+            ? [{ fxParam: { paramType: 3, unValue: Number(lt.rotate) }, name: 'Rotation' }]
+            : []),
+          { fxParam: { paramType: 5, unValue: 1 }, name: 'EnableTransform' },
+        ]
+      : [
+          { fxParam: { paramType: 5, unValue: 1186339 }, name: 'dwValue' },
+          { fxParam: { paramType: 5, unValue: 1 }, name: 'EnableTransform' },
+        ];
     const clipObj = {
       backgroundFillBluredness: 20,
       effectChainList: [
@@ -4853,10 +4990,7 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
             {
               display: 'transform',
               id: 'video/effect/transform',
-              paramList: [
-                { fxParam: { paramType: 5, unValue: 1186339 }, name: 'dwValue' },
-                { fxParam: { paramType: 5, unValue: 1 }, name: 'EnableTransform' },
-              ],
+              paramList: transformParams,
               placeholder: false,
               placeholderStatus: 0,
               thisUId: transUid,
@@ -5095,11 +5229,11 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     }
   }
 
-  // 4. Logo overlay track
+  // 4. Logo overlay track (across all screens)
   const logoClipsTrack = [];
-  const logoMeta = loadJson(pid, 'logo.json') || {};
-  const logoPath = plan.logo_path || logoMeta.path;
-  const logoEnabled = Boolean(plan.logo_enabled ?? logoMeta.enabled ?? true);
+  const effLogo = getEffectiveLogoMeta(pid, plan);
+  const logoPath = (plan.logo_path && fs.existsSync(plan.logo_path)) ? plan.logo_path : effLogo.path;
+  const logoEnabled = effLogo.enabled;
   if (logoEnabled && logoPath) {
     const [mid, resUid] = registerMedia(logoPath, 'image', Number(plan.total_duration || 10));
     if (mid) {
@@ -5471,6 +5605,7 @@ app.get('/api/projects/:id/wfp-manifest', async (req, res) => {
     const voMeta = loadJson(pid, 'voiceover.json') || {};
     const poemVoMeta = loadJson(pid, 'poem_voiceover.json') || {};
     const logoMeta = loadJson(pid, 'logo.json') || {};
+    const effLogo = getEffectiveLogoMeta(pid, plan);
     const entries = [];
     for (const [mid, srcPath] of mediaGuidToPath.entries()) {
       const normSrc = normSlash(srcPath);
@@ -5487,7 +5622,11 @@ app.get('/api/projects/:id/wfp-manifest', async (req, res) => {
         (s) => (s.path && normSlash(s.path) === normSrc) || baseLow === `slot_${s.slot}_${String(s.filename || '').toLowerCase()}` || String(s.filename || '').toLowerCase() === baseLow,
       );
       const isPoemVo = Boolean(poemVoMeta.path && (normSlash(poemVoMeta.path) === normSrc || String(poemVoMeta.filename || '').toLowerCase() === baseLow));
-      const isLogo = Boolean(logoMeta.path && (normSlash(logoMeta.path) === normSrc || String(logoMeta.filename || '').toLowerCase() === baseLow));
+      const isLogo = Boolean(
+        (effLogo.path && normSlash(effLogo.path) === normSrc) ||
+        (logoMeta.path && (normSlash(logoMeta.path) === normSrc || String(logoMeta.filename || '').toLowerCase() === baseLow)) ||
+        baseLow === 'eclass-logo.png',
+      );
       entries.push({
         guid: mid,
         filename: base,
