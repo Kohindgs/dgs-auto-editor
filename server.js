@@ -2588,10 +2588,8 @@ function computeBitrateSummary(settings, totalDur = 0, actualSizeMb = null) {
   const compActive = Boolean(settings.advanced_compression && settings.compression_mode !== 'none');
   const compQuality = Math.max(10, Math.min(95, Number(settings.compression_quality) || 70));
   const keepRatio = compActive ? Math.max(0.05, (100 - compQuality) / 100.0) : 1.0;
-  const vbrStreamBaseKbps =
-    settings.bitrate_mode === 'cbr' ? baseVideoKbps : Math.max(600, Math.round(baseVideoKbps * 0.25));
   const targetVideoKbps = compActive
-    ? Math.max(350, Math.round(vbrStreamBaseKbps * keepRatio))
+    ? Math.max(400, Math.round(baseVideoKbps * keepRatio))
     : baseVideoKbps;
   const audioKbps = settings.export_video_only
     ? 0
@@ -2605,13 +2603,13 @@ function computeBitrateSummary(settings, totalDur = 0, actualSizeMb = null) {
     actualTotalKbps != null ? Math.max(100, actualTotalKbps - audioKbps) : null;
   let signalLevel = 'high';
   let signalLabel = 'Studio Master HD';
-  if (!compActive && targetVideoKbps >= 14000) {
+  if (targetVideoKbps >= 14000) {
     signalLevel = 'master';
     signalLabel = 'Broadcast / Master HD';
-  } else if (targetVideoKbps >= 1400) {
+  } else if (targetVideoKbps >= 5000) {
     signalLevel = 'optimal';
     signalLabel = 'Optimal Classroom & Web HD';
-  } else if (targetVideoKbps >= 800) {
+  } else if (targetVideoKbps >= 2500) {
     signalLevel = 'balanced';
     signalLabel = 'Compact / Balanced Stream';
   } else {
@@ -2647,37 +2645,46 @@ function buildVideoRateArgs(settings, fps = 30) {
   const minGop = Math.max(15, Math.round(Number(fps) || 30));
 
   let base = ['-c:v', vcodec];
+  const useCompPreset = Boolean(settings.advanced_compression && settings.compression_mode !== 'none');
   if (vcodec === 'libx264') {
-    base.push(
-      '-preset', 'ultrafast',
-      '-profile:v', 'high',
-      '-level', '4.1',
-      '-g', String(gop),
-      '-keyint_min', String(minGop),
-      '-sc_threshold', '0',
-      '-bf', '0',
-      '-x264-params', `threads=3:lookahead-threads=1:sync-lookahead=0:sliced-threads=1:cabac=1:ref=1:bframes=0:scenecut=0:repeat-headers=1:keyint=${gop}:min-keyint=${minGop}`,
-    );
+    if (useCompPreset) {
+      base.push(
+        '-preset', 'veryfast',
+        '-profile:v', 'high',
+        '-level', '4.1',
+        '-g', String(gop),
+        '-keyint_min', String(minGop),
+      );
+    } else {
+      base.push(
+        '-preset', 'ultrafast',
+        '-profile:v', 'high',
+        '-level', '4.1',
+        '-g', String(gop),
+        '-keyint_min', String(minGop),
+        '-sc_threshold', '0',
+        '-bf', '0',
+        '-x264-params', `threads=3:lookahead-threads=1:sync-lookahead=0:sliced-threads=1:cabac=1:ref=1:bframes=0:scenecut=0:repeat-headers=1:keyint=${gop}:min-keyint=${minGop}`,
+      );
+    }
   } else if (vcodec === 'libx265') {
-    base.push('-preset', 'ultrafast', '-x265-params', 'pools=none:frame-threads=2:bframes=0:ref=1:repeat-headers=1');
+    base.push('-preset', useCompPreset ? 'veryfast' : 'ultrafast', '-x265-params', 'pools=none:frame-threads=2:bframes=0:ref=1:repeat-headers=1');
   }
   base.push('-pix_fmt', 'yuv420p', ...colorSpace);
 
   const q = Math.max(10, Math.min(95, Number(settings.compression_quality) || 70));
   const keepRatio = Math.max(0.05, (100 - q) / 100.0);
   let effectiveKbps = Math.max(500, Number(settings.video_bitrate_kbps) || 20000);
-  const vbrStreamBaseKbps =
-    settings.bitrate_mode === 'cbr' ? effectiveKbps : Math.max(600, Math.round(effectiveKbps * 0.25));
 
   if (settings.advanced_compression && settings.compression_mode === 'by_quality') {
-    const crf = Math.max(20, Math.min(36, Math.round(20 + (q / 100.0) * 15)));
-    const capKbps = Math.max(350, Math.round(vbrStreamBaseKbps * keepRatio));
+    const crf = Math.max(18, Math.min(35, Math.round(18 + (q / 100.0) * 14)));
+    const capKbps = Math.max(400, Math.round(effectiveKbps * keepRatio));
     if (vcodec === 'libx264' || vcodec === 'libx265') {
       return [...base, '-crf', String(crf), '-maxrate', `${capKbps}k`, '-bufsize', `${capKbps * 2}k`];
     }
     effectiveKbps = capKbps;
   } else if (settings.advanced_compression && settings.compression_mode === 'by_bitrate') {
-    effectiveKbps = Math.max(350, Math.round(vbrStreamBaseKbps * keepRatio));
+    effectiveKbps = Math.max(350, Math.round(effectiveKbps * 0.25 * keepRatio));
     if (vcodec === 'libx264' || vcodec === 'libx265') {
       const crf = effectiveKbps >= 10000 ? 20 : effectiveKbps >= 5000 ? 23 : effectiveKbps >= 2500 ? 26 : 29;
       return [...base, '-crf', String(crf), '-maxrate', `${effectiveKbps}k`, '-bufsize', `${effectiveKbps * 2}k`];
