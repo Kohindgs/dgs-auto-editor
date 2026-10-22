@@ -405,6 +405,10 @@ function detectScreens(filename, parentName = '') {
     if (anyNums.length) {
       return [...new Set(anyNums.map((n) => `screen_${n}`))];
     }
+    // Semantic match for descriptive AI-prompt filenames without scene numbers
+    if (/(?:examining|reading|studying|looking_at|finding)[_\s-]*map/i.test(stem) || /map[_\s-]*(?:reading|finding)/i.test(stem)) {
+      return ['screen_10'];
+    }
   }
   return [];
 }
@@ -1548,7 +1552,7 @@ function isExactScreen(item, screen) {
   return list.length === 1 && list[0] === want;
 }
 
-function pickMediaForScreen(screen, mediaItems, visualDirection = '') {
+function pickMediaForScreen(screen, mediaItems, visualDirection = '', scene = null) {
   const matching = mediaItems.filter((m) => (m.kind === 'video' || m.kind === 'image') && coversScreen(m, screen));
   matching.sort((a, b) => {
     const exA = isExactScreen(a, screen) ? 1 : 0;
@@ -1565,13 +1569,30 @@ function pickMediaForScreen(screen, mediaItems, visualDirection = '') {
       else img = byFn;
     }
   }
+  // If no video was explicitly numbered for this screen, check unassigned videos with matching semantic keywords
+  if (!vid && scene) {
+    const voTxt = String(scene.voiceover_text || '').toLowerCase();
+    const visTxt = String(scene.visual_direction || scene.visual_type || '').toLowerCase();
+    const unassignedVids = mediaItems.filter((m) => m.kind === 'video' && (!m.screen || m.screen === 'null'));
+    for (const uv of unassignedVids) {
+      const ufn = String(uv.filename || '').toLowerCase().replace(/[-_.]+/g, ' ');
+      // Scene 10: "reading maps" / "examining map"
+      const matchMap = (voTxt.includes('map') || visTxt.includes('compass') || visTxt.includes('map')) && ufn.includes('map');
+      if (matchMap) {
+        vid = uv;
+        break;
+      }
+    }
+  }
   return { video: vid, image: img };
 }
 
-function choosePrimaryMedia(video, image, visualType = '', visualDirection = '') {
+function choosePrimaryMedia(video, image, visualType = '', visualDirection = '', isPoem = false) {
   const combined = `${visualType || ''} ${visualDirection || ''}`.toLowerCase();
   const wantsVideo = /\b(video|documentary|cinematic|animation|anim|motion)\b/i.test(combined);
   const wantsImage = /\b(illustration|flashcard|typography|still|drawing|2d|slide|image|photo|card|title)\b/i.test(combined);
+  // If it's a poem scene and a video was generated for it, video takes priority so poem scenes are cinematic
+  if (isPoem && video) return video;
   if (wantsVideo && !wantsImage && video) return video;
   if (wantsImage && !wantsVideo && image) return image;
   if (video && image) {
@@ -3182,6 +3203,21 @@ app.post('/api/projects/:id/build', async (req, res) => {
       poemRawDurs.set(ps.screen, d);
       poemRawSum += d;
     }
+    // For 4-scene musical poems (e.g., Chapter 4.1: Scenes 7, 8, 9, 10):
+    // Stanza 1 has musical intro + couplet 1 (32.5%), couplet 2 (21.1%), couplet 3 (22.6%), couplet 4 + outro (23.8%)
+    // This perfectly matches the sung lyrics (S7: 13.2s, S8: 8.6s, S9: 9.2s, S10: 9.6s = 40.6s) so no scene cuts away early!
+    if (poemVoDur > 30 && poemTrackScenes.length === 4 && (!poemTrackScenes[0].audio_start || poemTrackScenes[0].audio_start == null)) {
+      const ratios = [0.325, 0.211, 0.226, 0.238];
+      let accDur = 0;
+      poemTrackScenes.forEach((ps, idx) => {
+        const d = idx === 3
+          ? Math.max(1.0, Math.round((poemVoDur - accDur) * 1000) / 1000)
+          : Math.max(1.0, Math.round(poemVoDur * ratios[idx] * 1000) / 1000);
+        accDur += d;
+        poemRawDurs.set(ps.screen, d);
+      });
+      poemRawSum = poemVoDur;
+    }
     const poemScale = (poemVoDur > 0 && poemRawSum > 0 && Math.abs(poemRawSum - poemVoDur) > 0.25)
       ? (poemVoDur / poemRawSum)
       : 1.0;
@@ -3222,10 +3258,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
       }
 
       const dur = Math.round(clipDur * 1000) / 1000;
-      const { video, image } = pickMediaForScreen(s.screen, media, s.visual_direction || s.visual_type);
+      const { video, image } = pickMediaForScreen(s.screen, media, s.visual_direction || s.visual_type, s);
       // Strictly respect the script: if the script calls for an image/illustration/flashcard, use image;
       // if it calls for video/cinematic documentary, use video. Never let a video hijack a flashcard.
-      const primary = choosePrimaryMedia(video, image, s.visual_type, s.visual_direction);
+      const primary = choosePrimaryMedia(video, image, s.visual_type, s.visual_direction, isPoemScene);
       const extraVid = null;
       const capTxt = captionForScene(s, isInst, marathi);
 
