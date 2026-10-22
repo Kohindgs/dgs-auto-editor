@@ -2531,6 +2531,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
           screen: s.screen,
           media_id: primary.id,
           media_path: primary.path,
+          filename: primary.filename || path.basename(String(primary.path || '')),
           kind: primary.kind,
           start: Math.round(tlCursor * 1000) / 1000,
           end: Math.round((tlCursor + dur) * 1000) / 1000,
@@ -2552,6 +2553,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
             screen: s.screen,
             media_id: extraVid.id,
             media_path: extraVid.path,
+            filename: extraVid.filename || path.basename(String(extraVid.path || '')),
             kind: 'video',
             start: Math.round(tlCursor * 1000) / 1000,
             end: Math.round((tlCursor + vdur) * 1000) / 1000,
@@ -2615,35 +2617,19 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const srtCues = buildSrtCues(clips, planOpts);
     saveJson(pid, 'subtitles.srt', formatSrt(srtCues));
 
-    // Scan timeline for missing cards / QA issues
-    const qaIssues = [];
+    const narrationSegments = [];
     for (const c of clips) {
-      if (c.fit === 'missing' || !c.media_path) {
-        const mNum = String(c.screen || '').match(/(\d+)$/);
-        const imgNo = mNum ? parseInt(mNum[1], 10) : null;
-        const sSec = Math.max(0, Math.floor(Number(c.start || 0)));
-        const eSec = Math.max(0, Math.floor(Number(c.end || 0)));
-        const tc = `${String(Math.floor(sSec / 60)).padStart(2, '0')}:${String(sSec % 60).padStart(2, '0')}–${String(Math.floor(eSec / 60)).padStart(2, '0')}:${String(eSec % 60).padStart(2, '0')}`;
-        qaIssues.push({
-          kind: 'missing_card',
-          severity: 'error',
+      if (c.narration_in != null && c.narration_out != null && Number(c.narration_out) - Number(c.narration_in) >= 0.15) {
+        narrationSegments.push({
           screen: c.screen,
-          image_no: imgNo,
-          time: Number(c.start || 0),
+          start: Number(c.start || 0),
           end: Number(c.end || 0),
-          timecode: tc,
-          message: `Image ${imgNo || c.screen}: blank on Video 1 · no card/video at ${tc}. Drop ${imgNo || c.screen}.png or Scene ${imgNo || c.screen}.mp4 in the media folder.`,
+          narration_in: Number(c.narration_in),
+          narration_out: Number(c.narration_out),
+          vo_text: String(c.vo_text || c.script_text || ''),
         });
       }
     }
-    const errCount = qaIssues.filter((i) => i.severity === 'error').length;
-    const warnCount = qaIssues.filter((i) => i.severity === 'warning').length;
-    const partialVoNote = (voDur > 1 && coveredSpokenCount < speechScenes.length)
-      ? ` · VO covers Scenes 1–${coveredSpokenCount} (add VO 2 for Scenes ${coveredSpokenCount + 1}–${speechScenes.length})`
-      : '';
-    const qaSummary = qaIssues.length
-      ? `Align scan: ${errCount} missing · ${warnCount} warnings · ${clips.length} pictures${partialVoNote}`
-      : `Align scan: no issues · ${clips.length} pictures checked${partialVoNote}`;
 
     const headClips = clips.filter((c) => c.narration_in != null && (!planOpts.has_poem || c.start < planOpts.poem_start_time - 0.02));
     const tailClips = planOpts.has_poem
@@ -2654,6 +2640,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
       project_id: pid,
       total_duration: Math.round(tlCursor * 1000) / 1000,
       clips,
+      narration_segments: narrationSegments,
+      manual_override: false,
       voiceover_path: voMeta.path || null,
       voiceover_slots: placedSlots,
       poem_voiceover_path: poemVoMeta.path || null,
@@ -2669,14 +2657,27 @@ app.post('/api/projects/:id/build', async (req, res) => {
       logo_enabled: logoMeta.enabled !== false && Boolean(logoMeta.path),
       language: (req.body && req.body.language) || 'en+mr',
       srt_cues: srtCues,
-      qa_issues: qaIssues,
-      qa_summary: qaSummary,
+      qa_issues: [],
+      qa_summary: '',
       poem: {
         has_poem: planOpts.has_poem,
         poem_start_time: planOpts.poem_start_time,
         poem_uploaded: Boolean(poemVoMeta.path),
       },
     };
+
+    const qaIssues = scanTimelineQA(plan, scenes);
+    const errCount = qaIssues.filter((i) => i.severity === 'error').length;
+    const warnCount = qaIssues.filter((i) => i.severity === 'warning').length;
+    const partialVoNote = (voDur > 1 && coveredSpokenCount < speechScenes.length)
+      ? ` · VO covers Scenes 1–${coveredSpokenCount} (add VO 2 for Scenes ${coveredSpokenCount + 1}–${speechScenes.length})`
+      : '';
+    const qaSummary = qaIssues.length
+      ? `QA scan: ${errCount ? `${errCount} missing · ` : ''}${warnCount ? `${warnCount} mismatch thought bubble${warnCount !== 1 ? 's' : ''} · ` : ''}${clips.length} clips on timeline${partialVoNote}`
+      : `QA scan: no issues · ${clips.length} clips aligned${partialVoNote}`;
+    plan.qa_issues = qaIssues;
+    plan.qa_summary = qaSummary;
+
     saveJson(pid, 'timeline.json', plan);
     saveJson(pid, 'qa.json', { summary: qaSummary, issues: qaIssues });
     res.json({ ...plan, scenes });
@@ -2684,6 +2685,140 @@ app.post('/api/projects/:id/build', async (req, res) => {
     res.status(500).json({ detail: String(e) });
   }
 });
+
+function fmtTimecodeRange(startSec, endSec) {
+  const sSec = Math.max(0, Math.floor(Number(startSec || 0)));
+  const eSec = Math.max(0, Math.floor(Number(endSec || 0)));
+  return `${String(Math.floor(sSec / 60)).padStart(2, '0')}:${String(sSec % 60).padStart(2, '0')}–${String(Math.floor(eSec / 60)).padStart(2, '0')}:${String(eSec % 60).padStart(2, '0')}`;
+}
+
+function scanTimelineQA(plan, scenesInput) {
+  const scenes = Array.isArray(scenesInput) ? scenesInput : [];
+  const byScreen = new Map(scenes.map((s) => [s.screen, s]));
+  const clips = Array.isArray(plan && plan.clips) ? plan.clips : [];
+  const qaIssues = [];
+
+  for (const c of clips) {
+    const mNum = String(c.screen || '').match(/(\d+)$/);
+    const imgNo = mNum ? parseInt(mNum[1], 10) : null;
+    const tc = fmtTimecodeRange(c.start, c.end);
+    const sc = byScreen.get(c.screen);
+
+    if (c.fit === 'missing' || (!c.media_path && !c.media_id)) {
+      const voPreview = String(c.vo_text || (sc && sc.voiceover_text) || '').trim();
+      qaIssues.push({
+        kind: 'missing_card',
+        severity: 'error',
+        screen: c.screen,
+        image_no: imgNo,
+        time: Number(c.start || 0),
+        end: Number(c.end || 0),
+        timecode: tc,
+        expected: voPreview.slice(0, 180),
+        found: 'Blank / Deleted slot on Video 1',
+        message: `Image ${imgNo || c.screen} missing at ${tc}${voPreview ? ` for VO "${voPreview.slice(0, 90)}"` : ''}. Pull an adjacent screen to cover this narration or drop ${imgNo || c.screen}.png.`,
+      });
+      continue;
+    }
+
+    // Check if clip already carries missing_words or fill-in-the-blank vs VO discrepancy
+    if (Array.isArray(c.missing_words) && c.missing_words.length > 0) {
+      const missStr = c.missing_words.map((w) => `"${w}"`).join(', ');
+      qaIssues.push({
+        kind: 'card_text',
+        severity: 'warning',
+        screen: c.screen,
+        image_no: imgNo,
+        time: Number(c.start || 0),
+        end: Number(c.end || 0),
+        timecode: tc,
+        expected: String(c.vo_text || c.script_text || '').slice(0, 180),
+        found: String(c.script_text || '').slice(0, 180),
+        missing_words: c.missing_words,
+        message: `Image ${imgNo || c.screen} (${tc}): Missing text in image (present in VO): ${missStr} missing on card. Delete this scene & pull adjacent screen to cover, or replace the image.`,
+      });
+    } else if (sc) {
+      const ost = String(sc.onscreen_text || '').trim();
+      const vo = String(sc.voiceover_text || c.vo_text || '').trim();
+      const ostHasBlank = /(\.{3,}|_{3,}|…{2,}|\[blank\])/i.test(ost);
+      const voHasBlank = /(\.{3,}|_{3,}|…{2,}|\[blank\])/i.test(vo) || (/pause/i.test(String(sc.voiceover_raw || '')) && ostHasBlank);
+      if (ostHasBlank && !voHasBlank && vo.length > 3) {
+        const ostWords = new Set((ost.toLowerCase().match(/[a-z]{2,}/g) || []));
+        const voWords = (vo.toLowerCase().match(/[a-z]{3,}/g) || []);
+        const missingInImg = voWords.filter((w) => !ostWords.has(w));
+        if (missingInImg.length > 0) {
+          c.missing_words = missingInImg.slice(0, 6);
+          const missStr = c.missing_words.map((w) => `"${w}"`).join(', ');
+          qaIssues.push({
+            kind: 'card_text',
+            severity: 'warning',
+            screen: c.screen,
+            image_no: imgNo,
+            time: Number(c.start || 0),
+            end: Number(c.end || 0),
+            timecode: tc,
+            expected: vo.slice(0, 180),
+            found: ost.slice(0, 180),
+            missing_words: c.missing_words,
+            message: `Image ${imgNo || c.screen} (${tc}): Card shows blank "${ost.slice(0, 90)}" while VO speaks answer (${missStr}). Delete scene & pull screen to cover, or replace image.`,
+          });
+        }
+      }
+    }
+  }
+
+  // Check if any locked narration segment is uncovered on Video 1 (e.g. after deleting a scene without pulling a screen to cover)
+  const narrSegs = Array.isArray(plan && plan.narration_segments) ? plan.narration_segments : [];
+  if (narrSegs.length > 0) {
+    const validVideoClips = clips.filter((c) => c.fit !== 'missing' && (c.media_id || c.media_path));
+    for (const seg of narrSegs) {
+      if (seg.narration_in == null || seg.narration_out == null) continue;
+      const spokenDur = Number(seg.narration_out) - Number(seg.narration_in);
+      if (spokenDur < 0.2) continue;
+      const segStart = Number(seg.start || 0);
+      const segEnd = Math.min(Number(seg.end || 0), segStart + spokenDur);
+      const mid = 0.5 * (segStart + segEnd);
+      const covered = validVideoClips.some((c) => Number(c.start || 0) - 0.15 <= mid && mid <= Number(c.end || 0) + 0.15);
+      if (!covered) {
+        const mNum = String(seg.screen || '').match(/(\d+)$/);
+        const imgNo = mNum ? parseInt(mNum[1], 10) : null;
+        const tc = fmtTimecodeRange(segStart, segEnd);
+        qaIssues.push({
+          kind: 'missing_card',
+          severity: 'warning',
+          screen: seg.screen,
+          image_no: imgNo,
+          time: segStart,
+          end: segEnd,
+          timecode: tc,
+          expected: String(seg.vo_text || '').slice(0, 180),
+          found: 'Empty gap on Video 1',
+          message: `Narration uncovered at ${tc} (${String(seg.screen || '').replace('screen_', 'Scene ')}): VO says "${String(seg.vo_text || '').slice(0, 100)}", but no screen covers this interval. Pull the previous or next screen to cover the timeline.`,
+        });
+      }
+    }
+  }
+
+  if (plan && plan.has_poem && !plan.poem_voiceover_path) {
+    const pStart = Number(plan.poem_start_time || 0);
+    const pEnd = Number(plan.poem_end_time || pStart + 15);
+    qaIssues.push({
+      kind: 'poem_mismatch',
+      severity: 'warning',
+      screen: 'poem',
+      image_no: null,
+      time: pStart,
+      end: pEnd,
+      timecode: fmtTimecodeRange(pStart, pEnd),
+      expected: 'Poem / Suno master audio track',
+      found: 'No Poem VO uploaded',
+      message: 'Poem scenes detected in script, but Poem / Suno VO audio has not been uploaded yet.',
+    });
+  }
+
+  qaIssues.sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
+  return qaIssues;
+}
 
 async function healTimelinePaths(pid, plan) {
   if (!plan) return plan;
@@ -2723,6 +2858,7 @@ async function healTimelinePaths(pid, plan) {
         if (matched && matched.path && fs.existsSync(matched.path)) {
           c.media_id = matched.id;
           c.media_path = matched.path;
+          c.filename = matched.filename || path.basename(matched.path);
           c.kind = matched.kind;
           if (c.fit === 'missing') c.fit = matched.kind === 'video' ? 'trim' : 'hold';
         }
@@ -2735,7 +2871,13 @@ async function healTimelinePaths(pid, plan) {
 app.put('/api/projects/:id/timeline', async (req, res) => {
   try {
     const pid = req.params.id;
+    const existing = loadJson(pid, 'timeline.json') || {};
+    const scenes = loadJson(pid, 'scenes.json') || [];
     const plan = req.body || {};
+    plan.manual_override = true;
+    if ((!Array.isArray(plan.narration_segments) || !plan.narration_segments.length) && Array.isArray(existing.narration_segments) && existing.narration_segments.length) {
+      plan.narration_segments = existing.narration_segments;
+    }
     if (Array.isArray(plan.clips)) {
       for (const c of plan.clips) {
         c.duration = Math.max(0.2, Math.round((Number(c.end || 0) - Number(c.start || 0)) * 1000) / 1000);
@@ -2748,8 +2890,60 @@ app.put('/api/projects/:id/timeline', async (req, res) => {
       }
     }
     await healTimelinePaths(pid, plan);
+    const qaIssues = scanTimelineQA(plan, scenes);
+    const errCount = qaIssues.filter((i) => i.severity === 'error').length;
+    const warnCount = qaIssues.filter((i) => i.severity === 'warning').length;
+    const clipCount = Array.isArray(plan.clips) ? plan.clips.length : 0;
+    plan.qa_issues = qaIssues;
+    plan.qa_summary = qaIssues.length
+      ? `QA scan: ${errCount ? `${errCount} missing · ` : ''}${warnCount ? `${warnCount} mismatch thought bubble${warnCount !== 1 ? 's' : ''} · ` : ''}${clipCount} clips on timeline`
+      : `QA scan: no issues · ${clipCount} clips aligned`;
     saveJson(pid, 'timeline.json', plan);
+    saveJson(pid, 'qa.json', { summary: plan.qa_summary, issues: qaIssues });
     res.json(plan);
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
+app.post('/api/projects/:id/clips/:screen/replace-media', upload.single('file'), async (req, res) => {
+  try {
+    const pid = req.params.id;
+    const screen = req.params.screen;
+    const file = req.file;
+    if (!file) return res.status(400).json({ detail: 'No file uploaded' });
+    const mediaDir = path.join(projectDir(pid), 'media');
+    fs.mkdirSync(mediaDir, { recursive: true });
+    const safeName = path.basename(file.originalname || `${screen}.png`);
+    const dest = path.join(mediaDir, safeName);
+    fs.copyFileSync(file.path, dest);
+    try { fs.unlinkSync(file.path); } catch (_) {}
+
+    const mediaItems = await reindexMedia(pid);
+    const matched = mediaItems.find((m) => m.path === dest || m.filename === safeName);
+    const plan = loadJson(pid, 'timeline.json');
+    if (!plan) return res.status(404).json({ detail: 'Timeline not built yet' });
+    const clipIndex = req.body && req.body.clip_index != null ? parseInt(req.body.clip_index, 10) : null;
+    if (Array.isArray(plan.clips)) {
+      plan.clips.forEach((c, idx) => {
+        if ((clipIndex != null && idx === clipIndex) || (clipIndex == null && c.screen === screen)) {
+          if (matched) {
+            c.media_id = matched.id;
+            c.media_path = matched.path;
+            c.filename = matched.filename;
+            c.kind = matched.kind;
+            c.fit = matched.kind === 'video' ? 'trim' : 'hold';
+            c.missing_words = [];
+          }
+        }
+      });
+    }
+    plan.manual_override = true;
+    const scenes = loadJson(pid, 'scenes.json') || [];
+    const qaIssues = scanTimelineQA(plan, scenes);
+    plan.qa_issues = qaIssues;
+    saveJson(pid, 'timeline.json', plan);
+    res.json({ plan, media: mediaItems });
   } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
