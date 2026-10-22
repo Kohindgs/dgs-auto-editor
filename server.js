@@ -1571,6 +1571,57 @@ app.post('/api/projects/:id/media-meta', async (req, res) => {
 });
 
 // Purge temporary physical media/VO/export files on server after render to keep server storage at 0 MB
+app.post('/api/projects/:id/media-rename', async (req, res) => {
+  // After the user renumbered picture files on their PC: move each media id to its new filename (ids stay the same)
+  try {
+    const pid = req.params.id;
+    const renames = Array.isArray(req.body?.renames) ? req.body.renames : [];
+    const media = loadJson(pid, 'media.json') || [];
+    const byId = new Map(media.map((m) => [m.id, m]));
+    // Phase 1: physically uploaded copies on the server → move to temp names (safe for swaps like 42↔45)
+    const moves = [];
+    for (const r of renames) {
+      const m = byId.get(String(r?.id || ''));
+      const to = path.basename(String(r?.to || ''));
+      if (!m || !to) continue;
+      const oldPath = m.path ? String(m.path) : '';
+      const newPath = oldPath ? path.join(path.dirname(oldPath), to) : '';
+      if (oldPath && fs.existsSync(oldPath)) {
+        const tmp = `${oldPath}.dgs-tmp-${m.id}`;
+        fs.renameSync(oldPath, tmp);
+        moves.push({ tmp, newPath });
+      }
+      m.filename = to;
+      if (newPath) m.path = newPath;
+      const screens = detectScreens(to, m.kind === 'video' ? 'videos' : 'images');
+      m.screen = screens[0] || null;
+      m.screens = screens;
+    }
+    // Phase 2: temp → final names
+    for (const mv of moves) {
+      try { if (fs.existsSync(mv.newPath)) fs.renameSync(mv.newPath, `${mv.newPath}.dgs-replaced-${Date.now()}`); } catch (_) {}
+      fs.renameSync(mv.tmp, mv.newPath);
+    }
+    saveJson(pid, 'media.json', Array.from(byId.values()));
+    const plan = loadJson(pid, 'timeline.json');
+    if (plan && Array.isArray(plan.clips)) {
+      for (const c of plan.clips) {
+        const m = c.media_id ? byId.get(c.media_id) : null;
+        if (m) {
+          c.filename = m.filename;
+          if (m.path) c.media_path = m.path;
+        }
+      }
+      saveJson(pid, 'timeline.json', plan);
+    }
+    const items = await reindexMedia(pid);
+    res.json({ media: items, timeline: plan || null });
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
+// Purge temporary physical media/VO/export files on server after render to keep server storage at 0 MB
 app.delete('/api/projects/:id/purge-server-media', (req, res) => {
   try {
     const pid = req.params.id;
