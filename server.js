@@ -478,12 +478,27 @@ function extractOnscreenText(raw) {
   return '';
 }
 
+function parseClockValue(val) {
+  if (val == null || val === '') return null;
+  if (typeof val === 'number' && Number.isFinite(val)) return val;
+  const s = String(val).trim();
+  const colon = s.match(/^(\d+):(\d{2}(?:\.\d+)?)(?::(\d{2}(?:\.\d+)?))?$/);
+  if (colon) {
+    if (colon[3] != null) {
+      return parseInt(colon[1], 10) * 3600 + parseFloat(colon[2]) * 60 + parseFloat(colon[3]);
+    }
+    return parseInt(colon[1], 10) * 60 + parseFloat(colon[2]);
+  }
+  const num = parseFloat(s);
+  return Number.isFinite(num) ? num : null;
+}
+
 function parseSunoRange(raw) {
   if (!raw) return [null, null, false];
-  const m = String(raw).match(/(?:suno\s*)?(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})/i);
+  const m = String(raw).match(/(?:suno\s*)?(\d{1,2}):(\d{2}(?:\.\d+)?)\s*[-–—→]\s*(\d{1,2}):(\d{2}(?:\.\d+)?)/i);
   if (!m) return [null, null, false];
-  const start = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-  const end = parseInt(m[3], 10) * 60 + parseInt(m[4], 10);
+  const start = parseInt(m[1], 10) * 60 + parseFloat(m[2]);
+  const end = parseInt(m[3], 10) * 60 + parseFloat(m[4]);
   return [start, end, /suno/i.test(String(raw))];
 }
 
@@ -492,13 +507,13 @@ function parseDurationCell(val) {
   if (typeof val === 'number' && val > 0 && val < 600) return val;
   const s = String(val).trim();
   const [sStart, sEnd] = parseSunoRange(s);
-  if (sStart != null && sEnd != null && sEnd > sStart) return sEnd - sStart;
+  if (sStart != null && sEnd != null && sEnd > sStart) return Math.round((sEnd - sStart) * 1000) / 1000;
   const secMatch = s.match(/(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds)\b/i);
   if (secMatch) return parseFloat(secMatch[1]);
-  const colon = s.match(/^(\d+):(\d{2})(?::(\d{2}))?$/);
+  const colon = s.match(/^(\d+):(\d{2}(?:\.\d+)?)(?::(\d{2}(?:\.\d+)?))?$/);
   if (colon) {
-    if (colon[3] != null) return parseInt(colon[1], 10) * 3600 + parseInt(colon[2], 10) * 60 + parseInt(colon[3], 10);
-    return parseInt(colon[1], 10) * 60 + parseInt(colon[2], 10);
+    if (colon[3] != null) return parseInt(colon[1], 10) * 3600 + parseFloat(colon[2]) * 60 + parseFloat(colon[3]);
+    return parseInt(colon[1], 10) * 60 + parseFloat(colon[2]);
   }
   const num = parseFloat(s);
   return Number.isFinite(num) && num > 0 && num < 600 ? num : null;
@@ -508,10 +523,19 @@ function loadRevisedDurationsFromWb(wb) {
   const out = new Map();
   if (!wb || !Array.isArray(wb.SheetNames) || wb.SheetNames.length < 2) return out;
   for (const name of wb.SheetNames.slice(1)) {
+    const lowName = String(name || '').toLowerCase();
+    if (lowName.includes('poem') || lowName.includes('prompt') || lowName.includes('guide') || lowName.includes('cue')) {
+      continue;
+    }
     const ws = wb.Sheets[name];
     if (!ws) continue;
     const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-    for (const row of rows) {
+    if (!rows.length) continue;
+    const hdr = (rows[0] || []).map((c) => String(c || '').trim().toLowerCase()).join(' | ');
+    if (!hdr.includes('revised') && lowName !== 'sheet2') continue;
+    if (hdr.includes('poem line') || hdr.includes('script scene')) continue;
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
       if (!row || row.length < 2) continue;
       const mScene = String(row[0] ?? '').trim().match(/^(\d+)$/);
       if (!mScene) continue;
@@ -523,9 +547,76 @@ function loadRevisedDurationsFromWb(wb) {
   return out;
 }
 
+function loadPoemTimingFromWb(wb) {
+  const out = new Map();
+  if (!wb || !Array.isArray(wb.SheetNames)) return out;
+  for (const name of wb.SheetNames) {
+    const ws = wb.Sheets[name];
+    if (!ws) continue;
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    let hdrIdx = -1;
+    let cScene = -1;
+    let cIn = -1;
+    let cOut = -1;
+    let cDur = -1;
+    for (let r = 0; r < Math.min(rows.length, 15); r++) {
+      const row = (rows[r] || []).map((c) => String(c || '').trim().toLowerCase());
+      const sIdx = row.findIndex((c) => c.includes('script scene') || c === 'scene #' || c === 'scene no' || c === 'scene');
+      const inIdx = row.findIndex((c) => c.includes('audio in') || c === 'in' || c.includes('start time'));
+      const outIdx = row.findIndex((c) => c.includes('audio out') || c === 'out' || c.includes('end time'));
+      if (sIdx >= 0 && inIdx >= 0 && outIdx >= 0) {
+        hdrIdx = r;
+        cScene = sIdx;
+        cIn = inIdx;
+        cOut = outIdx;
+        cDur = row.findIndex((c) => c.includes('scene duration'));
+        break;
+      }
+    }
+    if (hdrIdx < 0) continue;
+    for (let r = hdrIdx + 1; r < rows.length; r++) {
+      const row = rows[r];
+      if (!row || !row.length) continue;
+      const mSc = String(row[cScene] ?? '').trim().match(/(\d+)/);
+      if (!mSc) continue;
+      const scNo = parseInt(mSc[1], 10);
+      const aIn = parseClockValue(row[cIn]);
+      const aOut = parseClockValue(row[cOut]);
+      const sDur = cDur >= 0 ? parseDurationCell(row[cDur]) : null;
+      if (scNo > 0 && aIn != null && aOut != null && aOut > aIn) {
+        const prev = out.get(scNo);
+        const nextStart = prev ? Math.min(prev.audio_start, aIn) : aIn;
+        const nextEnd = prev ? Math.max(prev.audio_end, aOut) : aOut;
+        const spanDur = Math.round((nextEnd - nextStart) * 1000) / 1000;
+        out.set(scNo, {
+          audio_start: Math.round(nextStart * 1000) / 1000,
+          audio_end: Math.round(nextEnd * 1000) / 1000,
+          duration: sDur && sDur > 0 ? sDur : spanDur,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+function isSpokenHeadingOrActivityScene(section, visualType, voiceoverRaw, audioStart) {
+  if (audioStart != null) return false;
+  const sec = String(section || '').trim().toLowerCase();
+  const vtype = String(visualType || '').trim().toLowerCase();
+  const raw = String(voiceoverRaw || '').trim().toLowerCase();
+  if (/suno|original\s+song|poem\s*\/\s*original\s+song|attached\s+poem\s+track|instrumental/i.test(`${sec} ${vtype} ${raw}`)) {
+    return false;
+  }
+  if (/\b(heading|lead[- ]?in|attribution|author|poet|question|answer|vocabulary|exercise|activity|glossary|comprehension|summary|instruction|title)\b/i.test(`${sec} ${vtype}`)) {
+    return true;
+  }
+  return false;
+}
+
 function parseProductionXlsx(filePath) {
   const wb = XLSX.readFile(filePath);
   const revisedDurations = loadRevisedDurationsFromWb(wb);
+  const poemTimings = loadPoemTimingFromWb(wb);
   const scenes = [];
   for (const sheetName of wb.SheetNames) {
     const ws = wb.Sheets[sheetName];
@@ -533,15 +624,16 @@ function parseProductionXlsx(filePath) {
     let headerIdx = -1;
     let colMap = {};
     for (let r = 0; r < Math.min(rows.length, 25); r++) {
-      const row = rows[r].map((c) => String(c || '').trim().toLowerCase());
-      const hasScene = row.some((c) => c.includes('scene') || c.includes('screen') || c === 'sr. no' || c === 's.no');
-      const hasAudioOrText = row.some((c) => c.includes('audio') || c.includes('voice') || c.includes('narration') || c.includes('script') || c.includes('vo') || c.includes('on-screen'));
-      if (hasScene && hasAudioOrText) {
+      const row = rows[r].map((c) => String(c || '').replace(/\s+/g, ' ').trim().toLowerCase());
+      const shortNonEmpty = row.filter((c) => c.length > 0 && c.length < 60).length;
+      const hasScene = row.some((c) => c.length < 40 && (c.includes('scene') || c.includes('screen') || c === 'sr. no' || c === 's.no'));
+      const hasAudioOrText = row.some((c) => c.length < 55 && (c.includes('audio') || c.includes('voice') || c.includes('narration') || c.includes('script') || c === 'vo' || c.includes('on-screen') || c.includes('onscreen')));
+      if (shortNonEmpty >= 3 && hasScene && hasAudioOrText) {
         headerIdx = r;
         row.forEach((c, idx) => {
           if (c.includes('scene') || c.includes('screen') || c === 'no' || c.includes('sr')) colMap.scene = colMap.scene ?? idx;
           if (c.includes('section') || c.includes('timestamp')) colMap.section = colMap.section ?? idx;
-          if (c.includes('duration') || c.includes('time') || c.includes('sec')) colMap.duration = colMap.duration ?? idx;
+          if (!c.includes('section') && (c.includes('duration') || /\bsec(?:s|onds)?\b/.test(c) || c === 'time')) colMap.duration = colMap.duration ?? idx;
           if (c.includes('on-screen') || c.includes('onscreen') || c.includes('text on screen') || c.includes('ost')) colMap.onscreen = colMap.onscreen ?? idx;
           if (c.includes('voice') || c.includes('audio') || c.includes('narration') || c === 'vo' || c.includes('script')) colMap.vo = colMap.vo ?? idx;
           if (c.includes('visual') && c.includes('type')) colMap.vtype = colMap.vtype ?? idx;
@@ -600,22 +692,37 @@ function parseProductionXlsx(filePath) {
         audioEnd = dEnd;
         isSuno = isSuno || dSuno;
       }
+      const pCue = poemTimings.get(sceneNo);
+      if (pCue) {
+        audioStart = pCue.audio_start;
+        audioEnd = pCue.audio_end;
+        isSuno = true;
+      }
 
       const sheet1Dur = rawDurCell != null ? parseDurationCell(rawDurCell) : null;
-      const durVal = revisedDurations.has(sceneNo) ? revisedDurations.get(sceneNo) : sheet1Dur;
+      const durVal = pCue
+        ? pCue.duration
+        : revisedDurations.has(sceneNo)
+          ? revisedDurations.get(sceneNo)
+          : sheet1Dur;
 
       const ostClean = rawOstCell || extractOnscreenText(rawVoCell);
       const voClean = cleanVoText(rawVoCell, ostClean);
       const combined = `${rawScene} ${currentSection} ${rawVoCell} ${rawVisCell} ${rawTypeCell}`.toLowerCase();
-      const isPoem =
-        isSuno ||
-        audioStart != null ||
-        combined.includes('poem recitation') ||
-        combined.includes('suno') ||
-        combined.includes('full poem song') ||
-        combined.includes('attached poem track') ||
-        currentSection.toLowerCase().startsWith('poem') ||
-        currentSection.toLowerCase().includes('song intro');
+      const spokenHeading = isSpokenHeadingOrActivityScene(currentSection, rawTypeCell, rawVoCell, audioStart);
+      const isPoem = poemTimings.size > 0
+        ? Boolean(pCue || isSuno || audioStart != null)
+        : !spokenHeading && (
+            isSuno ||
+            audioStart != null ||
+            combined.includes('poem recitation') ||
+            combined.includes('suno') ||
+            combined.includes('full poem song') ||
+            combined.includes('poem / original song') ||
+            combined.includes('attached poem track') ||
+            currentSection.toLowerCase().startsWith('poem') ||
+            currentSection.toLowerCase().includes('song intro')
+          );
       const vType = /video|mp4|anim/i.test(rawTypeCell || rawVisCell) ? 'Video' : 'Image';
 
       scenes.push({
@@ -698,12 +805,15 @@ function isInstrumentalScene(scene) {
 function onPoemTrack(scene) {
   if (!scene) return false;
   if (!scene.is_poem && scene.audio_start == null) return false;
+  if (isSpokenHeadingOrActivityScene(scene.section, scene.visual_type, scene.voiceover_raw, scene.audio_start)) {
+    return false;
+  }
   const text = String(scene.voiceover_text || '').trim().toLowerCase();
   const raw = String(scene.voiceover_raw || '');
   const sec = String(scene.section || '').trim().toLowerCase();
   if (text.startsWith('instrumental') || isInstrumentalScene(scene)) return true;
   if (scene.audio_start != null) return true;
-  if (/suno\s*master|attached\s+poem\s+track/i.test(raw)) return true;
+  if (/suno\s*master|original\s+suno|attached\s+poem\s+track/i.test(raw)) return true;
   if (sec.startsWith('poem') || sec.includes('song intro')) return true;
   return Boolean(scene.is_poem);
 }
@@ -818,12 +928,19 @@ function alignScenesWithGlobalDP(segScenes, speechWeights, segStart, segEnd, sil
     const maxDrift = Math.max(16, segDur * 0.18);
     for (let i = 1; i <= M; i++) {
       const d = expDurs[i - 1];
+      const scObj = segScenes[i - 1];
+      const hasEndPause = questionPauseSeconds(scObj) > 0;
       cumExp += d;
       for (let k = i; k < K; k++) {
         if (i === M && k !== K - 1) continue;
         if (i < M && k === K - 1) continue;
         if (Math.abs(cuts[k].t - cumExp) > maxDrift) continue;
-        const pauseBonus = Math.min(0.55, cuts[k].dur * (indic ? 1.1 : 0.9));
+        const cDur = cuts[k].dur;
+        const pauseBonus = indic
+          ? Math.min(0.55, cDur * 1.1)
+          : hasEndPause
+            ? Math.min(1.10, cDur * 0.65)
+            : Math.min(0.45, Math.min(cDur, 0.95) * 0.85) - (cDur > 1.5 ? 0.35 : 0);
         for (let p = i - 1; p < k; p++) {
           if (dp[i - 1][p] >= 1e11) continue;
           const actual = cuts[k].t - cuts[p].t;
@@ -1290,6 +1407,68 @@ app.delete('/api/projects/:id', (req, res) => {
   }
 });
 
+function refreshScriptFromWorkbookIfNeeded(pid) {
+  try {
+    const scriptMeta = loadJson(pid, 'script_meta.json') || {};
+    let scenes = loadJson(pid, 'script.json') || [];
+    if (scriptMeta.imported_bundle || !scriptMeta.filename) return { scenes, scriptMeta };
+    const ext = path.extname(String(scriptMeta.filename)).toLowerCase();
+    if (ext !== '.xlsx' && ext !== '.xlsm' && ext !== '.xls') return { scenes, scriptMeta };
+    const xlsxPath = path.join(projectRoot(pid), 'script', path.basename(scriptMeta.filename));
+    if (!fs.existsSync(xlsxPath)) return { scenes, scriptMeta };
+
+    const freshScenes = parseProductionXlsx(xlsxPath);
+    if (!freshScenes.length || freshScenes.length !== scenes.length) return { scenes, scriptMeta };
+
+    let changed = false;
+    for (let i = 0; i < scenes.length; i++) {
+      const cur = scenes[i];
+      const fr = freshScenes[i];
+      if (!fr || cur.screen !== fr.screen) continue;
+      if (
+        cur.duration !== fr.duration ||
+        cur.audio_start !== fr.audio_start ||
+        cur.audio_end !== fr.audio_end ||
+        Boolean(cur.is_poem) !== Boolean(fr.is_poem)
+      ) {
+        cur.duration = fr.duration;
+        cur.audio_start = fr.audio_start;
+        cur.audio_end = fr.audio_end;
+        cur.is_poem = fr.is_poem;
+        changed = true;
+      }
+    }
+    const poemScenes = scenes.filter((s) => s.is_poem);
+    const sunoList = poemScenes.filter((s) => s.audio_start != null && s.audio_end != null);
+    const sunoDur = sunoList.length
+      ? Math.round((Math.max(...sunoList.map((s) => Number(s.audio_end))) - Math.min(...sunoList.map((s) => Number(s.audio_start)))) * 1000) / 1000
+      : null;
+    const nextPoem = poemScenes.length
+      ? {
+          has_poem: true,
+          scene_count: poemScenes.length,
+          first_screen: poemScenes[0].screen,
+          last_screen: poemScenes[poemScenes.length - 1].screen,
+          suno_duration: sunoDur,
+        }
+      : { has_poem: false };
+    if (JSON.stringify(scriptMeta.poem) !== JSON.stringify(nextPoem)) {
+      scriptMeta.poem = nextPoem;
+      changed = true;
+    }
+    if (changed) {
+      saveJson(pid, 'script.json', scenes);
+      saveJson(pid, 'script_meta.json', scriptMeta);
+    }
+    return { scenes, scriptMeta };
+  } catch {
+    return {
+      scenes: loadJson(pid, 'script.json') || [],
+      scriptMeta: loadJson(pid, 'script_meta.json') || {},
+    };
+  }
+}
+
 app.get('/api/projects/:id/load', (req, res) => {
   const pid = req.params.id;
   if (!fs.existsSync(projectRoot(pid))) return res.status(404).json({ detail: 'Project not found' });
@@ -1297,13 +1476,13 @@ app.get('/api/projects/:id/load', (req, res) => {
   if (!existingClient.client_id) {
     touchProjectClient(pid, req);
   }
-  const scriptMeta = loadJson(pid, 'script_meta.json') || {};
+  const { scenes, scriptMeta } = refreshScriptFromWorkbookIfNeeded(pid);
   const lastExp = loadJson(pid, 'last_export.json') || {};
   const title = lastExp.title || (scriptMeta.filename ? path.parse(scriptMeta.filename).name : `Project ${pid}`);
   res.json({
     project_id: pid,
     title,
-    scenes: loadJson(pid, 'script.json') || [],
+    scenes,
     poem: scriptMeta.poem || null,
     media: loadJson(pid, 'media.json') || [],
     voiceover: loadJson(pid, 'voiceover.json'),
@@ -1467,12 +1646,17 @@ function handleScriptFile(pid, tempPath, origName) {
     scenes = parsePlainScript(fs.readFileSync(dest, 'utf-8'));
   }
   const poemScenes = scenes.filter((s) => s.is_poem);
+  const sunoList = poemScenes.filter((s) => s.audio_start != null && s.audio_end != null);
+  const sunoDur = sunoList.length
+    ? Math.round((Math.max(...sunoList.map((s) => Number(s.audio_end))) - Math.min(...sunoList.map((s) => Number(s.audio_start)))) * 1000) / 1000
+    : null;
   const poem = poemScenes.length
     ? {
         has_poem: true,
         scene_count: poemScenes.length,
         first_screen: poemScenes[0].screen,
         last_screen: poemScenes[poemScenes.length - 1].screen,
+        suno_duration: sunoDur,
       }
     : { has_poem: false };
 
@@ -1974,7 +2158,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
   try {
     const pid = req.params.id;
     touchProjectClient(pid, req);
-    const scenes = loadJson(pid, 'script.json') || [];
+    const { scenes, scriptMeta } = refreshScriptFromWorkbookIfNeeded(pid);
     // Refresh cleanVoText for production_xlsx scenes (e.g., "Read exact on-screen text")
     let changedVo = false;
     for (const s of scenes) {
@@ -1993,7 +2177,6 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const voMeta = loadJson(pid, 'voiceover.json') || {};
     const poemVoMeta = loadJson(pid, 'poem_voiceover.json') || {};
     const logoMeta = loadJson(pid, 'logo.json') || {};
-    const scriptMeta = loadJson(pid, 'script_meta.json') || {};
     const existingTl = loadJson(pid, 'timeline.json');
 
     // If project was imported from a .wfpbundle / .wfp and neither script nor master VO was replaced,
@@ -2127,7 +2310,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
     // Note: For Marathi/Indic chapters without a separate Poem VO (!hasPoemVo), poem lyrics live inside the narration VO!
     const speechScenes = scenes.filter((s) => {
       if (hasPoemVo && onPoemTrack(s)) return false;
-      if (!indic && s.audio_start != null && s.audio_end != null && onPoemTrack(s)) return false;
+      if (!indic && onPoemTrack(s)) return false;
       return isSpokenVo(s, { indic, hasPoemVo });
     });
 
@@ -2135,22 +2318,31 @@ app.post('/api/projects/:id/build', async (req, res) => {
     let totalSpeechWeight = 0;
     for (const s of speechScenes) {
       const txt = String(s.voiceover_text || s.onscreen_text || '').trim();
-      const words = txt.split(/\s+/).filter(Boolean).length;
+      const noEll = txt.replace(/\.{2,}/g, ' ');
+      const words = (noEll.match(/[\w\u0900-\u097F']+/g) || []).length;
       const devChars = (txt.match(/[\u0900-\u097F]/g) || []).length;
       const isDevanagari = devChars > 0;
-      const sentBreaks = Math.max(0, (txt.match(/[.!?।]/g) || []).length - 1);
-      const sents = Math.max(1, (txt.match(/[.!?।]+/g) || []).length);
-      const repMatches = (txt.match(/\b([a-zA-Z]{2,})[,\s]+\1\b/gi) || []).length;
+      const sentBreaks = Math.max(0, (noEll.match(/[.!?।]/g) || []).length - 1);
+      const sents = Math.max(1, (noEll.match(/[.!?।]+/g) || []).length);
+      const commas = (noEll.match(/[,;:]/g) || []).length;
+      const repMatches = (noEll.match(/\b([a-zA-Z]{2,})[,\s]+\1\b/gi) || []).length;
+      const qp = questionPauseSeconds(s);
+      const hasMidPause = qp === 0 && /\d+(?:\.\d+)?\s*-\s*second\s+pause/i.test(String(s.voiceover_raw || ''));
+      const listItems = commas + sents;
+      const isWordBank = !isDevanagari && ((commas >= 3 && words <= commas * 2.5) || (sents >= 4 && words <= sents * 1.8));
       let w;
       if (isDevanagari && voDur > 1) {
         // Pure phonetic character + word + sentence-break weight for Marathi/Hindi (ignores flat 8s Excel placeholders)
         w = Math.max(1.2, devChars * 0.105 + words * 0.22 + sentBreaks * 0.25 + 0.25);
       } else if (voDur > 1) {
-        // Natural English instructional speaking duration (~0.31s/word + 0.36s/sentence + expressive sound repeat + pause bonus)
-        const qPauseBonus = Math.min(2.2, questionPauseSeconds(s) * 0.45);
-        w = words > 0
-          ? Math.max(1.1, words * 0.31 + sents * 0.36 + repMatches * 1.1 + qPauseBonus + 0.20)
-          : (Number(s.duration) || 2.0);
+        if (isWordBank) {
+          w = Math.max(2.0, words * 0.34 + listItems * 0.56 + 0.25);
+        } else {
+          const pBonus = qp > 0 ? 1.45 : (hasMidPause ? 0.55 : 0.0);
+          w = words > 0
+            ? Math.max(1.1, words * 0.30 + sents * 0.36 + commas * 0.36 + repMatches * 1.1 + pBonus + 0.15)
+            : (Number(s.duration) || 2.0);
+        }
       } else {
         const wordEst = words > 0 ? Math.max(1.2, words * (isDevanagari ? 0.55 : 0.38) + 0.25) : (Number(s.duration) || 2.0);
         w = s.duration && Number(s.duration) > 0 ? 0.55 * wordEst + 0.45 * Number(s.duration) : wordEst;
@@ -2244,10 +2436,30 @@ app.post('/api/projects/:id/build', async (req, res) => {
     let inPoemBlock = false;
     const anyPoemScene = scenes.some((s) => s.is_poem || onPoemTrack(s));
 
+    // Pre-calculate exact poem scene durations so they always sum to poemVoDur when a Poem VO is present
+    const poemTrackScenes = scenes.filter((x) => (hasPoemVo || !indic) && onPoemTrack(x));
+    const poemRawDurs = new Map();
+    let poemRawSum = 0;
+    for (const ps of poemTrackScenes) {
+      let d = 0;
+      if (ps.audio_start != null && ps.audio_end != null && Number(ps.audio_end) > Number(ps.audio_start)) {
+        d = Math.max(0.4, Number(ps.audio_end) - Number(ps.audio_start));
+      } else if (ps.duration && Number(ps.duration) > 0) {
+        d = Math.max(0.4, Number(ps.duration));
+      } else {
+        d = poemVoDur > 0 ? Math.max(1.5, poemVoDur / Math.max(1, poemTrackScenes.length)) : 6.0;
+      }
+      poemRawDurs.set(ps.screen, d);
+      poemRawSum += d;
+    }
+    const poemScale = (poemVoDur > 0 && poemRawSum > 0 && Math.abs(poemRawSum - poemVoDur) > 0.25)
+      ? (poemVoDur / poemRawSum)
+      : 1.0;
+
     // Group scenes into runs of 'poem' vs 'speech' when poem clock is active
     for (let i = 0; i < scenes.length; i++) {
       const s = scenes[i];
-      const isPoemScene = (hasPoemVo || (!indic && s.audio_start != null && s.audio_end != null)) && onPoemTrack(s);
+      const isPoemScene = (hasPoemVo || !indic) && onPoemTrack(s);
       const spoken = !isPoemScene && speechWeights.has(s.screen);
       const isInst = isInstrumentalScene(s);
 
@@ -2260,14 +2472,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
           poemStartTime = tlCursor;
           inPoemBlock = true;
         }
-        if (s.audio_start != null && s.audio_end != null && Number(s.audio_end) > Number(s.audio_start)) {
-          clipDur = Math.max(0.4, Number(s.audio_end) - Number(s.audio_start));
-        } else if (s.duration && Number(s.duration) > 0) {
-          clipDur = Math.max(0.4, Number(s.duration));
-        } else if (poemVoDur > 0) {
-          const poemCount = Math.max(1, scenes.filter((x) => onPoemTrack(x)).length);
-          clipDur = Math.max(1.5, poemVoDur / poemCount);
-        }
+        const basePoemDur = poemRawDurs.get(s.screen) || (poemVoDur > 0 ? poemVoDur / Math.max(1, poemTrackScenes.length) : 6.0);
+        clipDur = Math.max(0.4, Math.round(basePoemDur * poemScale * 1000) / 1000);
         poemEndTime = Math.max(poemEndTime, tlCursor + clipDur);
       } else if (spoken && alignedSpeechMap.has(s.screen)) {
         const [ni, no] = alignedSpeechMap.get(s.screen);
@@ -2473,7 +2679,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
     };
     saveJson(pid, 'timeline.json', plan);
     saveJson(pid, 'qa.json', { summary: qaSummary, issues: qaIssues });
-    res.json(plan);
+    res.json({ ...plan, scenes });
   } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
@@ -2488,8 +2694,12 @@ async function healTimelinePaths(pid, plan) {
 
   if (voMeta.path && !voMeta.local_only && fs.existsSync(voMeta.path)) {
     plan.voiceover_path = voMeta.path;
+  } else if (voMeta.path && !plan.voiceover_path) {
+    plan.voiceover_path = voMeta.path;
   }
   if (poemVoMeta.path && !poemVoMeta.local_only && fs.existsSync(poemVoMeta.path)) {
+    plan.poem_voiceover_path = poemVoMeta.path;
+  } else if (poemVoMeta.path && !plan.poem_voiceover_path) {
     plan.poem_voiceover_path = poemVoMeta.path;
   }
   if (logoMeta.path && !logoMeta.local_only && fs.existsSync(logoMeta.path)) {
