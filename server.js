@@ -1700,6 +1700,14 @@ app.post('/api/projects/:id/media/:kind', upload.array('files', 500), async (req
     const allowed = kind === 'images' ? IMAGE_EXT : VIDEO_EXT;
     const destDir = path.join(root, 'media', kind);
     fs.mkdirSync(destDir, { recursive: true });
+    if (req.query?.replace === '1' || req.headers?.['x-replace-kind'] === '1') {
+      for (const f of fs.readdirSync(destDir)) {
+        try { fs.unlinkSync(path.join(destDir, f)); } catch {}
+      }
+      const existing = loadJson(pid, 'media.json') || [];
+      const targetItemKind = kind === 'videos' ? 'video' : 'image';
+      saveJson(pid, 'media.json', existing.filter((m) => m.kind !== targetItemKind));
+    }
     let saved = 0;
     let skipped = 0;
     for (const f of req.files || []) {
@@ -1731,8 +1739,13 @@ app.post('/api/projects/:id/media-meta', async (req, res) => {
     const kind = req.body?.kind === 'videos' ? 'videos' : 'images';
     const allowed = kind === 'images' ? IMAGE_EXT : VIDEO_EXT;
     const incoming = Array.isArray(req.body?.items) ? req.body.items : [];
+    const replaceKind = req.body?.replace_kind !== false;
     const existing = loadJson(pid, 'media.json') || [];
-    const byKey = new Map(existing.map((m) => [`${m.kind}:${String(m.filename || '').toLowerCase()}`, m]));
+    const targetItemKind = kind === 'videos' ? 'video' : 'image';
+    const baseItems = replaceKind
+      ? existing.filter((m) => m.kind !== targetItemKind)
+      : existing;
+    const byKey = new Map(baseItems.map((m) => [`${m.kind}:${String(m.filename || '').toLowerCase()}`, m]));
     let saved = 0;
     let skipped = 0;
     for (const raw of incoming) {
@@ -1760,9 +1773,44 @@ app.post('/api/projects/:id/media-meta', async (req, res) => {
       });
       saved++;
     }
+    if (replaceKind) {
+      const incomingNames = new Set(incoming.map((raw) => path.basename(String(raw?.filename || '')).toLowerCase()));
+      const destDir = path.join(root, 'media', kind);
+      if (fs.existsSync(destDir)) {
+        for (const f of fs.readdirSync(destDir)) {
+          if (!incomingNames.has(f.toLowerCase())) {
+            try { fs.unlinkSync(path.join(destDir, f)); } catch {}
+          }
+        }
+      }
+    }
     saveJson(pid, 'media.json', Array.from(byKey.values()));
     const items = await reindexMedia(pid);
     res.json({ count: items.length, saved, skipped, folder: kind, media: items });
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
+app.delete('/api/projects/:id/media/:kind', async (req, res) => {
+  try {
+    const pid = req.params.id;
+    touchProjectClient(pid, req);
+    const root = projectRoot(pid);
+    if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
+    const kind = req.params.kind === 'videos' ? 'videos' : 'images';
+    const targetItemKind = kind === 'videos' ? 'video' : 'image';
+    const existing = loadJson(pid, 'media.json') || [];
+    const remaining = existing.filter((m) => m.kind !== targetItemKind);
+    saveJson(pid, 'media.json', remaining);
+    const destDir = path.join(root, 'media', kind);
+    if (fs.existsSync(destDir)) {
+      for (const f of fs.readdirSync(destDir)) {
+        try { fs.unlinkSync(path.join(destDir, f)); } catch {}
+      }
+    }
+    const items = await reindexMedia(pid);
+    res.json({ count: items.length, folder: kind, media: items });
   } catch (e) {
     res.status(500).json({ detail: String(e) });
   }
