@@ -1119,6 +1119,339 @@ function alignScenesWithGlobalDP(segScenes, speechWeights, segStart, segEnd, sil
   return result;
 }
 
+// ===========================================================================
+// Word-level script <-> voice-over alignment (English).
+// Port of backend/app/align_from_script.py (match + _snap_to_silences), but the
+// matching is one global monotonic alignment of ALL script words against ALL
+// heard words, so a line can never be skipped or pulled ahead of its audio.
+// The heard words come from Whisper running in the user's browser.
+// ===========================================================================
+const WA_CONS_CACHE = new Map();
+function waClean(text) {
+  return String(text == null ? '' : text).replace(/[\u2019\u2018`\u00b4]/g, "'");
+}
+function waTokens(text) {
+  return waClean(text).toLowerCase().match(/[\p{L}\p{N}]+(?:'[\p{L}\p{N}]+)?/gu) || [];
+}
+function waNorm(text) {
+  const m = waClean(text).toLowerCase().match(/[\p{L}\p{N}]+|'/gu);
+  return (m ? m.join('') : '').replace(/^'+|'+$/g, '');
+}
+function waConsSkeleton(text) {
+  const s = String(text || '');
+  if (WA_CONS_CACHE.has(s)) return WA_CONS_CACHE.get(s);
+  const key = s.toLowerCase().replace(/[^a-z]/g, '');
+  let res = '';
+  if (key) {
+    res = key.replace(/[aeiouh]/g, '').replace(/[zpfwc]/g, (ch) => ({ z: 'j', p: 'b', f: 'b', w: 'v', c: 's' }[ch]));
+    res = res.replace(/(.)\1+/g, '$1');
+    if (!res) res = key[0] === 'h' ? 'h' : (key[0] === 'v' || key[0] === 'w' ? 'v' : key[0]);
+  }
+  WA_CONS_CACHE.set(s, res);
+  return res;
+}
+function waSameWord(h, w) {
+  if (!h || !w) return false;
+  if (h === w) return true;
+  const lh = h.length;
+  const lw = w.length;
+  if (Math.min(lh, lw) >= 2 && Math.abs(lh - lw) <= 1 && (h.startsWith(w) || w.startsWith(h))) return true;
+  if (lh >= 3 && lw >= 3 && Math.abs(lh - lw) <= 2 && (h.includes(w) || w.includes(h))) return true;
+  if (lh >= 3 && lw >= 3 && Math.abs(lh - lw) <= 2) {
+    const hc = waConsSkeleton(h.replace(/ck/g, 'k'));
+    const wc = waConsSkeleton(w.replace(/ck/g, 'k'));
+    if (hc.length >= 2 && hc === wc) return true;
+    if (lh >= 4 && lw >= 4 && h[0] === w[0] && hc.slice(0, 2) === wc.slice(0, 2)) return true;
+  }
+  return false;
+}
+const WA_SMALL = new Set(['a', 'an', 'the', 'of', 'to', 'in', 'on', 'is', 'it', 'and', 'or', 'at', 'as', 'we', 'i', 'my', 'so', 'be', 'by', 'do', 'for', 'are', 'was', 'that', 'this']);
+function waPairScore(scriptTok, heardTok) {
+  if (scriptTok === heardTok) return WA_SMALL.has(scriptTok) || scriptTok.length < 3 ? 1.4 : 3.0;
+  if (waSameWord(heardTok, scriptTok)) return 1.7;
+  return -0.9;
+}
+
+/**
+ * Returns Map(screen -> [narration_in, narration_out]) for every spoken scene it could place,
+ * or null when the recording words are unusable (caller falls back to the silence/estimate path).
+ */
+function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDuration) {
+  if (!Array.isArray(wordsIn) || !speechScenes.length) return null;
+  const pos = new Map((allScenes || []).map((s, i) => [s.screen, i]));
+  const A = [];
+  for (const w of wordsIn) {
+    const tok = waNorm(w && w.text);
+    const st = Number(w && w.start);
+    const en = Number(w && w.end);
+    if (!tok || !Number.isFinite(st)) continue;
+    A.push({ tok, text: String(w.text), start: st, end: Number.isFinite(en) && en >= st ? en : st + 0.1 });
+  }
+  A.sort((a, b) => a.start - b.start);
+  if (A.length < 6) return null;
+
+  // Script tokens for every spoken scene, in script order
+  const S = [];
+  const ranges = [];
+  speechScenes.forEach((s, si) => {
+    const toks = waTokens(s.voiceover_text || '').map(waNorm).filter(Boolean);
+    ranges.push([S.length, S.length + toks.length]);
+    for (const t of toks) S.push({ tok: t, si });
+  });
+  const n = S.length;
+  const m = A.length;
+  if (n < 3 || n * m > 36e6) return null;
+
+  // Overlap alignment (free leading/trailing gaps on both sides: the recording may start/end with extras
+  // or cover only part of the script).
+  const W = m + 1;
+  const H = new Float32Array((n + 1) * W);
+  const T = new Uint8Array((n + 1) * W); // 1 diag, 2 skip script token (up), 3 skip heard word (left)
+  const GS = -1.0;
+  const GA = -0.45;
+  for (let k = 1; k <= n; k++) {
+    const sTok = S[k - 1].tok;
+    for (let j = 1; j <= m; j++) {
+      const diag = H[(k - 1) * W + (j - 1)] + waPairScore(sTok, A[j - 1].tok);
+      const up = H[(k - 1) * W + j] + GS;
+      const left = H[k * W + (j - 1)] + GA;
+      let best = diag;
+      let dir = 1;
+      if (up > best) { best = up; dir = 2; }
+      if (left > best) { best = left; dir = 3; }
+      H[k * W + j] = best;
+      T[k * W + j] = dir;
+    }
+  }
+  let bk = n;
+  let bj = m;
+  let bv = -1e30;
+  for (let j = 0; j <= m; j++) if (H[n * W + j] > bv) { bv = H[n * W + j]; bk = n; bj = j; }
+  for (let k = 0; k <= n; k++) if (H[k * W + m] > bv) { bv = H[k * W + m]; bk = k; bj = m; }
+  const matchOf = new Int32Array(n).fill(-1);
+  {
+    let k = bk;
+    let j = bj;
+    while (k > 0 && j > 0) {
+      const d = T[k * W + j];
+      if (d === 1) {
+        if (waPairScore(S[k - 1].tok, A[j - 1].tok) > 0) matchOf[k - 1] = j - 1;
+        k--; j--;
+      } else if (d === 2) k--;
+      else j--;
+    }
+  }
+
+  // Per-scene heard-word span
+  const spans = speechScenes.map((_, si) => {
+    const [a, b] = ranges[si];
+    let js = [];
+    for (let k = a; k < b; k++) if (matchOf[k] >= 0) js.push(matchOf[k]);
+    if (js.length >= 3) {
+      const sorted = [...js].sort((x, y) => x - y);
+      const med = sorted[Math.floor(sorted.length / 2)];
+      js = js.filter((j) => Math.abs(j - med) <= 14);
+    }
+    const need = Math.max(1, Math.ceil((b - a) * 0.25));
+    if (!(b > a) || js.length < need) return null;
+    return { si: Math.min(...js), ei: Math.max(...js), hits: js.length, ntok: b - a };
+  });
+  const matchedTok = spans.reduce((acc, sp) => acc + (sp ? sp.hits : 0), 0);
+  if (matchedTok < Math.max(4, n * 0.3)) return null;
+
+  // Words nobody claimed between two neighbouring script lines belong to one of them: split at the strongest break.
+  for (let i = 0; i + 1 < speechScenes.length; i++) {
+    const a = spans[i];
+    const b = spans[i + 1];
+    if (!a || !b) continue;
+    if (pos.get(speechScenes[i + 1].screen) !== pos.get(speechScenes[i].screen) + 1) continue;
+    if (b.si <= a.ei) { b.si = Math.max(a.ei + 1, b.si); if (b.si > b.ei) b.ei = b.si; continue; }
+    const gapWords = b.si - a.ei - 1;
+    if (gapWords < 1 || gapWords > 14) continue;
+    let bestK = a.ei;
+    let bestScore = -1;
+    for (let k = a.ei; k < b.si; k++) {
+      const gap = A[k + 1].start - A[k].end;
+      const t = A[k].text.trim();
+      const punct = /[.?!]$/.test(t) ? 0.3 : (/[,;:]$/.test(t) ? 0.12 : 0);
+      const sc = gap + punct;
+      if (sc > bestScore) { bestScore = sc; bestK = k; }
+    }
+    a.ei = bestK;
+    b.si = bestK + 1;
+  }
+
+  // Scenes that were not heard at all: share the time between their matched neighbours by script length.
+  const raw = []; // {scene, ws, we}
+  const lastHeardEnd = A[A.length - 1].end;
+  let i = 0;
+  while (i < speechScenes.length) {
+    const sp = spans[i];
+    if (sp) {
+      raw.push({ scene: speechScenes[i], ws: A[sp.si].start, we: A[sp.ei].end, si: sp.si, ei: sp.ei });
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < speechScenes.length && !spans[j]) j++;
+    const prev = i > 0 ? spans[i - 1] : null;
+    const next = j < speechScenes.length ? spans[j] : null;
+    const group = [];
+    for (let g = i; g < j; g++) group.push(g);
+    const tA = prev ? A[prev.ei].end : 0;
+    const tB = next ? A[next.si].start : lastHeardEnd;
+    if (!next) {
+      // After the last heard line: only keep them if audible words remain, otherwise they sit beyond the recording.
+      const remaining = A.filter((w) => w.start >= tA - 0.01).length;
+      if (!prev || remaining < group.length) { i = j; continue; }
+    }
+    const weights = group.map((g) => Math.max(1, ranges[g][1] - ranges[g][0]));
+    const totalW = weights.reduce((x, y) => x + y, 0);
+    const span = Math.max(0.3 * group.length, tB - tA);
+    let cur = tA;
+    group.forEach((g, idx) => {
+      const d = span * (weights[idx] / totalW);
+      raw.push({ scene: speechScenes[g], ws: cur, we: cur + d, si: null, ei: null, guessed: true });
+      cur += d;
+    });
+    i = j;
+  }
+  if (!raw.length) return null;
+
+  const lead = (idx) => {
+    const st = A[idx].start;
+    if (idx <= 0) return Math.max(0, st - 0.16);
+    const gap = st - A[idx - 1].end;
+    return gap <= 0.04 ? st : st - Math.min(0.18, gap * 0.45);
+  };
+  const tail = (idx) => {
+    const en = A[idx].end;
+    if (idx + 1 >= A.length) return en + 0.35;
+    const gap = A[idx + 1].start - en;
+    return gap <= 0.06 ? en : en + Math.min(0.26, gap * 0.48);
+  };
+
+  // Silence snapping (same rules as _snap_to_silences)
+  const sil = [];
+  for (const pair of silences || []) {
+    if (!Array.isArray(pair) || pair.length < 2) continue;
+    const a = Number(pair[0]);
+    const b = Number(pair[1]);
+    if (b > a) sil.push([a, b]);
+  }
+  sil.sort((x, y) => x[0] - y[0]);
+  const msil = [];
+  for (const [s0, s1] of sil) {
+    const last = msil[msil.length - 1];
+    if (last && s0 - last[1] <= 0.09) last[1] = Math.max(last[1], s1);
+    else msil.push([s0, s1]);
+  }
+
+  const placed = new Map();
+  if (msil.length && raw.length) {
+    const gaps = [];
+    let lastEnd = 0;
+    for (let k = 0; k < raw.length - 1; k++) {
+      const wEnd = raw[k].we;
+      const wNext = raw[k + 1].ws;
+      let cands = msil.filter((s) => s[0] > lastEnd + 0.08 && wEnd - 0.35 <= s[0] && s[0] <= Math.max(wEnd, wNext) + 0.65 && Math.abs(s[1] - wNext) < 1.05);
+      if (!cands.length) {
+        cands = msil.filter((s) => s[0] > lastEnd + 0.08 && Math.abs(s[0] - wEnd) < 0.85 && wNext - 0.5 <= s[1] && s[1] <= Math.min(raw[k + 1].we - 0.2, wNext + 2.6));
+      }
+      if (cands.length && k + 2 < raw.length) {
+        const nEnd = raw[k + 1].we;
+        const nNext = raw[k + 2].ws;
+        const withNext = cands.filter((s) => msil.some((t) => t[0] > s[1] + 0.08 && Math.abs(t[0] - nEnd) < 0.95 && Math.abs(t[1] - nNext) < 1.05));
+        if (withNext.length) cands = withNext;
+      }
+      if (cands.length) {
+        let best = cands[0];
+        let bd = Infinity;
+        for (const s of cands) {
+          const d = Math.abs(s[0] - wEnd) + 0.6 * Math.abs(s[1] - wNext);
+          if (d < bd) { bd = d; best = s; }
+        }
+        gaps.push([best[0], best[1], true]);
+        lastEnd = best[1];
+      } else {
+        const g0 = Math.min(wEnd, wNext);
+        const g1 = Math.max(wEnd, wNext);
+        gaps.push([g0, Math.max(g0 + 0.08, g1), false]);
+        lastEnd = g1;
+      }
+    }
+    const out = [];
+    for (let k = 0; k < raw.length; k++) {
+      const r = raw[k];
+      let srcIn;
+      if (k === 0) {
+        srcIn = 0.0;
+      } else {
+        const prevOut = out[out.length - 1][1];
+        const [s0, s1] = gaps[k - 1];
+        const hasBreak = questionPauseSeconds(raw[k - 1].scene) > 0 || (pos.get(r.scene.screen) - pos.get(raw[k - 1].scene.screen) > 1);
+        if (hasBreak) {
+          const effWs = r.ws >= s0 + 0.25 ? r.ws : s1 - 0.16;
+          const onset = Math.min(effWs, s1 - 0.16);
+          srcIn = Math.max(prevOut, s0 + 0.18, Math.min(onset - 0.24, s1 - 0.38));
+        } else {
+          srcIn = prevOut;
+        }
+      }
+      let srcOut;
+      if (k < raw.length - 1) {
+        const nxt = raw[k + 1];
+        const [s0, s1, hasSil] = gaps[k];
+        const hasBreak = questionPauseSeconds(r.scene) > 0 || (pos.get(nxt.scene.screen) - pos.get(r.scene.screen) > 1);
+        const effWe = hasSil ? Math.max(s0 + 0.14, Math.min(r.we, s0 + 0.24)) : r.we;
+        const effNws = hasSil
+          ? (nxt.ws > s0 + 0.20 ? Math.min(nxt.ws, s1 - 0.12) : s1 - 0.14)
+          : nxt.ws;
+        if (hasBreak) {
+          srcOut = Math.min(s1 - 0.18, Math.max(effWe + 0.18, s0 + Math.min(0.40, 0.48 * (s1 - s0))));
+          srcOut = Math.max(s0 + 0.14, srcOut);
+        } else if (hasSil) {
+          const targetCut = effNws - 0.14;
+          const minCut = Math.max(s0 + 0.14, effWe + 0.06);
+          const maxCut = Math.max(minCut, s1 - 0.16);
+          srcOut = Math.max(minCut, Math.min(maxCut, targetCut));
+        } else {
+          srcOut = s0 + 0.5 * (s1 - s0);
+        }
+      } else {
+        srcOut = r.we + 0.35;
+      }
+      if (srcOut <= srcIn + 0.2) srcOut = srcIn + 0.3;
+      out.push([Math.round(srcIn * 1000) / 1000, Math.round(srcOut * 1000) / 1000]);
+    }
+    raw.forEach((r, k) => placed.set(r.scene.screen, out[k]));
+  } else {
+    raw.forEach((r, k) => {
+      const a = r.si != null ? lead(r.si) : r.ws;
+      const b = r.ei != null ? tail(r.ei) : r.we;
+      placed.set(r.scene.screen, [Math.round(a * 1000) / 1000, Math.round(Math.max(a + 0.3, b) * 1000) / 1000]);
+    });
+  }
+
+  // Continuous lines share one cut: never let a line start before the previous one ended, never leave a hole.
+  let prevOut = 0;
+  for (let k = 0; k < raw.length; k++) {
+    const scr = raw[k].scene.screen;
+    const [a, b] = placed.get(scr);
+    let ni = a;
+    if (k > 0 && ni < prevOut) ni = prevOut;
+    const no = Math.max(b, ni + 0.3);
+    placed.set(scr, [Math.round(ni * 1000) / 1000, Math.round(no * 1000) / 1000]);
+    prevOut = no;
+  }
+  const maxT = Number(voDuration) > 1 ? Number(voDuration) : Infinity;
+  for (const [scr, [a, b]] of placed) {
+    if (a >= maxT) placed.delete(scr);
+    else if (b > maxT) placed.set(scr, [a, Math.round(maxT * 1000) / 1000]);
+  }
+  return placed;
+}
+
 /** Flat 6s/8s sheet values are a template, not a measured narration clock. */
 function scriptDurationsAreMeasured(list) {
   const vals = (list || []).map((s) => Number(s && s.duration)).filter((d) => d > 0.4 && d < 180);
@@ -1231,6 +1564,20 @@ function pickMediaForScreen(screen, mediaItems, visualDirection = '') {
     }
   }
   return { video: vid, image: img };
+}
+
+function choosePrimaryMedia(video, image, visualType = '', visualDirection = '') {
+  const combined = `${visualType || ''} ${visualDirection || ''}`.toLowerCase();
+  const wantsVideo = /\b(video|documentary|cinematic|animation|anim|motion)\b/i.test(combined);
+  const wantsImage = /\b(illustration|flashcard|typography|still|drawing|2d|slide|image|photo|card|title)\b/i.test(combined);
+  if (wantsVideo && !wantsImage && video) return video;
+  if (wantsImage && !wantsVideo && image) return image;
+  if (video && image) {
+    if (wantsVideo) return video;
+    if (wantsImage) return image;
+    return video;
+  }
+  return video || image || null;
 }
 
 function mergeAdjacentSameMedia(clips) {
@@ -2520,8 +2867,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
       const sceneMap = new Map(scenes.map((s) => [normScreenId(s.screen), s]));
       for (const c of existingTl.clips) {
         const s = sceneMap.get(normScreenId(c.screen));
-        const picked = pickMediaForScreen(c.screen, media, s?.visual_direction || '');
-        const primary = picked.video || picked.image || null;
+        const picked = pickMediaForScreen(c.screen, media, s?.visual_direction || s?.visual_type || '');
+        const primary = choosePrimaryMedia(picked.video, picked.image, s?.visual_type, s?.visual_direction);
         if (primary) {
           c.media_id = primary.id;
           c.media_path = primary.path;
@@ -2701,7 +3048,32 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const alignedSpeechMap = new Map();
     let coveredSpokenCount = speechScenes.length;
 
-    if (voDur > 1 && speechScenes.length > 0) {
+    // English: place every line on the words Whisper actually heard (sent by the browser). No estimating.
+    let wordAlignUsed = false;
+    let heardWords = null;
+    if (!marathi && voDur > 1 && speechScenes.length > 0) {
+      const bodyWords = Array.isArray(req.body && req.body.words) ? req.body.words : null;
+      if (bodyWords && bodyWords.length >= 6) {
+        heardWords = bodyWords;
+        voMeta.words = bodyWords.map((w) => ({ text: String(w.text || ''), start: Number(w.start), end: Number(w.end) }));
+        voMeta.words_dur = voDur;
+        saveJson(pid, 'voiceover.json', voMeta);
+      } else if (Array.isArray(voMeta.words) && voMeta.words.length >= 6 && Math.abs(Number(voMeta.words_dur || 0) - voDur) <= 0.9) {
+        heardWords = voMeta.words;
+      }
+      if (heardWords) {
+        const byWords = alignSpeechByWords(speechScenes, scenes, heardWords, silences, voDur);
+        if (byWords && byWords.size >= Math.max(1, Math.floor(speechScenes.length * 0.5))) {
+          for (const [k, v] of byWords.entries()) alignedSpeechMap.set(k, v);
+          wordAlignUsed = true;
+          let lastIdx = 0;
+          speechScenes.forEach((sc, ix) => { if (alignedSpeechMap.has(sc.screen)) lastIdx = ix + 1; });
+          coveredSpokenCount = lastIdx;
+        }
+      }
+    }
+
+    if (!wordAlignUsed && voDur > 1 && speechScenes.length > 0) {
       const activeSlots = Array.isArray(voMeta.slots) && voMeta.slots.length > 1
         ? voMeta.slots.filter((sl) => Number(sl.duration || 0) > 0.5)
         : [];
@@ -2837,9 +3209,9 @@ app.post('/api/projects/:id/build', async (req, res) => {
 
       const dur = Math.round(clipDur * 1000) / 1000;
       const { video, image } = pickMediaForScreen(s.screen, media, s.visual_direction || s.visual_type);
-      // Prefer the animated scene video over static slide image when both exist for the same scene,
-      // and NEVER append a separate unaligned 10s silent "Action Video" clip that interrupts VO playback!
-      const primary = video || image;
+      // Strictly respect the script: if the script calls for an image/illustration/flashcard, use image;
+      // if it calls for video/cinematic documentary, use video. Never let a video hijack a flashcard.
+      const primary = choosePrimaryMedia(video, image, s.visual_type, s.visual_direction);
       const extraVid = null;
       const capTxt = captionForScene(s, isInst, marathi);
 
@@ -2918,7 +3290,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
 
       // End-of-line question pause hold: only insert synthetic silent holds when NO voiceover recording is present.
       // When a real VO recording is present (voDur > 1), the speaker's audio already contains the natural pauses!
-      const qPause = voDur > 1 ? 0 : questionPauseSeconds(s);
+      const qPause = (voDur > 1 && !wordAlignUsed) ? 0 : questionPauseSeconds(s);
       if (qPause > 0) {
         const pDur = Math.round(qPause * 1000) / 1000;
         rawClips.push({
@@ -3013,7 +3385,11 @@ app.post('/api/projects/:id/build', async (req, res) => {
         ? (measuredScriptClock
           ? 'Marathi engine: workbook scene times, snapped to the silence after each line. English Suno path was not used.'
           : 'Marathi engine: the sheet durations are a 6s/8s template, not a narration clock. Cuts follow Devanagari line length and the silence after each line. English Suno path was not used.')
-        : 'English engine: Suno poem clock + English word/silence alignment.',
+        : (wordAlignUsed
+          ? `English engine: every spoken line is placed on the words actually heard in the VO (${heardWords.length} words), cuts snapped to the silences. Class pauses come from the script.`
+          : (voDur > 1
+            ? 'English engine: ESTIMATED cuts (word timings from the VO are not ready yet). Wait for "Listening to VO" to finish, then press Auto-align again.'
+            : 'English engine: Suno poem clock + English word/silence alignment.')),
       srt_cues: srtCues,
       qa_issues: [],
       qa_summary: '',
@@ -3106,33 +3482,6 @@ function scanTimelineQA(plan, scenesInput) {
         missing_words: c.missing_words,
         message: `Image ${imgNo || c.screen} (${tc}): Missing text in image (present in VO): ${missStr} missing on card. Delete this scene & pull adjacent screen to cover, or replace the image.`,
       });
-    } else if (sc && plan && plan.align_engine !== 'marathi' && plan.language !== 'mr' && plan.language !== 'hi') {
-      const ost = String(sc.onscreen_text || '').trim();
-      const vo = String(sc.voiceover_text || c.vo_text || '').trim();
-      const ostHasBlank = /(\.{3,}|_{3,}|…{2,}|\[blank\])/i.test(ost);
-      const voHasBlank = /(\.{3,}|_{3,}|…{2,}|\[blank\])/i.test(vo) || (/pause/i.test(String(sc.voiceover_raw || '')) && ostHasBlank);
-      if (ostHasBlank && !voHasBlank && vo.length > 3) {
-        const ostWords = new Set((ost.toLowerCase().match(/[a-z]{2,}/g) || []));
-        const voWords = (vo.toLowerCase().match(/[a-z]{3,}/g) || []);
-        const missingInImg = voWords.filter((w) => !ostWords.has(w));
-        if (missingInImg.length > 0) {
-          c.missing_words = missingInImg.slice(0, 6);
-          const missStr = c.missing_words.map((w) => `"${w}"`).join(', ');
-          qaIssues.push({
-            kind: 'card_text',
-            severity: 'warning',
-            screen: c.screen,
-            image_no: imgNo,
-            time: Number(c.start || 0),
-            end: Number(c.end || 0),
-            timecode: tc,
-            expected: vo.slice(0, 180),
-            found: ost.slice(0, 180),
-            missing_words: c.missing_words,
-            message: `Image ${imgNo || c.screen} (${tc}): Card shows blank "${ost.slice(0, 90)}" while VO speaks answer (${missStr}). Delete scene & pull screen to cover, or replace image.`,
-          });
-        }
-      }
     }
   }
 
@@ -3166,23 +3515,6 @@ function scanTimelineQA(plan, scenesInput) {
         });
       }
     }
-  }
-
-  if (plan && plan.has_poem && !plan.poem_voiceover_path && plan.align_engine !== 'marathi' && plan.language !== 'mr') {
-    const pStart = Number(plan.poem_start_time || 0);
-    const pEnd = Number(plan.poem_end_time || pStart + 15);
-    qaIssues.push({
-      kind: 'poem_mismatch',
-      severity: 'warning',
-      screen: 'poem',
-      image_no: null,
-      time: pStart,
-      end: pEnd,
-      timecode: fmtTimecodeRange(pStart, pEnd),
-      expected: 'Poem / Suno master audio track',
-      found: 'No Poem VO uploaded',
-      message: 'Poem scenes detected in script, but Poem / Suno VO audio has not been uploaded yet.',
-    });
   }
 
   qaIssues.sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
