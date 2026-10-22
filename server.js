@@ -236,6 +236,9 @@ function metaPath(pid, name) {
 function saveJson(pid, name, data) {
   fs.writeFileSync(metaPath(pid, name), JSON.stringify(data, null, 2), 'utf-8');
 }
+function saveSrt(pid, name, text) {
+  fs.writeFileSync(metaPath(pid, name), String(text || ''), 'utf-8');
+}
 function loadJson(pid, name) {
   const p = metaPath(pid, name);
   if (!fs.existsSync(p)) return null;
@@ -827,6 +830,39 @@ function isIndicScript(scenes) {
   return Boolean(devMatches && devMatches.length >= 12);
 }
 
+/** Language dropdown is the switch. English never runs the Marathi engine. */
+function resolveAlignLanguage(requested, scenes) {
+  const raw = String(requested || '').trim().toLowerCase();
+  if (raw === 'en' || raw === 'english') {
+    return { language: 'en', marathi: false, engine: 'english' };
+  }
+  if (raw === 'mr' || raw === 'marathi' || raw === 'hi' || raw === 'hindi') {
+    return { language: raw === 'hi' || raw === 'hindi' ? 'hi' : 'mr', marathi: true, engine: 'marathi' };
+  }
+  // auto / en+mr / empty — Devanagari script picks Marathi, otherwise English
+  if (isIndicScript(scenes)) {
+    return { language: 'mr', marathi: true, engine: 'marathi' };
+  }
+  return { language: raw === 'auto' ? 'en' : (raw || 'en'), marathi: false, engine: 'english' };
+}
+
+function captionForScene(scene, isInst, marathi) {
+  const ostTxt = String(scene?.onscreen_text || '').trim();
+  const voTxt = String(scene?.voiceover_text || '').trim();
+  if (isInst) return '';
+  const ostIsPlaceholder = !ostTxt || /^[—–\-]+$/.test(ostTxt);
+  const isBlankPrompt = /\.{3,}|_{3,}|……/.test(ostTxt);
+  if (marathi) {
+    if (isBlankPrompt) return ostTxt;
+    return voTxt || (!ostIsPlaceholder ? ostTxt : '');
+  }
+  const preferOst = !ostIsPlaceholder && (
+    isBlankPrompt
+    || (ostTxt.length > voTxt.length && ostTxt.toLowerCase().startsWith(voTxt.toLowerCase()))
+  );
+  return preferOst ? ostTxt : (voTxt || ostTxt || '');
+}
+
 function isSpokenVo(scene, opts = {}) {
   if (!scene || isInstrumentalScene(scene)) return false;
   const text = String(scene.voiceover_text || '').trim();
@@ -1189,9 +1225,19 @@ function buildSrtCues(clips, planOpts = {}) {
   const poemStart = Number(planOpts.poem_start_time || 0);
   const poemEnd = Number(planOpts.poem_end_time || 0);
   const lyricStart = Number(planOpts.poem_lyric_start || 0);
+  const marathi = Boolean(
+    planOpts.marathi
+    || planOpts.align_engine === 'marathi'
+    || planOpts.language === 'mr'
+    || planOpts.language === 'hi',
+  );
+  const wrapW = marathi ? 38 : 44;
 
   for (const c of clips || []) {
-    const txt = cleanCaptionText(c.caption_text || c.vo_text || '');
+    const spokenRaw = String(c.vo_text || '');
+    const capRaw = String(c.caption_text || '');
+    const capIsPlaceholder = !capRaw.trim() || /^[—–\-]+$/.test(capRaw.trim());
+    const txt = cleanCaptionText(marathi ? (spokenRaw || (capIsPlaceholder ? '' : capRaw)) : (capIsPlaceholder ? spokenRaw : (capRaw || spokenRaw)));
     if (!txt) continue;
     let start = Number(c.start || 0);
     let end = Number(c.end || 0);
@@ -1212,7 +1258,8 @@ function buildSrtCues(clips, planOpts = {}) {
       end = Math.min(end, start + (Number(c.narration_out) - Number(c.narration_in)));
     } else if (inPoem) {
       if (lyricStart > start + 0.05) start = lyricStart;
-    } else if (!c.vo_text) {
+    } else if (marathi || !c.vo_text) {
+      // Marathi leftover cards after the VO ends must not get fake captions
       continue;
     }
     end = Math.min(end, start + Math.max(readingCap(txt), end - start));
@@ -1232,7 +1279,7 @@ function buildSrtCues(clips, planOpts = {}) {
             screen: c.screen,
             start: Math.round(cursor * 1000) / 1000,
             end: Math.round(segEnd * 1000) / 1000,
-            text: wrapTwoLines(sent),
+            text: wrapTwoLines(sent, wrapW),
           });
         }
         cursor = segEnd;
@@ -1243,7 +1290,7 @@ function buildSrtCues(clips, planOpts = {}) {
         screen: c.screen,
         start: Math.round(start * 1000) / 1000,
         end: Math.round(end * 1000) / 1000,
-        text: wrapTwoLines(txt),
+        text: wrapTwoLines(txt, wrapW),
       });
     }
   }
@@ -2262,7 +2309,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       if (voMeta.path) existingTl.voiceover_path = voMeta.path;
       if (poemVoMeta.path) existingTl.poem_voiceover_path = poemVoMeta.path;
       existingTl.srt_cues = buildSrtCues(existingTl.clips, existingTl);
-      saveJson(pid, 'subtitles.srt', formatSrt(existingTl.srt_cues));
+      saveSrt(pid, 'subtitles.srt', formatSrt(existingTl.srt_cues));
 
       const qaIssues = [];
       for (const c of existingTl.clips) {
@@ -2352,7 +2399,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const voDur = Number(voMeta.duration || 0);
     const poemVoDur = Number(poemVoMeta.duration || 0);
     const hasPoemVo = Boolean((poemVoMeta.path && fs.existsSync(poemVoMeta.path)) || poemVoDur > 0);
-    const indic = isIndicScript(scenes);
+    const langRes = resolveAlignLanguage(req.body && req.body.language, scenes);
+    const marathi = langRes.marathi;
+    // Marathi engine is a separate path. English Auto-align never uses Indic weights / poem-in-VO.
+    const indic = marathi;
     const silences = Array.isArray(voMeta.silences) && voMeta.silences.length
       ? voMeta.silences
       : [];
@@ -2372,7 +2422,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       const noEll = txt.replace(/\.{2,}/g, ' ');
       const words = (noEll.match(/[\w\u0900-\u097F']+/g) || []).length;
       const devChars = (txt.match(/[\u0900-\u097F]/g) || []).length;
-      const isDevanagari = devChars > 0;
+      const isDevanagari = marathi || devChars > 0;
       const sentBreaks = Math.max(0, (noEll.match(/[.!?।]/g) || []).length - 1);
       const sents = Math.max(1, (noEll.match(/[.!?।]+/g) || []).length);
       const commas = (noEll.match(/[,;:]/g) || []).length;
@@ -2380,11 +2430,11 @@ app.post('/api/projects/:id/build', async (req, res) => {
       const qp = questionPauseSeconds(s);
       const hasMidPause = qp === 0 && /\d+(?:\.\d+)?\s*-\s*second\s+pause/i.test(String(s.voiceover_raw || ''));
       const listItems = commas + sents;
-      const isWordBank = !isDevanagari && ((commas >= 3 && words <= commas * 2.5) || (sents >= 4 && words <= sents * 1.8));
+      const isWordBank = !marathi && !isDevanagari && ((commas >= 3 && words <= commas * 2.5) || (sents >= 4 && words <= sents * 1.8));
       let w;
-      if (isDevanagari && voDur > 1) {
-        // Pure phonetic character + word + sentence-break weight for Marathi/Hindi (ignores flat 8s Excel placeholders)
-        w = Math.max(1.2, devChars * 0.105 + words * 0.22 + sentBreaks * 0.25 + 0.25);
+      if ((marathi || isDevanagari) && voDur > 1) {
+        // Marathi/Hindi: Devanagari character + word + danda weights. Never the English word-bank / repeat-word clock.
+        w = Math.max(1.2, (devChars || words) * 0.105 + words * 0.22 + sentBreaks * 0.25 + 0.25);
       } else if (voDur > 1) {
         if (isWordBank) {
           w = Math.max(2.0, words * 0.34 + listItems * 0.56 + 0.25);
@@ -2532,8 +2582,11 @@ app.post('/api/projects/:id/build', async (req, res) => {
         narrOut = no;
         clipDur = Math.max(0.4, narrOut - narrIn);
       } else if (spoken) {
-        // Scene beyond partial VO coverage (waiting for VO 2+): use natural speaking duration
-        clipDur = Math.max(1.2, speechWeights.get(s.screen) || Number(s.duration) || 2.5);
+        // Scene beyond the recorded VO: do not invent spoken duration from English word-banks.
+        // Marathi leftover cards stay as short silent holds so the picture lane follows the VO clock.
+        clipDur = marathi
+          ? Math.max(1.0, Math.min(2.2, Number(s.duration) || 1.6))
+          : Math.max(1.2, speechWeights.get(s.screen) || Number(s.duration) || 2.5);
       } else {
         // Silent title / instrumental card: use script duration without advancing narrCursor
         clipDur = Math.max(0.4, Number(s.duration) || 2.0);
@@ -2545,11 +2598,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       // and NEVER append a separate unaligned 10s silent "Action Video" clip that interrupts VO playback!
       const primary = video || image;
       const extraVid = null;
-      const ostTxt = String(s.onscreen_text || '').trim();
-      const voTxt = String(s.voiceover_text || '').trim();
-      // Preserve fill-in-the-blank dots ('....') or full heading text ('For the Teacher :') from onscreen_text when present
-      const preferOst = ostTxt && (/\.{3,}|_{3,}|—/.test(ostTxt) || (ostTxt.length > voTxt.length && ostTxt.toLowerCase().startsWith(voTxt.toLowerCase())));
-      const capTxt = isInst ? '' : (preferOst ? ostTxt : (voTxt || ostTxt || ''));
+      const capTxt = captionForScene(s, isInst, marathi);
 
       if (!primary) {
         rawClips.push({
@@ -2660,13 +2709,17 @@ app.post('/api/projects/:id/build', async (req, res) => {
 
     const planOpts = {
       poem_voiceover_path: poemVoMeta.path || null,
-      has_poem: anyPoemScene || hasPoemVo,
+      // Marathi poems live in the narration VO unless a separate Poem file was uploaded.
+      has_poem: marathi && !hasPoemVo ? false : (anyPoemScene || hasPoemVo),
       poem_start_time: Math.round(poemStartTime * 1000) / 1000,
       poem_end_time: Math.round(poemEndTime * 1000) / 1000,
       poem_lyric_start: 0,
+      marathi,
+      language: langRes.language,
+      align_engine: langRes.engine,
     };
     const srtCues = buildSrtCues(clips, planOpts);
-    saveJson(pid, 'subtitles.srt', formatSrt(srtCues));
+    saveSrt(pid, 'subtitles.srt', formatSrt(srtCues));
 
     const narrationSegments = [];
     for (const c of clips) {
@@ -2706,7 +2759,11 @@ app.post('/api/projects/:id/build', async (req, res) => {
       narration_tail_out: tailClips.length ? Math.max(...tailClips.map((c) => Number(c.narration_out || 0))) : null,
       logo_path: logoMeta.path || null,
       logo_enabled: logoMeta.enabled !== false && Boolean(logoMeta.path),
-      language: (req.body && req.body.language) || 'en+mr',
+      language: langRes.language,
+      align_engine: langRes.engine,
+      align_note: marathi
+        ? 'Marathi engine: Devanagari character weights + FFmpeg silence cuts. Live Hostinger has no Whisper language pack — word-level matching is local Python only.'
+        : 'English engine: Suno poem clock + English word/silence alignment.',
       srt_cues: srtCues,
       qa_issues: [],
       qa_summary: '',
@@ -2720,12 +2777,23 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const qaIssues = scanTimelineQA(plan, scenes);
     const errCount = qaIssues.filter((i) => i.severity === 'error').length;
     const warnCount = qaIssues.filter((i) => i.severity === 'warning').length;
-    const partialVoNote = (voDur > 1 && coveredSpokenCount < speechScenes.length)
-      ? ` · VO covers Scenes 1–${coveredSpokenCount} (add VO 2 for Scenes ${coveredSpokenCount + 1}–${speechScenes.length})`
-      : '';
+    const uploadedVoSlots = Array.isArray(voMeta.slots)
+      ? voMeta.slots.filter((sl) => Number(sl.duration || 0) > 0.5).length
+      : (voDur > 1 ? 1 : 0);
+    const engineNote = marathi
+      ? ` · Marathi engine · ${silences.length} silence cuts · ${srtCues.length} SRT cues`
+      : ` · English engine · ${srtCues.length} SRT cues`;
+    let partialVoNote = '';
+    if (voDur > 1 && coveredSpokenCount < speechScenes.length) {
+      if (uploadedVoSlots >= 2) {
+        partialVoNote = ` · VO 1+2 cover Scenes 1–${coveredSpokenCount}; Scenes ${coveredSpokenCount + 1}–${speechScenes.length} have script lines but no remaining narration audio`;
+      } else {
+        partialVoNote = ` · VO covers Scenes 1–${coveredSpokenCount} (add VO ${uploadedVoSlots + 1} for Scenes ${coveredSpokenCount + 1}–${speechScenes.length})`;
+      }
+    }
     const qaSummary = qaIssues.length
-      ? `QA scan: ${errCount ? `${errCount} missing · ` : ''}${warnCount ? `${warnCount} mismatch thought bubble${warnCount !== 1 ? 's' : ''} · ` : ''}${clips.length} clips on timeline${partialVoNote}`
-      : `QA scan: no issues · ${clips.length} clips aligned${partialVoNote}`;
+      ? `QA scan: ${errCount ? `${errCount} missing · ` : ''}${warnCount ? `${warnCount} mismatch thought bubble${warnCount !== 1 ? 's' : ''} · ` : ''}${clips.length} clips on timeline${engineNote}${partialVoNote}`
+      : `QA scan: no issues · ${clips.length} clips aligned${engineNote}${partialVoNote}`;
     plan.qa_issues = qaIssues;
     plan.qa_summary = qaSummary;
 
@@ -2788,7 +2856,7 @@ function scanTimelineQA(plan, scenesInput) {
         missing_words: c.missing_words,
         message: `Image ${imgNo || c.screen} (${tc}): Missing text in image (present in VO): ${missStr} missing on card. Delete this scene & pull adjacent screen to cover, or replace the image.`,
       });
-    } else if (sc) {
+    } else if (sc && plan && plan.align_engine !== 'marathi' && plan.language !== 'mr' && plan.language !== 'hi') {
       const ost = String(sc.onscreen_text || '').trim();
       const vo = String(sc.voiceover_text || c.vo_text || '').trim();
       const ostHasBlank = /(\.{3,}|_{3,}|…{2,}|\[blank\])/i.test(ost);
@@ -2850,7 +2918,7 @@ function scanTimelineQA(plan, scenesInput) {
     }
   }
 
-  if (plan && plan.has_poem && !plan.poem_voiceover_path) {
+  if (plan && plan.has_poem && !plan.poem_voiceover_path && plan.align_engine !== 'marathi' && plan.language !== 'mr') {
     const pStart = Number(plan.poem_start_time || 0);
     const pEnd = Number(plan.poem_end_time || pStart + 15);
     qaIssues.push({
@@ -2941,6 +3009,10 @@ app.put('/api/projects/:id/timeline', async (req, res) => {
       }
     }
     await healTimelinePaths(pid, plan);
+    if (Array.isArray(plan.clips)) {
+      plan.srt_cues = buildSrtCues(plan.clips, plan);
+      saveSrt(pid, 'subtitles.srt', formatSrt(plan.srt_cues));
+    }
     const qaIssues = scanTimelineQA(plan, scenes);
     const errCount = qaIssues.filter((i) => i.severity === 'error').length;
     const warnCount = qaIssues.filter((i) => i.severity === 'warning').length;
@@ -3004,7 +3076,7 @@ app.get('/api/projects/:id/srt/download', (req, res) => {
   const pid = req.params.id;
   const plan = loadJson(pid, 'timeline.json');
   if (!plan) return res.status(404).send('No timeline');
-  const cues = plan.srt_cues && plan.srt_cues.length ? plan.srt_cues : buildSrtCues(plan.clips || [], plan);
+  const cues = buildSrtCues(plan.clips || [], plan);
   const srt = formatSrt(cues);
   const title = String(req.query.title || 'Subtitles').replace(/[^a-zA-Z0-9._ -]/g, '_');
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -3509,7 +3581,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
       }
 
       if (settings.export_srt_sidecar) {
-        const cues = plan.srt_cues && plan.srt_cues.length ? plan.srt_cues : buildSrtCues(plan.clips || [], plan);
+        const cues = buildSrtCues(plan.clips || [], plan);
         const srtSidecarPath = path.join(EXPORTS_DIR, pid, `${safeTitle}.srt`);
         fs.writeFileSync(srtSidecarPath, formatSrt(cues), 'utf-8');
       }
