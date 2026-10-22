@@ -1181,11 +1181,12 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
   const pos = new Map((allScenes || []).map((s, i) => [s.screen, i]));
   const A = [];
   for (const w of wordsIn) {
-    const tok = waNorm(w && w.text);
+    const rawTxt = w && (w.word != null ? w.word : w.text);
+    const tok = waNorm(rawTxt);
     const st = Number(w && w.start);
     const en = Number(w && w.end);
     if (!tok || !Number.isFinite(st)) continue;
-    A.push({ tok, text: String(w.text), start: st, end: Number.isFinite(en) && en >= st ? en : st + 0.1 });
+    A.push({ tok, text: String(rawTxt), start: st, end: Number.isFinite(en) && en >= st ? en : st + 0.1 });
   }
   A.sort((a, b) => a.start - b.start);
   if (A.length < 6) return null;
@@ -1320,15 +1321,15 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
 
   const lead = (idx) => {
     const st = A[idx].start;
-    if (idx <= 0) return Math.max(0, st - 0.16);
+    if (idx <= 0) return Math.max(0, st - 0.25);
     const gap = st - A[idx - 1].end;
-    return gap <= 0.04 ? st : st - Math.min(0.18, gap * 0.45);
+    return gap <= 0.04 ? st : st - Math.min(0.28, gap * 0.45);
   };
   const tail = (idx) => {
     const en = A[idx].end;
     if (idx + 1 >= A.length) return en + 0.35;
     const gap = A[idx + 1].start - en;
-    return gap <= 0.06 ? en : en + Math.min(0.26, gap * 0.48);
+    return gap <= 0.06 ? en : en + Math.min(0.28, gap * 0.48);
   };
 
   // Silence snapping (same rules as _snap_to_silences)
@@ -1411,12 +1412,18 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
           srcOut = Math.min(s1 - 0.18, Math.max(effWe + 0.18, s0 + Math.min(0.40, 0.48 * (s1 - s0))));
           srcOut = Math.max(s0 + 0.14, srcOut);
         } else if (hasSil) {
-          const targetCut = effNws - 0.14;
-          const minCut = Math.max(s0 + 0.14, effWe + 0.06);
-          const maxCut = Math.max(minCut, s1 - 0.16);
+          const gap = nxt.ws - r.we;
+          let targetCut;
+          if (gap >= 0.40) {
+            targetCut = Math.max(r.we + 0.15, Math.min(nxt.ws - 0.25, r.we + gap * 0.5));
+          } else {
+            targetCut = Math.max(r.we + 0.08, nxt.ws - 0.20);
+          }
+          const minCut = Math.max(s0 + 0.10, r.we + 0.06);
+          const maxCut = Math.max(minCut, s1 - 0.18);
           srcOut = Math.max(minCut, Math.min(maxCut, targetCut));
         } else {
-          srcOut = s0 + 0.5 * (s1 - s0);
+          srcOut = Math.max(r.we + 0.08, Math.min(nxt.ws - 0.18, s0 + 0.5 * (s1 - s0)));
         }
       } else {
         srcOut = r.we + 0.35;
@@ -3065,7 +3072,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
       const bodyWords = Array.isArray(req.body && req.body.words) ? req.body.words : null;
       if (bodyWords && bodyWords.length >= 6) {
         heardWords = bodyWords;
-        voMeta.words = bodyWords.map((w) => ({ text: String(w.text || ''), start: Number(w.start), end: Number(w.end) }));
+        voMeta.words = bodyWords.map((w) => {
+          const val = String(w && (w.word != null ? w.word : (w.text || '')));
+          return { word: val, text: val, start: Number(w.start), end: Number(w.end) };
+        });
         voMeta.words_dur = voDur;
         saveJson(pid, 'voiceover.json', voMeta);
       } else if (Array.isArray(voMeta.words) && voMeta.words.length >= 6 && Math.abs(Number(voMeta.words_dur || 0) - voDur) <= 0.9) {
@@ -3343,7 +3353,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       poem_lyric_start: 0,
       marathi,
       language: langRes.language,
-      align_engine: langRes.engine,
+      align_engine: wordAlignUsed ? 'english_word' : langRes.engine,
     };
     const srtCues = buildSrtCues(clips, planOpts);
     saveSrt(pid, 'subtitles.srt', formatSrt(srtCues));
@@ -3390,7 +3400,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       logo_transform: effLogo.transform,
       ignored_qa_keys: Array.isArray(existingTl?.ignored_qa_keys) ? existingTl.ignored_qa_keys : [],
       language: langRes.language,
-      align_engine: langRes.engine,
+      align_engine: wordAlignUsed ? 'english_word' : langRes.engine,
       align_note: marathi
         ? (measuredScriptClock
           ? 'Marathi engine: workbook scene times, snapped to the silence after each line. English Suno path was not used.'
