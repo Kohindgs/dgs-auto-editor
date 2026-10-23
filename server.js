@@ -3418,19 +3418,33 @@ app.post('/api/projects/:id/build', async (req, res) => {
         } else {
           byWords = alignSpeechByWords(speechScenes, scenes, heardWords, silences, voDur);
         }
-        if (byWords && byWords.size >= Math.max(1, Math.floor(speechScenes.length * 0.5))) {
+        // Require strong coverage — never accept a half-matched map and guess the rest.
+        const minCover = Math.max(1, Math.ceil(speechScenes.length * 0.85));
+        if (byWords && byWords.size >= minCover) {
           for (const [k, v] of byWords.entries()) alignedSpeechMap.set(k, v);
           wordAlignUsed = true;
           let lastIdx = 0;
           speechScenes.forEach((sc, ix) => { if (alignedSpeechMap.has(sc.screen)) lastIdx = ix + 1; });
           coveredSpokenCount = lastIdx;
+        } else if (byWords) {
+          console.warn(`[align] Word lock coverage too low: ${byWords.size}/${speechScenes.length} (need ≥${minCover})`);
         }
       }
     }
 
-    // Fill any spoken holes with silence/weight DP on the real VO clock — never a second tlCursor lane.
-    // Only when we already placed some lines (word-lock holes). Full empty map is handled below.
-    if (voDur > 1 && speechScenes.length > 0 && alignedSpeechMap.size > 0) {
+    // English + real VO: refuse silence/weight estimates when the client asked for heard words only.
+    const requireHeard = Boolean(req.body && req.body.require_heard_words) || (!marathi && voDur > 1 && Array.isArray(req.body?.words));
+    if (requireHeard && !marathi && voDur > 1 && speechScenes.length > 0 && !wordAlignUsed) {
+      return res.status(422).json({
+        detail:
+          'Refused estimate align — could not lock script lines to heard VO words. ' +
+          'Re-link VO 1+2, run Auto-align again after Whisper finishes hearing the full narration. No guessed cuts.',
+      });
+    }
+
+    // Fill small word-lock holes only between two heard neighbours (still on the VO clock).
+    // Skip entirely when requireHeard — unmapped lines stay off the VO lane rather than guessed.
+    if (!requireHeard && voDur > 1 && speechScenes.length > 0 && alignedSpeechMap.size > 0) {
       const missing = speechScenes.filter((s) => !alignedSpeechMap.has(s.screen));
       if (missing.length) {
         let i = 0;
