@@ -3344,8 +3344,80 @@ app.post('/api/projects/:id/build', async (req, res) => {
       } else if (Array.isArray(voMeta.words) && voMeta.words.length >= 6 && Math.abs(Number(voMeta.words_dur || 0) - voDur) <= 0.9) {
         heardWords = voMeta.words;
       }
+      // Reject partial Whisper (e.g. only VO 1 heard while meta duration is VO1+VO2) — that forces
+      // late scenes onto a fake tlCursor and desyncs from ~mid-story onward.
+      if (heardWords && heardWords.length >= 6) {
+        let maxWordT = 0;
+        for (const w of heardWords) maxWordT = Math.max(maxWordT, Number(w.end || w.start || 0));
+        if (voDur > 30 && maxWordT < voDur * 0.82) {
+          console.warn(`[align] Ignoring partial ASR words (last word ${maxWordT.toFixed(1)}s vs VO ${voDur.toFixed(1)}s)`);
+          heardWords = null;
+        }
+      }
       if (heardWords) {
-        const byWords = alignSpeechByWords(speechScenes, scenes, heardWords, silences, voDur);
+        const multiSlots = Array.isArray(voMeta.slots)
+          ? voMeta.slots.filter((sl) => Number(sl.duration || 0) > 0.5)
+          : [];
+        let byWords = null;
+        if (multiSlots.length > 1) {
+          // Per-slot word lock: story lines only match VO1 words, later sections only VO2+.
+          // Stops repeated phrases ("Death to the wolf") from yanking mid/late scenes onto the wrong file.
+          byWords = new Map();
+          const totalNarrW = speechScenes.reduce((acc, s) => acc + (speechWeights.get(s.screen) || 2.0), 0) || 1;
+          let startIdx = 0;
+          let cumSlotDur = 0;
+          for (let sIdx = 0; sIdx < multiSlots.length; sIdx++) {
+            const sl = multiSlots[sIdx];
+            const slStart = Number(sl.start_offset || 0);
+            const slEnd = Number(sl.end_offset || (slStart + Number(sl.duration || 0)));
+            cumSlotDur += Number(sl.duration || 0);
+            let endIdx = speechScenes.length;
+            if (sIdx < multiSlots.length - 1) {
+              const targetW = (cumSlotDur / Math.max(1, voDur)) * totalNarrW;
+              let bestIdx = startIdx + 1;
+              let runW = 0;
+              const sectionCandidates = [];
+              for (let k = 1; k <= speechScenes.length - (multiSlots.length - 1 - sIdx); k++) {
+                runW += speechWeights.get(speechScenes[k - 1].screen) || 2.0;
+                if (k <= startIdx) continue;
+                const curSec = String(speechScenes[k - 1].section || '').split('|')[0].trim().toLowerCase();
+                const nextSec = k < speechScenes.length
+                  ? String(speechScenes[k].section || '').split('|')[0].trim().toLowerCase()
+                  : '';
+                if (curSec && nextSec && curSec !== nextSec) {
+                  const diff = Math.abs(runW - targetW);
+                  if (diff / Math.max(1, targetW) <= 0.35) sectionCandidates.push({ k, diff });
+                }
+              }
+              if (sectionCandidates.length) {
+                sectionCandidates.sort((a, b) => a.diff - b.diff);
+                bestIdx = sectionCandidates[0].k;
+              } else {
+                runW = 0;
+                let bestScore = Infinity;
+                for (let k = 1; k <= speechScenes.length - (multiSlots.length - 1 - sIdx); k++) {
+                  runW += speechWeights.get(speechScenes[k - 1].screen) || 2.0;
+                  if (k <= startIdx) continue;
+                  const diff = Math.abs(runW - targetW);
+                  if (diff < bestScore) { bestScore = diff; bestIdx = k; }
+                }
+              }
+              endIdx = bestIdx;
+            }
+            const subScenes = speechScenes.slice(startIdx, endIdx);
+            const slotWords = heardWords.filter((w) => {
+              const t = Number(w.start);
+              return Number.isFinite(t) && t >= slStart - 0.35 && t <= slEnd + 0.35;
+            });
+            if (subScenes.length && slotWords.length >= 4) {
+              const subMap = alignSpeechByWords(subScenes, scenes, slotWords, silences, slEnd);
+              if (subMap) for (const [k, v] of subMap.entries()) byWords.set(k, v);
+            }
+            startIdx = endIdx;
+          }
+        } else {
+          byWords = alignSpeechByWords(speechScenes, scenes, heardWords, silences, voDur);
+        }
         if (byWords && byWords.size >= Math.max(1, Math.floor(speechScenes.length * 0.5))) {
           for (const [k, v] of byWords.entries()) alignedSpeechMap.set(k, v);
           wordAlignUsed = true;
@@ -3353,6 +3425,35 @@ app.post('/api/projects/:id/build', async (req, res) => {
           speechScenes.forEach((sc, ix) => { if (alignedSpeechMap.has(sc.screen)) lastIdx = ix + 1; });
           coveredSpokenCount = lastIdx;
         }
+      }
+    }
+
+    // Fill any spoken holes with silence/weight DP on the real VO clock — never a second tlCursor lane.
+    // Only when we already placed some lines (word-lock holes). Full empty map is handled below.
+    if (voDur > 1 && speechScenes.length > 0 && alignedSpeechMap.size > 0) {
+      const missing = speechScenes.filter((s) => !alignedSpeechMap.has(s.screen));
+      if (missing.length) {
+        let i = 0;
+        while (i < speechScenes.length) {
+          if (alignedSpeechMap.has(speechScenes[i].screen)) { i++; continue; }
+          let j = i;
+          while (j < speechScenes.length && !alignedSpeechMap.has(speechScenes[j].screen)) j++;
+          const gapScenes = speechScenes.slice(i, j);
+          const prev = i > 0 ? alignedSpeechMap.get(speechScenes[i - 1].screen) : null;
+          const next = j < speechScenes.length ? alignedSpeechMap.get(speechScenes[j].screen) : null;
+          const gapStart = prev ? Number(prev[1]) : 0;
+          const gapEnd = next ? Number(next[0]) : voDur;
+          if (gapEnd - gapStart >= 0.45 * gapScenes.length) {
+            const subMap = (marathi ? alignMarathiBySpeech : alignScenesWithGlobalDP)(
+              gapScenes, speechWeights, gapStart, gapEnd, silences, indic,
+            );
+            for (const [k, v] of subMap.entries()) alignedSpeechMap.set(k, v);
+          }
+          i = j;
+        }
+        let lastIdx = 0;
+        speechScenes.forEach((sc, ix) => { if (alignedSpeechMap.has(sc.screen)) lastIdx = ix + 1; });
+        coveredSpokenCount = Math.max(coveredSpokenCount, lastIdx);
       }
     }
 
@@ -3570,21 +3671,33 @@ app.post('/api/projects/:id/build', async (req, res) => {
         // Absolute picture start on the VO clock (brain).
         s.__picStart = picStart;
       } else if (spoken) {
-        // Scene beyond the recorded VO: do not invent spoken duration from English word-banks.
-        // Marathi leftover cards stay as short silent holds so the picture lane follows the VO clock.
-        clipDur = marathi
-          ? Math.max(1.0, Math.min(2.2, Number(s.duration) || 1.6))
-          : Math.max(1.2, speechWeights.get(s.screen) || Number(s.duration) || 2.5);
+        // Beyond / outside the VO map: never invent a second packed clock for English spoken lines.
+        // That was forcing mid-chapter desync (e.g. from Scene 27) when word-lock missed a hole.
+        if (voDur > 1 && !marathi) {
+          narrIn = null;
+          narrOut = null;
+          clipDur = 0.55;
+        } else {
+          clipDur = marathi
+            ? Math.max(1.0, Math.min(2.2, Number(s.duration) || 1.6))
+            : Math.max(1.2, speechWeights.get(s.screen) || Number(s.duration) || 2.5);
+        }
       } else {
         // Silent title / instrumental card: use script duration without advancing narrCursor
         clipDur = Math.max(0.4, Number(s.duration) || 2.0);
       }
 
-      // Absolute VO clock for word-aligned speech; otherwise sequential cursor.
+      // Absolute VO clock for spoken lines; silent cards may use sequential cursor AFTER the VO.
       const voLocked = spoken && narrIn != null && Number.isFinite(narrIn);
-      const clipStart = voLocked
-        ? Number(s.__picStart != null ? s.__picStart : narrIn)
-        : tlCursor;
+      let clipStart;
+      if (voLocked) {
+        clipStart = Number(s.__picStart != null ? s.__picStart : narrIn);
+      } else if (spoken && voDur > 1 && !marathi) {
+        // Park unmapped English spoken cards after the VO ends — do not weave them into the VO clock.
+        clipStart = Math.max(tlCursor, voDur + 0.05);
+      } else {
+        clipStart = tlCursor;
+      }
       const dur = Math.round(clipDur * 1000) / 1000;
       const clipEnd = Math.round((clipStart + dur) * 1000) / 1000;
       const { video, image } = pickMediaForScreen(s.screen, media, s.visual_direction || s.visual_type, s);
