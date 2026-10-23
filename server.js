@@ -1193,10 +1193,104 @@ const VoAlignBrain = {
     if (picEnd < a0 + minDur) picEnd = a0 + Math.max(minDur, a1 - a0);
     return [Math.round(a0 * 1000) / 1000, Math.round(picEnd * 1000) / 1000];
   },
-  lockPoemScenes(poemScenes, poemOrigin, poemDuration, durFn) {
+  /**
+   * Place poem lyric cards on the poem VO clock.
+   * Prefer heard Whisper words (relative to poem file 0); otherwise scale durations (estimate).
+   */
+  lockPoemScenes(poemScenes, poemOrigin, poemDuration, durFn, poemWords, allScenes) {
     const origin = Number(poemOrigin || 0);
     const fileEnd = origin + Number(poemDuration || 0);
     if (!poemScenes.length || poemDuration <= 0.4) return [];
+    const words = Array.isArray(poemWords) ? poemWords : [];
+
+    // 1) Match lyric script lines to heard poem words (same engine as narration).
+    if (words.length >= 6) {
+      const byWords = alignSpeechByWords(
+        poemScenes,
+        allScenes || poemScenes,
+        words,
+        [],
+        Number(poemDuration),
+      );
+      const minCover = Math.max(1, Math.ceil(poemScenes.length * 0.7));
+      if (byWords && byWords.size >= minCover) {
+        const out = [];
+        for (let i = 0; i < poemScenes.length; i++) {
+          const sc = poemScenes[i];
+          const span = byWords.get(sc.screen);
+          if (!span) continue;
+          const ni = Number(span[0]);
+          const no = Number(span[1]);
+          let nextIn = null;
+          for (let j = i + 1; j < poemScenes.length; j++) {
+            const nxt = byWords.get(poemScenes[j].screen);
+            if (nxt) { nextIn = Number(nxt[0]); break; }
+          }
+          const [picIn, picOut] = this.lockPictureToAudio(ni, no, nextIn);
+          out.push({
+            screen: sc.screen,
+            start: Math.round((origin + picIn) * 1000) / 1000,
+            end: Math.round((origin + picOut) * 1000) / 1000,
+            narration_in: Math.round((origin + ni) * 1000) / 1000,
+            narration_out: Math.round((origin + no) * 1000) / 1000,
+            engine: 'poem_word',
+          });
+        }
+        if (out.length) {
+          out[out.length - 1].end = Math.round(Math.max(Number(out[out.length - 1].end), fileEnd) * 1000) / 1000;
+          out[out.length - 1].narration_out = Math.round(
+            Math.max(Number(out[out.length - 1].narration_out), fileEnd) * 1000,
+          ) / 1000;
+        }
+        return out;
+      }
+      // 2) Even partition of heard words across lyric cards (still heard — not script-duration guess).
+      const spans = words
+        .map((w) => {
+          const a = Number(w.start);
+          const b = Number(w.end != null ? w.end : a + 0.08);
+          return Number.isFinite(a) ? [a, Math.max(a + 0.05, b)] : null;
+        })
+        .filter(Boolean);
+      if (spans.length >= 6) {
+        const n = poemScenes.length;
+        const lastEnd = spans[spans.length - 1][1];
+        const out = [];
+        for (let i = 0; i < n; i++) {
+          let i0 = Math.round(i * (spans.length / n));
+          let i1 = Math.round((i + 1) * (spans.length / n)) - 1;
+          i0 = Math.max(0, Math.min(i0, spans.length - 1));
+          i1 = Math.max(i0, Math.min(i1, spans.length - 1));
+          const aIn = spans[i0][0];
+          const aOut = spans[i1][1];
+          let nxtIn = null;
+          if (i + 1 < n) {
+            let j0 = Math.round((i + 1) * (spans.length / n));
+            j0 = Math.max(0, Math.min(j0, spans.length - 1));
+            nxtIn = spans[j0][0];
+          }
+          let [picIn, picOut] = this.lockPictureToAudio(aIn, aOut, nxtIn);
+          if (i + 1 >= n) picOut = Math.max(picOut, lastEnd);
+          out.push({
+            screen: poemScenes[i].screen,
+            start: Math.round((origin + picIn) * 1000) / 1000,
+            end: Math.round((origin + picOut) * 1000) / 1000,
+            narration_in: Math.round((origin + aIn) * 1000) / 1000,
+            narration_out: Math.round((origin + aOut) * 1000) / 1000,
+            engine: 'poem_word',
+          });
+        }
+        if (out.length) {
+          out[out.length - 1].end = Math.round(Math.max(Number(out[out.length - 1].end), fileEnd) * 1000) / 1000;
+          out[out.length - 1].narration_out = Math.round(
+            Math.max(Number(out[out.length - 1].narration_out), fileEnd) * 1000,
+          ) / 1000;
+        }
+        return out;
+      }
+    }
+
+    // 3) Estimate fallback: scale script durations to fill the poem file.
     const raw = poemScenes.map((sc) => Math.max(0.4, Number(durFn(sc) || 2)));
     const rawSum = raw.reduce((a, b) => a + b, 0) || 1;
     const scale = Number(poemDuration) / rawSum;
@@ -1213,6 +1307,7 @@ const VoAlignBrain = {
         end,
         narration_in: start,
         narration_out: end,
+        engine: 'estimate',
       });
       cursor = end;
     });
@@ -3442,6 +3537,51 @@ app.post('/api/projects/:id/build', async (req, res) => {
       });
     }
 
+    // Poem VO words (browser Whisper on the poem file). Times are relative to poem file 0.
+    let poemHeardWords = null;
+    let poemWordAlignUsed = false;
+    const poemWordsBody = Array.isArray(req.body && req.body.poem_words) ? req.body.poem_words : null;
+    if (!marathi && hasPoemVo && poemVoDur > 0.4) {
+      if (poemWordsBody && poemWordsBody.length >= 6) {
+        poemHeardWords = poemWordsBody.map((w) => {
+          const val = String(w && (w.word != null ? w.word : (w.text || '')));
+          return { word: val, text: val, start: Number(w.start), end: Number(w.end) };
+        });
+        poemVoMeta.words = poemHeardWords;
+        poemVoMeta.words_dur = poemVoDur;
+        saveJson(pid, 'poem_voiceover.json', poemVoMeta);
+      } else if (
+        Array.isArray(poemVoMeta.words) &&
+        poemVoMeta.words.length >= 6 &&
+        Math.abs(Number(poemVoMeta.words_dur || 0) - poemVoDur) <= 0.9
+      ) {
+        poemHeardWords = poemVoMeta.words;
+      }
+      if (poemHeardWords && poemHeardWords.length >= 6) {
+        let maxPoemT = 0;
+        for (const w of poemHeardWords) maxPoemT = Math.max(maxPoemT, Number(w.end || w.start || 0));
+        if (poemVoDur > 20 && maxPoemT < poemVoDur * 0.55) {
+          // Poems often have instrumental intro/outro — allow earlier cutoff than narration,
+          // but reject if Whisper barely heard anything relative to file length.
+          console.warn(
+            `[align] Ignoring partial poem ASR (last word ${maxPoemT.toFixed(1)}s vs poem ${poemVoDur.toFixed(1)}s)`,
+          );
+          poemHeardWords = null;
+        }
+      }
+    }
+    const poemTrackForRequire = scenes.filter((x) => (hasPoemVo || !indic) && onPoemTrack(x));
+    const requireHeardPoem =
+      Boolean(req.body && req.body.require_heard_poem) ||
+      (!marathi && hasPoemVo && poemVoDur > 0.4 && Array.isArray(req.body?.poem_words));
+    if (requireHeardPoem && !marathi && hasPoemVo && poemTrackForRequire.length > 0 && !(poemHeardWords && poemHeardWords.length >= 6)) {
+      return res.status(422).json({
+        detail:
+          'Refused poem estimate align — could not hear Poem VO words. ' +
+          'Re-link the Poem VO, run Auto-align again after Whisper finishes hearing the poem. No guessed poem cuts.',
+      });
+    }
+
     // Fill small word-lock holes only between two heard neighbours (still on the VO clock).
     // Skip entirely when requireHeard — unmapped lines stay off the VO lane rather than guessed.
     if (!requireHeard && voDur > 1 && speechScenes.length > 0 && alignedSpeechMap.size > 0) {
@@ -3629,6 +3769,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
             poemStartTime,
             poemVoDur,
             (sc) => poemRawDurs.get(sc.screen) || Number(sc.duration) || (poemVoDur / Math.max(1, run.length)),
+            poemHeardWords,
+            scenes,
           )
           : run.map((sc) => {
             const base = poemRawDurs.get(sc.screen) || (poemVoDur > 0 ? poemVoDur / Math.max(1, run.length) : 6.0);
@@ -3636,8 +3778,23 @@ app.post('/api/projects/:id/build', async (req, res) => {
             const start = Math.round(tlCursor * 1000) / 1000;
             const end = Math.round((tlCursor + d) * 1000) / 1000;
             tlCursor = end;
-            return { screen: sc.screen, start, end, narration_in: start, narration_out: end };
+            return { screen: sc.screen, start, end, narration_in: start, narration_out: end, engine: 'estimate' };
           });
+        if (
+          requireHeardPoem &&
+          (!lockedPoem.length || lockedPoem.some((lr) => lr.engine !== 'poem_word'))
+        ) {
+          return res.status(422).json({
+            detail:
+              'Refused poem estimate align — heard Poem VO words but could not lock lyric cards to them. ' +
+              'Re-link Poem VO and retry Auto-align. No guessed poem cuts.',
+          });
+        }
+        if (lockedPoem.length && lockedPoem.every((lr) => lr.engine === 'poem_word')) {
+          poemWordAlignUsed = true;
+        } else if (lockedPoem.some((lr) => lr.engine === 'poem_word')) {
+          poemWordAlignUsed = true;
+        }
         for (const lr of lockedPoem) {
           const sc = run.find((x) => x.screen === lr.screen) || run[0];
           const isInstP = isInstrumentalScene(sc);
@@ -3903,12 +4060,16 @@ app.post('/api/projects/:id/build', async (req, res) => {
       ignored_qa_keys: Array.isArray(existingTl?.ignored_qa_keys) ? existingTl.ignored_qa_keys : [],
       language: langRes.language,
       align_engine: wordAlignUsed ? 'english_word' : langRes.engine,
+      poem_align_engine: poemWordAlignUsed ? 'poem_word' : (hasPoemVo && poemVoDur > 0.4 ? 'estimate' : null),
       align_note: marathi
         ? (measuredScriptClock
           ? 'Marathi engine: workbook scene times, snapped to the silence after each line. English Suno path was not used.'
           : 'Marathi engine: the sheet durations are a 6s/8s template, not a narration clock. Cuts follow Devanagari line length and the silence after each line. English Suno path was not used.')
         : (wordAlignUsed
           ? `English engine: every spoken line is placed on the words actually heard in the VO (${heardWords.length} words), cuts snapped to the silences. Class pauses come from the script.`
+            + (poemWordAlignUsed
+              ? ` Poem lyric cards locked to heard Poem VO words (${poemHeardWords.length} words).`
+              : (hasPoemVo ? ' Poem VO present but lyric cards used duration scale (no poem words heard).' : ''))
           : (voDur > 1
             ? 'English engine: ESTIMATED cuts (word timings from the VO are not ready yet). Wait for "Listening to VO" to finish, then press Auto-align again.'
             : 'English engine: Suno poem clock + English word/silence alignment.')),
@@ -3919,6 +4080,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
         has_poem: planOpts.has_poem,
         poem_start_time: planOpts.poem_start_time,
         poem_uploaded: Boolean(poemVoMeta.path),
+        poem_align_engine: poemWordAlignUsed ? 'poem_word' : (hasPoemVo && poemVoDur > 0.4 ? 'estimate' : null),
       },
     };
 
@@ -3948,10 +4110,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
       ? voMeta.slots.filter((sl) => Number(sl.duration || 0) > 0.5).length
       : (voDur > 1 ? 1 : 0);
     const engineNote = wordAlignUsed
-      ? ` · VO-word lock · ${srtCues.length} SRT cues`
+      ? ` · VO-word lock${poemWordAlignUsed ? ' · Poem-word lock' : ''} · ${srtCues.length} SRT cues`
       : marathi
         ? ` · Marathi engine · ${silences.length} silence cuts · ${srtCues.length} SRT cues`
-        : ` · English engine · ${srtCues.length} SRT cues`;
+        : ` · English engine${poemWordAlignUsed ? ' · Poem-word lock' : ''} · ${srtCues.length} SRT cues`;
     let partialVoNote = '';
     if (voDur > 1 && coveredSpokenCount < speechScenes.length) {
       if (uploadedVoSlots >= 2) {
