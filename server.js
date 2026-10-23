@@ -92,6 +92,52 @@ function normalizeLogoTransform(raw) {
   };
 }
 
+const DEFAULT_POEM_OVERLAY_STYLE = {
+  enabled: true,
+  locked: false,
+  font_family: 'Poppins',
+  font_size_px: 28,
+  preset_style: 'badge_pill',
+  text_color: '#ffffff',
+  bg_color: '#0f172a',
+  bg_opacity: 0.88,
+  border_color: '#38bdf8',
+  border_width: 2,
+  border_radius: 24,
+  box_shadow: true,
+  text_align: 'center',
+  x_pct: 10,
+  y_pct: 72,
+  w_pct: 80,
+  h_pct: 20,
+};
+
+function normalizePoemOverlayStyle(raw) {
+  if (!raw || typeof raw !== 'object') return { ...DEFAULT_POEM_OVERLAY_STYLE };
+  const validPresets = ['badge_pill', 'neon_glow', 'karaoke_box', 'pastel_banner', 'comic_pop', 'clean_subtitle'];
+  const presetKey = validPresets.includes(raw.preset_style) ? raw.preset_style : DEFAULT_POEM_OVERLAY_STYLE.preset_style;
+  const num = (v, min, max, d) => (Number.isFinite(Number(v)) ? Math.max(min, Math.min(max, Number(v))) : d);
+  return {
+    enabled: raw.enabled !== false,
+    locked: Boolean(raw.locked),
+    font_family: String(raw.font_family || DEFAULT_POEM_OVERLAY_STYLE.font_family).slice(0, 80),
+    font_size_px: num(raw.font_size_px, 12, 72, DEFAULT_POEM_OVERLAY_STYLE.font_size_px),
+    preset_style: presetKey,
+    text_color: String(raw.text_color || DEFAULT_POEM_OVERLAY_STYLE.text_color).slice(0, 32),
+    bg_color: String(raw.bg_color || DEFAULT_POEM_OVERLAY_STYLE.bg_color).slice(0, 32),
+    bg_opacity: num(raw.bg_opacity, 0, 1, DEFAULT_POEM_OVERLAY_STYLE.bg_opacity),
+    border_color: String(raw.border_color || DEFAULT_POEM_OVERLAY_STYLE.border_color).slice(0, 32),
+    border_width: num(raw.border_width, 0, 16, DEFAULT_POEM_OVERLAY_STYLE.border_width),
+    border_radius: num(raw.border_radius, 0, 64, DEFAULT_POEM_OVERLAY_STYLE.border_radius),
+    box_shadow: raw.box_shadow !== false,
+    text_align: raw.text_align === 'left' || raw.text_align === 'right' ? raw.text_align : 'center',
+    x_pct: num(raw.x_pct, 0, 95, DEFAULT_POEM_OVERLAY_STYLE.x_pct),
+    y_pct: num(raw.y_pct, 0, 95, DEFAULT_POEM_OVERLAY_STYLE.y_pct),
+    w_pct: num(raw.w_pct, 10, 100, DEFAULT_POEM_OVERLAY_STYLE.w_pct),
+    h_pct: num(raw.h_pct, 5, 90, DEFAULT_POEM_OVERLAY_STYLE.h_pct),
+  };
+}
+
 function getEffectiveLogoMeta(pid, plan = null) {
   const meta = loadJson(pid, 'logo.json') || {};
   const enabled =
@@ -3428,6 +3474,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       logo_path: effLogo.path || null,
       logo_enabled: effLogo.enabled,
       logo_transform: effLogo.transform,
+      poem_overlay: existingTl?.poem_overlay ? normalizePoemOverlayStyle(existingTl.poem_overlay) : normalizePoemOverlayStyle(),
       ignored_qa_keys: Array.isArray(existingTl?.ignored_qa_keys) ? existingTl.ignored_qa_keys : [],
       language: langRes.language,
       align_engine: wordAlignUsed ? 'english_word' : langRes.engine,
@@ -3647,6 +3694,11 @@ app.put('/api/projects/:id/timeline', async (req, res) => {
     curLogoMeta.enabled = plan.logo_enabled !== false;
     curLogoMeta.transform = normalizeLogoTransform(plan.logo_transform || curLogoMeta.transform);
     saveJson(pid, 'logo.json', curLogoMeta);
+    if (plan.poem_overlay) {
+      plan.poem_overlay = normalizePoemOverlayStyle(plan.poem_overlay);
+    } else if (existing.poem_overlay) {
+      plan.poem_overlay = normalizePoemOverlayStyle(existing.poem_overlay);
+    }
     if (!Array.isArray(plan.ignored_qa_keys) && Array.isArray(existing.ignored_qa_keys)) {
       plan.ignored_qa_keys = existing.ignored_qa_keys;
     }
