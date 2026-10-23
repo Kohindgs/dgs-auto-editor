@@ -1194,6 +1194,30 @@ const VoAlignBrain = {
     return [Math.round(a0 * 1000) / 1000, Math.round(picEnd * 1000) / 1000];
   },
   /**
+   * Keep word-lock times in SCRIPT order. If Whisper matched a late scene (e.g. S58)
+   * onto early VO words, relocate that span after the previous script scene so the
+   * alignment queue stays S1→S2→S3… and cards are not skipped/shuffled.
+   */
+  enforceMonotonicSpeechMap(speechScenes, alignedMap) {
+    if (!alignedMap || !speechScenes || !speechScenes.length) return alignedMap;
+    let cursor = 0;
+    for (const sc of speechScenes) {
+      const span = alignedMap.get(sc.screen);
+      if (!span) continue;
+      let a = Number(span[0]);
+      let b = Number(span[1]);
+      if (!(Number.isFinite(a) && Number.isFinite(b)) || b <= a) continue;
+      const dur = Math.max(0.35, b - a);
+      if (a < cursor - 0.05) {
+        a = Math.round(cursor * 1000) / 1000;
+        b = Math.round((a + dur) * 1000) / 1000;
+        alignedMap.set(sc.screen, [a, b]);
+      }
+      cursor = Math.max(cursor, b);
+    }
+    return alignedMap;
+  },
+  /**
    * Place poem lyric cards on the poem VO clock.
    * Prefer heard Whisper words (relative to poem file 0); otherwise scale durations (estimate).
    */
@@ -3545,6 +3569,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
         const minCover = Math.max(1, Math.ceil(speechScenes.length * 0.85));
         if (byWords && byWords.size >= minCover) {
           for (const [k, v] of byWords.entries()) alignedSpeechMap.set(k, v);
+          // Script order wins: never let a late scene (e.g. S58) land at VO 00:00 ahead of S2.
+          VoAlignBrain.enforceMonotonicSpeechMap(speechScenes, alignedSpeechMap);
           wordAlignUsed = true;
           let lastIdx = 0;
           speechScenes.forEach((sc, ix) => { if (alignedSpeechMap.has(sc.screen)) lastIdx = ix + 1; });
@@ -3936,21 +3962,15 @@ app.post('/api/projects/:id/build', async (req, res) => {
         tlCursor = Math.max(tlCursor, clipEnd);
       } else {
         const srcDur = primary.kind === 'video' ? Number(primary.duration || dur) : dur;
-        // Cut timeline to VO; stretch longer video takes into the spoken window (full take plays with VO).
+        // Cut timeline to VO at 1× — never speed up videos (stretch made takes look "fast").
         let fitMode = 'hold';
         let sourceOut = dur;
         if (primary.kind === 'image') {
           fitMode = 'hold';
           sourceOut = dur;
-        } else if (srcDur > dur + 0.12) {
-          fitMode = 'stretch';
-          sourceOut = Math.round(srcDur * 1000) / 1000;
-        } else if (srcDur < dur - 0.12) {
-          fitMode = marathi ? 'hold' : 'passthrough';
-          sourceOut = Math.round(Math.max(0.2, srcDur) * 1000) / 1000;
         } else {
           fitMode = 'trim';
-          sourceOut = Math.round(Math.min(dur, srcDur) * 1000) / 1000;
+          sourceOut = Math.round(Math.min(Math.max(0.2, srcDur), dur) * 1000) / 1000;
         }
         rawClips.push({
           screen: s.screen,
