@@ -1171,6 +1171,56 @@ function alignScenesWithGlobalDP(segScenes, speechWeights, segStart, segEnd, sil
 }
 
 // ===========================================================================
+// VO-Align Brain — smart cut methodology for EVERY chapter (narration + poem).
+// Same rules as backend/app/vo_align_brain.py:
+//   Picture/video/SRT live on the SAME clock as the audio that is playing.
+//   Never invent a second packed timeline for spoken/sung lines.
+//   Never inject synthetic class-pause holds when a real VO already has silence.
+// ===========================================================================
+const VoAlignBrain = {
+  hasRealVo(duration) {
+    return Number(duration || 0) > 1;
+  },
+  shouldInjectClassPauses(voDuration) {
+    return !this.hasRealVo(voDuration);
+  },
+  lockPictureToAudio(audioIn, audioOut, nextAudioIn, minDur = 0.2) {
+    const a0 = Number(audioIn);
+    const a1 = Number(audioOut);
+    let picEnd = (nextAudioIn != null && Number(nextAudioIn) > a0 + minDur)
+      ? Number(nextAudioIn)
+      : a1;
+    if (picEnd < a0 + minDur) picEnd = a0 + Math.max(minDur, a1 - a0);
+    return [Math.round(a0 * 1000) / 1000, Math.round(picEnd * 1000) / 1000];
+  },
+  lockPoemScenes(poemScenes, poemOrigin, poemDuration, durFn) {
+    const origin = Number(poemOrigin || 0);
+    const fileEnd = origin + Number(poemDuration || 0);
+    if (!poemScenes.length || poemDuration <= 0.4) return [];
+    const raw = poemScenes.map((sc) => Math.max(0.4, Number(durFn(sc) || 2)));
+    const rawSum = raw.reduce((a, b) => a + b, 0) || 1;
+    const scale = Number(poemDuration) / rawSum;
+    let cursor = origin;
+    const out = [];
+    poemScenes.forEach((sc, idx) => {
+      let dur = Math.max(0.4, Math.round(raw[idx] * scale * 1000) / 1000);
+      if (idx === poemScenes.length - 1) dur = Math.max(0.4, Math.round((fileEnd - cursor) * 1000) / 1000);
+      const start = Math.round(cursor * 1000) / 1000;
+      const end = Math.round((cursor + dur) * 1000) / 1000;
+      out.push({
+        screen: sc.screen,
+        start,
+        end,
+        narration_in: start,
+        narration_out: end,
+      });
+      cursor = end;
+    });
+    return out;
+  },
+};
+
+// ===========================================================================
 // Word-level script <-> voice-over alignment (English).
 // Port of backend/app/align_from_script.py (match + _snap_to_silences), but the
 // matching is one global monotonic alignment of ALL script words against ALL
@@ -2514,6 +2564,9 @@ async function rebuildMergedVo(pid, slots) {
       slots: active,
       silences: mergedSilences,
       local_only: true,
+      // Clear stale Whisper words so Auto-align never reuses the previous chapter/VO.
+      words: [],
+      words_dur: 0,
     };
     saveJson(pid, 'voiceover.json', meta);
     return meta;
@@ -2525,7 +2578,15 @@ async function rebuildMergedVo(pid, slots) {
     only.duration = dur;
     only.start_offset = 0;
     only.end_offset = dur;
-    const meta = { path: only.path, filename: only.filename, duration: dur, kind: 'narration', slots: active };
+    const meta = {
+      path: only.path,
+      filename: only.filename,
+      duration: dur,
+      kind: 'narration',
+      slots: active,
+      words: [],
+      words_dur: 0,
+    };
     saveJson(pid, 'voiceover.json', meta);
     const tl = loadJson(pid, 'timeline.json');
     if (tl && only.path && fs.existsSync(only.path)) {
@@ -2623,7 +2684,15 @@ async function rebuildMergedVo(pid, slots) {
   const probedMerged = await probeDuration(mergedPath);
   const totalDur = probedMerged && probedMerged >= offset * 0.8 ? probedMerged : Math.round(offset * 1000) / 1000;
   const label = active.map((s) => `VO${s.slot} (${s.filename})`).join(' + ');
-  const meta = { path: mergedPath, filename: label, duration: totalDur, kind: 'narration', slots: active };
+  const meta = {
+    path: mergedPath,
+    filename: label,
+    duration: totalDur,
+    kind: 'narration',
+    slots: active,
+    words: [],
+    words_dur: 0,
+  };
   saveJson(pid, 'voiceover.json', meta);
   const tl = loadJson(pid, 'timeline.json');
   if (tl && mergedPath && fs.existsSync(mergedPath)) {
@@ -3325,18 +3394,76 @@ app.post('/api/projects/:id/build', async (req, res) => {
       let narrOut = null;
 
       if (isPoemScene) {
-        if (!inPoemBlock) {
-          poemStartTime = tlCursor;
-          inPoemBlock = true;
+        // Poem VO brain: flush the whole poem run onto the poem audio clock once.
+        if (inPoemBlock) continue;
+        inPoemBlock = true;
+        const run = [];
+        for (let j = i; j < scenes.length; j++) {
+          if ((hasPoemVo || !indic) && onPoemTrack(scenes[j])) run.push(scenes[j]);
+          else break;
         }
-        const basePoemDur = poemRawDurs.get(s.screen) || (poemVoDur > 0 ? poemVoDur / Math.max(1, poemTrackScenes.length) : 6.0);
-        clipDur = Math.max(0.4, Math.round(basePoemDur * poemScale * 1000) / 1000);
-        poemEndTime = Math.max(poemEndTime, tlCursor + clipDur);
+        poemStartTime = tlCursor;
+        const lockedPoem = (hasPoemVo && poemVoDur > 0.4)
+          ? VoAlignBrain.lockPoemScenes(
+            run,
+            poemStartTime,
+            poemVoDur,
+            (sc) => poemRawDurs.get(sc.screen) || Number(sc.duration) || (poemVoDur / Math.max(1, run.length)),
+          )
+          : run.map((sc) => {
+            const base = poemRawDurs.get(sc.screen) || (poemVoDur > 0 ? poemVoDur / Math.max(1, run.length) : 6.0);
+            const d = Math.max(0.4, Math.round(base * poemScale * 1000) / 1000);
+            const start = Math.round(tlCursor * 1000) / 1000;
+            const end = Math.round((tlCursor + d) * 1000) / 1000;
+            tlCursor = end;
+            return { screen: sc.screen, start, end, narration_in: start, narration_out: end };
+          });
+        for (const lr of lockedPoem) {
+          const sc = run.find((x) => x.screen === lr.screen) || run[0];
+          const isInstP = isInstrumentalScene(sc);
+          const { video, image } = pickMediaForScreen(sc.screen, media, sc.visual_direction || sc.visual_type, sc);
+          const primary = choosePrimaryMedia(video, image, sc.visual_type, sc.visual_direction, true);
+          const dur = Math.max(0.4, Number(lr.end) - Number(lr.start));
+          const capTxt = captionForScene(sc, isInstP, marathi);
+          rawClips.push({
+            screen: sc.screen,
+            media_id: primary ? primary.id : null,
+            media_path: primary ? primary.path : '',
+            filename: primary ? (primary.filename || path.basename(String(primary.path || ''))) : '',
+            kind: primary ? primary.kind : 'image',
+            start: Number(lr.start),
+            end: Number(lr.end),
+            duration: dur,
+            source_in: 0,
+            source_out: primary && primary.kind === 'video' ? Math.min(dur, Number(primary.duration || dur)) : dur,
+            script_text: sc.text || sc.voiceover_text || sc.onscreen_text || sc.screen,
+            vo_text: isInstP ? (sc.voiceover_text || 'Instrumental.') : (sc.voiceover_text || ''),
+            caption_text: capTxt,
+            narration_in: lr.narration_in,
+            narration_out: lr.narration_out,
+            fit: primary ? (primary.kind === 'image' ? 'hold' : 'trim') : 'missing',
+          });
+          poemEndTime = Math.max(poemEndTime, Number(lr.end));
+          tlCursor = Math.max(tlCursor, Number(lr.end));
+        }
+        continue;
       } else if (spoken && alignedSpeechMap.has(s.screen)) {
         const [ni, no] = alignedSpeechMap.get(s.screen);
         narrIn = ni;
         narrOut = no;
-        clipDur = Math.max(0.4, narrOut - narrIn);
+        let nextIn = null;
+        for (let j = i + 1; j < scenes.length; j++) {
+          const nxt = scenes[j];
+          if ((hasPoemVo || !indic) && onPoemTrack(nxt)) break;
+          if (alignedSpeechMap.has(nxt.screen)) {
+            nextIn = Number(alignedSpeechMap.get(nxt.screen)[0]);
+            break;
+          }
+        }
+        const [picStart, picEnd] = VoAlignBrain.lockPictureToAudio(ni, no, nextIn);
+        clipDur = Math.max(0.4, picEnd - picStart);
+        // Absolute picture start on the VO clock (brain).
+        s.__picStart = picStart;
       } else if (spoken) {
         // Scene beyond the recorded VO: do not invent spoken duration from English word-banks.
         // Marathi leftover cards stay as short silent holds so the picture lane follows the VO clock.
@@ -3348,7 +3475,13 @@ app.post('/api/projects/:id/build', async (req, res) => {
         clipDur = Math.max(0.4, Number(s.duration) || 2.0);
       }
 
+      // Absolute VO clock for word-aligned speech; otherwise sequential cursor.
+      const voLocked = spoken && narrIn != null && Number.isFinite(narrIn);
+      const clipStart = voLocked
+        ? Number(s.__picStart != null ? s.__picStart : narrIn)
+        : tlCursor;
       const dur = Math.round(clipDur * 1000) / 1000;
+      const clipEnd = Math.round((clipStart + dur) * 1000) / 1000;
       const { video, image } = pickMediaForScreen(s.screen, media, s.visual_direction || s.visual_type, s);
       // Strictly respect the script: if the script calls for an image/illustration/flashcard, use image;
       // if it calls for video/cinematic documentary, use video. Never let a video hijack a flashcard.
@@ -3362,8 +3495,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
           media_id: null,
           media_path: '',
           kind: 'image',
-          start: Math.round(tlCursor * 1000) / 1000,
-          end: Math.round((tlCursor + dur) * 1000) / 1000,
+          start: Math.round(clipStart * 1000) / 1000,
+          end: clipEnd,
           duration: dur,
           source_in: 0,
           source_out: dur,
@@ -3374,7 +3507,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
           narration_out: narrOut,
           fit: 'missing',
         });
-        tlCursor += dur;
+        tlCursor = Math.max(tlCursor, clipEnd);
       } else {
         const srcDur = primary.kind === 'video' ? Number(primary.duration || dur) : dur;
           const fitMode =
@@ -3391,8 +3524,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
           media_path: primary.path,
           filename: primary.filename || path.basename(String(primary.path || '')),
           kind: primary.kind,
-          start: Math.round(tlCursor * 1000) / 1000,
-          end: Math.round((tlCursor + dur) * 1000) / 1000,
+          start: Math.round(clipStart * 1000) / 1000,
+          end: clipEnd,
           duration: dur,
           source_in: 0,
           source_out: primary.kind === 'video' ? Math.min(dur, srcDur) : dur,
@@ -3403,7 +3536,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
           narration_out: narrOut,
           fit: fitMode,
         });
-        tlCursor += dur;
+        tlCursor = Math.max(tlCursor, clipEnd);
 
         if (extraVid) {
           const vdur = Math.round((Number(extraVid.duration) || 4.0) * 1000) / 1000;
@@ -3429,9 +3562,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
         }
       }
 
-      // End-of-line question pause hold: only insert synthetic silent holds when NO voiceover recording is present.
-      // When a real VO recording is present (voDur > 1), the speaker's audio already contains the natural pauses!
-      const qPause = (voDur > 1 && !wordAlignUsed) ? 0 : questionPauseSeconds(s);
+      // Brain: never inject synthetic class-pause holds when a real VO exists.
+      const qPause = VoAlignBrain.shouldInjectClassPauses(voDur) ? questionPauseSeconds(s) : 0;
       if (qPause > 0) {
         const pDur = Math.round(qPause * 1000) / 1000;
         rawClips.push({
@@ -3452,6 +3584,14 @@ app.post('/api/projects/:id/build', async (req, res) => {
           fit: primary ? 'hold' : 'missing',
         });
         tlCursor += pDur;
+      }
+    }
+    // Keep absolute VO-locked clips in time order (word-align may place them out of loop order).
+    rawClips.sort((a, b) => Number(a.start) - Number(b.start) || Number(a.end) - Number(b.end));
+    for (let k = 0; k < rawClips.length - 1; k++) {
+      if (Number(rawClips[k].end) > Number(rawClips[k + 1].start)) {
+        rawClips[k].end = Number(rawClips[k + 1].start);
+        rawClips[k].duration = Math.max(0.2, Number(rawClips[k].end) - Number(rawClips[k].start));
       }
     }
 
