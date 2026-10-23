@@ -764,7 +764,7 @@ function parseProductionXlsx(filePath) {
           if (c.includes('section') || c.includes('timestamp')) colMap.section = colMap.section ?? idx;
           if (!c.includes('section') && (c.includes('duration') || /\bsec(?:s|onds)?\b/.test(c) || c === 'time')) colMap.duration = colMap.duration ?? idx;
           if (c.includes('on-screen') || c.includes('onscreen') || c.includes('text on screen') || c.includes('ost')) colMap.onscreen = colMap.onscreen ?? idx;
-          if (c.includes('voice') || c.includes('audio') || c.includes('narration') || c === 'vo' || c.includes('script')) colMap.vo = colMap.vo ?? idx;
+          if (!c.includes('visual') && !c.includes('description') && (c.includes('voice') || c.includes('audio') || c.includes('narration') || c === 'vo' || /\bscript\b/.test(c) || c.includes('dialogue') || c.includes('dialog'))) colMap.vo = colMap.vo ?? idx;
           if (c.includes('visual') && c.includes('type')) colMap.vtype = colMap.vtype ?? idx;
           else if (c.includes('visual') || c.includes('animation') || c.includes('image') || c.includes('action')) colMap.visual = colMap.visual ?? idx;
           if (c.includes('type') || c.includes('asset') || c.includes('media')) colMap.vtype = colMap.vtype ?? idx;
@@ -3200,7 +3200,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
             ? String(speechScenes[k].section || '').split('|')[0].trim().toLowerCase()
             : '';
           const isSecBoundary = k < speechScenes.length && curSec && nextSec && curSec !== nextSec;
-          const scoreDiff = isSecBoundary ? rawDiff - Math.min(18, voDur * 0.10) : rawDiff;
+          const scoreDiff = isSecBoundary ? rawDiff - Math.min(4, voDur * 0.03) : rawDiff;
           if (scoreDiff < bestDiff) {
             bestDiff = scoreDiff;
             bestCount = k;
@@ -3234,7 +3234,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
               const nextSec = k < narratedScenes.length
                 ? String(narratedScenes[k].section || '').split('|')[0].trim().toLowerCase()
                 : '';
-              const secBonus = (curSec && nextSec && curSec !== nextSec && diff < 35) ? 28 : 0;
+              const secBonus = (curSec && nextSec && curSec !== nextSec && diff < 8) ? Math.min(3, diff * 0.4) : 0;
               if (diff - secBonus < bestScore) {
                 bestScore = diff - secBonus;
                 bestIdx = k;
@@ -4375,7 +4375,7 @@ function updateScriptWorkbookOnDisk(pid, scenes) {
             if (c.includes('scene') || c.includes('screen') || c === 'no' || c.includes('sr')) colMap.scene = colMap.scene ?? idx;
             if (!c.includes('section') && (c.includes('duration') || /\bsec(?:s|onds)?\b/.test(c) || c === 'time')) colMap.duration = colMap.duration ?? idx;
             if (c.includes('on-screen') || c.includes('onscreen') || c.includes('text on screen') || c.includes('ost')) colMap.onscreen = colMap.onscreen ?? idx;
-            if (c.includes('voice') || c.includes('audio') || c.includes('narration') || c === 'vo' || c.includes('script')) colMap.vo = colMap.vo ?? idx;
+            if (!c.includes('visual') && !c.includes('description') && (c.includes('voice') || c.includes('audio') || c.includes('narration') || c === 'vo' || /\bscript\b/.test(c) || c.includes('dialogue') || c.includes('dialog'))) colMap.vo = colMap.vo ?? idx;
             if (!(c.includes('visual') && c.includes('type')) && (c.includes('visual') || c.includes('animation') || c.includes('image') || c.includes('action'))) colMap.visual = colMap.visual ?? idx;
           });
           break;
