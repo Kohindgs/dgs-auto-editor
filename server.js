@@ -3234,6 +3234,34 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const poemVoMeta = loadJson(pid, 'poem_voiceover.json') || {};
     const logoMeta = loadJson(pid, 'logo.json') || {};
     const existingTl = loadJson(pid, 'timeline.json');
+    // Auto-align must NOT reassign pictures/videos. Keep each screen's previous media_id
+    // so force_realign only moves cuts — never shuffles or blanks cards.
+    const prevClipByScreen = new Map();
+    if (existingTl && Array.isArray(existingTl.clips)) {
+      for (const c of existingTl.clips) {
+        const key = normScreenId(c.screen);
+        if (!key || prevClipByScreen.has(key)) continue;
+        if (c.media_id || c.media_path || c.filename) prevClipByScreen.set(key, c);
+      }
+    }
+    const resolvePrimaryMedia = (screen, visualType, visualDirection, scene, isPoem = false) => {
+      const key = normScreenId(screen);
+      const prev = prevClipByScreen.get(key);
+      if (prev && prev.media_id) {
+        const still = media.find((m) => m.id === prev.media_id);
+        if (still && (still.kind === 'image' || still.kind === 'video')) return still;
+      }
+      if (prev && prev.filename) {
+        const byName = media.find(
+          (m) =>
+            (m.kind === 'image' || m.kind === 'video') &&
+            String(m.filename || '').toLowerCase() === String(prev.filename || '').toLowerCase(),
+        );
+        if (byName) return byName;
+      }
+      const { video, image } = pickMediaForScreen(screen, media, visualDirection || visualType, scene);
+      return choosePrimaryMedia(video, image, visualType, visualDirection, isPoem);
+    };
 
     // If project was imported from a .wfpbundle / .wfp and neither script nor master VO was replaced,
     // preserve the bundle's exact clip timings/alignment while refreshing newly uploaded media, captions, logo, and QA!
@@ -3798,8 +3826,13 @@ app.post('/api/projects/:id/build', async (req, res) => {
         for (const lr of lockedPoem) {
           const sc = run.find((x) => x.screen === lr.screen) || run[0];
           const isInstP = isInstrumentalScene(sc);
-          const { video, image } = pickMediaForScreen(sc.screen, media, sc.visual_direction || sc.visual_type, sc);
-          const primary = choosePrimaryMedia(video, image, sc.visual_type, sc.visual_direction, true);
+          const primary = resolvePrimaryMedia(
+            sc.screen,
+            sc.visual_type,
+            sc.visual_direction || sc.visual_type,
+            sc,
+            true,
+          );
           const dur = Math.max(0.4, Number(lr.end) - Number(lr.start));
           const capTxt = captionForScene(sc, isInstP, marathi);
           rawClips.push({
@@ -3871,10 +3904,14 @@ app.post('/api/projects/:id/build', async (req, res) => {
       }
       const dur = Math.round(clipDur * 1000) / 1000;
       const clipEnd = Math.round((clipStart + dur) * 1000) / 1000;
-      const { video, image } = pickMediaForScreen(s.screen, media, s.visual_direction || s.visual_type, s);
-      // Strictly respect the script: if the script calls for an image/illustration/flashcard, use image;
-      // if it calls for video/cinematic documentary, use video. Never let a video hijack a flashcard.
-      const primary = choosePrimaryMedia(video, image, s.visual_type, s.visual_direction, isPoemScene);
+      // Keep prior media assignment — Auto-align only retimes; never reshuffles cards.
+      const primary = resolvePrimaryMedia(
+        s.screen,
+        s.visual_type,
+        s.visual_direction || s.visual_type,
+        s,
+        isPoemScene,
+      );
       const extraVid = null;
       const capTxt = captionForScene(s, isInst, marathi);
 
