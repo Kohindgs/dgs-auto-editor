@@ -1501,7 +1501,7 @@ function waPairScore(scriptTok, heardTok) {
  * Returns Map(screen -> [narration_in, narration_out]) for every spoken scene it could place,
  * or null when the recording words are unusable (caller falls back to the silence/estimate path).
  */
-function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDuration) {
+function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDuration, segmentStart = 0) {
   if (!Array.isArray(wordsIn) || !speechScenes.length) return null;
   const pos = new Map((allScenes || []).map((s, i) => [s.screen, i]));
   const A = [];
@@ -1624,7 +1624,7 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
     const next = j < speechScenes.length ? spans[j] : null;
     const group = [];
     for (let g = i; g < j; g++) group.push(g);
-    const tA = prev ? A[prev.ei].end : 0;
+    const tA = prev ? A[prev.ei].end : Math.max(0, Number(segmentStart) || 0);
     const tB = next ? A[next.si].start : lastHeardEnd;
     if (!next) {
       // After the last heard line: only keep them if audible words remain, otherwise they sit beyond the recording.
@@ -1711,7 +1711,7 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
       const r = raw[k];
       let srcIn;
       if (k === 0) {
-        srcIn = 0.0;
+        srcIn = Math.max(0, Number(segmentStart) || 0);
       } else {
         const prevOut = out[out.length - 1][1];
         const [s0, s1] = gaps[k - 1];
@@ -1927,6 +1927,30 @@ function choosePrimaryMedia(video, image, visualType = '', visualDirection = '',
   // All other narrative, story, poem, explanation scenes: video takes priority over static image
   // (A video named Scene N replaces image N. Keep the image only when that screen has no video.)
   return video;
+}
+
+/** Correct old auto-generated 2-4x video playback while preserving hand edits. */
+function normalizeAutoAlignedVideoPlayback(plan) {
+  if (!plan || !Array.isArray(plan.clips) || plan.manual_override === true) return 0;
+  let changed = 0;
+  for (const c of plan.clips) {
+    if (!c || c.kind !== 'video' || c.fit === 'missing') continue;
+    const dur = Number(c.end) - Number(c.start);
+    if (!Number.isFinite(dur) || dur < 0.19) continue;
+    const srcIn = Math.max(0, Number(c.source_in) || 0);
+    let srcOut = Number(c.source_out);
+    if (!Number.isFinite(srcOut) || srcOut <= srcIn) srcOut = srcIn + dur;
+    const natural = srcOut - srcIn;
+    const nextFit = (c.fit === 'stretch' || c.fit === 'passthrough')
+      ? (natural < dur - 0.07 ? 'hold' : 'trim') : c.fit;
+    const nextOut = Math.round((srcIn + Math.min(dur, natural)) * 1000) / 1000;
+    if (nextFit !== c.fit || srcOut > nextOut + 0.01) {
+      c.fit = nextFit;
+      c.source_out = nextOut;
+      changed += 1;
+    }
+  }
+  return changed;
 }
 
 function mergeAdjacentSameMedia(clips) {
@@ -2367,6 +2391,7 @@ app.get('/api/projects/:id/load', (req, res) => {
   const lastExp = loadJson(pid, 'last_export.json') || {};
   const title = lastExp.title || (scriptMeta.filename ? path.parse(scriptMeta.filename).name : `Project ${pid}`);
   const tl = loadJson(pid, 'timeline.json');
+  if (normalizeAutoAlignedVideoPlayback(tl)) saveJson(pid, 'timeline.json', tl);
   const mediaList = loadJson(pid, 'media.json') || [];
   if (tl && Array.isArray(tl.clips) && mediaList.length) {
     const sceneMap = new Map((scenes || []).map((s) => [normScreenId(s.screen), s]));
@@ -3505,8 +3530,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
         const multiSlots = Array.isArray(voMeta.slots)
           ? voMeta.slots.filter((sl) => Number(sl.duration || 0) > 0.5)
           : [];
-        let byWords = null;
-        if (multiSlots.length > 1) {
+        let byWords = alignSpeechByWords(speechScenes, scenes, heardWords, silences, voDur);
+        // One continuous script/VO clock across all narration files.
+        // Only fall back to duration-based slot partitioning if global word lock is incomplete.
+        if (multiSlots.length > 1 && (!byWords || byWords.size < Math.ceil(speechScenes.length * 0.85))) {
           // Per-slot word lock: story lines only match VO1 words, later sections only VO2+.
           // Stops repeated phrases ("Death to the wolf") from yanking mid/late scenes onto the wrong file.
           byWords = new Map();
@@ -3557,17 +3584,28 @@ app.post('/api/projects/:id/build', async (req, res) => {
               return Number.isFinite(t) && t >= slStart - 0.35 && t <= slEnd + 0.35;
             });
             if (subScenes.length && slotWords.length >= 4) {
-              const subMap = alignSpeechByWords(subScenes, scenes, slotWords, silences, slEnd);
+              const subMap = alignSpeechByWords(subScenes, scenes, slotWords, silences, slEnd, slStart);
               if (subMap) for (const [k, v] of subMap.entries()) byWords.set(k, v);
             }
             startIdx = endIdx;
           }
-        } else {
-          byWords = alignSpeechByWords(speechScenes, scenes, heardWords, silences, voDur);
         }
         // Require strong coverage — never accept a half-matched map and guess the rest.
         const minCover = Math.max(1, Math.ceil(speechScenes.length * 0.85));
-        if (byWords && byWords.size >= minCover) {
+        let credibleWordMap = Boolean(byWords && byWords.size >= minCover);
+        let lastWordStart = -1;
+        if (credibleWordMap) for (const sc of speechScenes) {
+          const span = byWords.get(sc.screen);
+          if (!span) continue;
+          const a = Number(span[0]);
+          const b = Number(span[1]);
+          if (!Number.isFinite(a) || !Number.isFinite(b) || b - a < 0.19 || a < lastWordStart - 0.03 || a < -0.01 || b > voDur + 0.75) {
+            credibleWordMap = false;
+            break;
+          }
+          lastWordStart = a;
+        }
+        if (credibleWordMap) {
           for (const [k, v] of byWords.entries()) alignedSpeechMap.set(k, v);
           // Script order wins: never let a late scene (e.g. S58) land at VO 00:00 ahead of S2.
           VoAlignBrain.enforceMonotonicSpeechMap(speechScenes, alignedSpeechMap);
@@ -3576,7 +3614,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
           speechScenes.forEach((sc, ix) => { if (alignedSpeechMap.has(sc.screen)) lastIdx = ix + 1; });
           coveredSpokenCount = lastIdx;
         } else if (byWords) {
-          console.warn(`[align] Word lock coverage too low: ${byWords.size}/${speechScenes.length} (need ≥${minCover})`);
+          console.warn(`[align] Rejected low-coverage or non-monotonic word map: ${byWords.size}/${speechScenes.length} (need ≥${minCover})`);
         }
       }
     }
@@ -3971,6 +4009,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
         } else {
           fitMode = 'trim';
           sourceOut = Math.round(Math.min(Math.max(0.2, srcDur), dur) * 1000) / 1000;
+          if (srcDur < dur - 0.12) fitMode = 'hold';
         }
         rawClips.push({
           screen: s.screen,
@@ -4050,6 +4089,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
     }
 
     const clips = mergeAdjacentSameMedia(rawClips);
+    normalizeAutoAlignedVideoPlayback({ clips, manual_override: false });
     if (clips.length) {
       tlCursor = clips[clips.length - 1].end;
     }
@@ -4155,6 +4195,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       Object.assign(syncReport, again, { repaired: syncReport.repaired });
     }
     plan.sync_report = syncReport;
+    normalizeAutoAlignedVideoPlayback(plan);
     plan.manual_override = false;
 
     const qaIssues = [
@@ -4208,6 +4249,7 @@ function scanTimelineQA(plan, scenesInput) {
 
 async function healTimelinePaths(pid, plan) {
   if (!plan) return plan;
+  normalizeAutoAlignedVideoPlayback(plan);
   const voMeta = loadJson(pid, 'voiceover.json') || {};
   const poemVoMeta = loadJson(pid, 'poem_voiceover.json') || {};
   const logoMeta = loadJson(pid, 'logo.json') || {};
