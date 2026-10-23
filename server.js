@@ -3728,14 +3728,22 @@ app.post('/api/projects/:id/build', async (req, res) => {
         tlCursor = Math.max(tlCursor, clipEnd);
       } else {
         const srcDur = primary.kind === 'video' ? Number(primary.duration || dur) : dur;
-          const fitMode =
-          primary.kind === 'image'
-            ? 'hold'
-            : srcDur >= dur - 0.05
-              ? 'trim'
-              : marathi
-                ? 'hold'
-                : 'passthrough';
+        // Cut timeline to VO; stretch longer video takes into the spoken window (full take plays with VO).
+        let fitMode = 'hold';
+        let sourceOut = dur;
+        if (primary.kind === 'image') {
+          fitMode = 'hold';
+          sourceOut = dur;
+        } else if (srcDur > dur + 0.12) {
+          fitMode = 'stretch';
+          sourceOut = Math.round(srcDur * 1000) / 1000;
+        } else if (srcDur < dur - 0.12) {
+          fitMode = marathi ? 'hold' : 'passthrough';
+          sourceOut = Math.round(Math.max(0.2, srcDur) * 1000) / 1000;
+        } else {
+          fitMode = 'trim';
+          sourceOut = Math.round(Math.min(dur, srcDur) * 1000) / 1000;
+        }
         rawClips.push({
           screen: s.screen,
           media_id: primary.id,
@@ -3746,7 +3754,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
           end: clipEnd,
           duration: dur,
           source_in: 0,
-          source_out: primary.kind === 'video' ? Math.min(dur, srcDur) : dur,
+          source_out: sourceOut,
           script_text: s.text || s.voiceover_text || s.onscreen_text || s.screen,
           vo_text: isInst ? (s.voiceover_text || 'Instrumental.') : (s.voiceover_text || ''),
           caption_text: capTxt,
