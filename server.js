@@ -405,17 +405,23 @@ function numbersToScreens(blob) {
   return out;
 }
 
+function devanagariToAsciiDigits(str) {
+  if (!str) return '';
+  return String(str).replace(/[०-९]/g, (ch) => String(ch.charCodeAt(0) - 0x0966));
+}
+
 function detectScreens(filename, parentName = '') {
-  for (const candidate of [filename, parentName]) {
-    if (!candidate) continue;
+  for (const rawCandidate of [filename, parentName]) {
+    if (!rawCandidate) continue;
+    const candidate = devanagariToAsciiDigits(rawCandidate);
     const stem = path.parse(String(candidate)).name;
     const trimmed = stem.trim();
     if (/^\d{1,3}$/.test(trimmed)) {
       const n = parseInt(trimmed, 10);
       if (n >= 1 && n <= 500) return [`screen_${n}`];
     }
-    // Supports "Scene 15 & 16", "Screen 15 + 16", "Scene 15 and 16"
-    const labelMulti = stem.match(/(?:screen|scene)[_\s-]*(\d+(?:\s*(?:[&+,/]|and)\s*\d+)+)/i);
+    // Supports "Scene 15 & 16", "Screen 15 + 16", "Scene 15 and 16", or Marathi "दृश्य १५", "सीन २", "व्हिडिओ ५"
+    const labelMulti = stem.match(/(?:screen|scene|दृश्य|सीन|प्रसंग|भाग|व्हिडिओ|चित्र)[_\s-]*(\d+(?:\s*(?:[&+,/]|and)\s*\d+)+)/i);
     if (labelMulti) {
       const sc = numbersToScreens(labelMulti[1]);
       if (sc.length) return sc;
@@ -427,7 +433,7 @@ function detectScreens(filename, parentName = '') {
       if (sc.length) return sc;
     }
     // Range "Scene 15 to 17", "15-17"
-    const rangeMatch = stem.match(/(?:screen|scene|sc|slide|shot|img|vid|clip)?[\s_-]*(\d{1,3})\s*(?:to|-|–)\s*(\d{1,3})/i);
+    const rangeMatch = stem.match(/(?:screen|scene|sc|slide|shot|img|vid|clip|दृश्य|सीन|प्रसंग|भाग|चित्र|व्हिडिओ)?[\s_-]*(\d{1,3})\s*(?:to|-|–)\s*(\d{1,3})/i);
     if (rangeMatch) {
       const a = parseInt(rangeMatch[1], 10);
       const b = parseInt(rangeMatch[2], 10);
@@ -437,7 +443,7 @@ function detectScreens(filename, parentName = '') {
         return out;
       }
     }
-    const tagMatches = [...stem.matchAll(/(?:screen|scene|sc|slide|shot|img|vid|clip)[\s_-]*(\d{1,3})/gi)];
+    const tagMatches = [...stem.matchAll(/(?:screen|scene|sc|slide|shot|img|vid|clip|दृश्य|सीन|प्रसंग|भाग|चित्र|व्हिडिओ)[\s_-]*(\d{1,3})/gi)];
     if (tagMatches.length) {
       return [...new Set(tagMatches.map((m) => `screen_${parseInt(m[1], 10)}`))];
     }
@@ -772,7 +778,7 @@ function parseProductionXlsx(filePath) {
     for (let r = headerIdx + 1; r < rows.length; r++) {
       const row = rows[r];
       if (!row || !row.length) continue;
-      const rawScene = String(row[colMap.scene ?? 0] || '').trim();
+      const rawScene = devanagariToAsciiDigits(String(row[colMap.scene ?? 0] || '')).trim();
       const rawSecCell = colMap.section != null ? String(row[colMap.section] || '').trim() : '';
       if (rawSecCell) currentSection = rawSecCell;
 
@@ -846,7 +852,7 @@ function parseProductionXlsx(filePath) {
             audioStart != null ||
             isPoemCandidate
           );
-      const vType = /video|mp4|anim/i.test(rawTypeCell || rawVisCell) ? 'Video' : 'Image';
+      const vType = /video|mp4|anim|व्हिडिओ|चलचित्र/i.test(rawTypeCell || rawVisCell) ? 'Video' : 'Image';
 
       scenes.push({
         screen,
@@ -1634,19 +1640,19 @@ function pickMediaForScreen(screen, mediaItems, visualDirection = '', scene = nu
 }
 
 function choosePrimaryMedia(video, image, visualType = '', visualDirection = '', isPoem = false) {
+  if (!video) return image || null;
+  if (!image) return video || null;
+
   const combined = `${visualType || ''} ${visualDirection || ''}`.toLowerCase();
-  const wantsVideo = /\b(video|documentary|cinematic|animation|anim|motion)\b/i.test(combined);
-  const wantsImage = /\b(illustration|flashcard|typography|still|drawing|2d|slide|image|photo|card|title)\b/i.test(combined);
-  // If it's a poem scene and a video was generated for it, video takes priority so poem scenes are cinematic
-  if (isPoem && video) return video;
-  if (wantsVideo && !wantsImage && video) return video;
-  if (wantsImage && !wantsVideo && image) return image;
-  if (video && image) {
-    if (wantsVideo) return video;
-    if (wantsImage) return image;
-    return video;
+  // Only suppress video if the visual description explicitly calls for a static flashcard / prompt card
+  const isExplicitFlashcard = /\b(flashcard|prompt card|quiz card|fill in the blank|word bank)\b/i.test(combined);
+  if (isExplicitFlashcard && !/\b(video|motion|anim|व्हिडिओ|चलचित्र)\b/i.test(combined)) {
+    return image;
   }
-  return video || image || null;
+
+  // All other narrative, story, poem, explanation scenes: video takes priority over static image
+  // (A video named Scene N replaces image N. Keep the image only when that screen has no video.)
+  return video;
 }
 
 function mergeAdjacentSameMedia(clips) {
@@ -2086,6 +2092,27 @@ app.get('/api/projects/:id/load', (req, res) => {
   const lastExp = loadJson(pid, 'last_export.json') || {};
   const title = lastExp.title || (scriptMeta.filename ? path.parse(scriptMeta.filename).name : `Project ${pid}`);
   const tl = loadJson(pid, 'timeline.json');
+  const mediaList = loadJson(pid, 'media.json') || [];
+  if (tl && Array.isArray(tl.clips) && mediaList.length) {
+    const sceneMap = new Map((scenes || []).map((s) => [normScreenId(s.screen), s]));
+    let changed = false;
+    for (const c of tl.clips) {
+      const s = sceneMap.get(normScreenId(c.screen));
+      const picked = pickMediaForScreen(c.screen, mediaList, s?.visual_direction || s?.visual_type || '', s);
+      const primary = choosePrimaryMedia(picked.video, picked.image, s?.visual_type, s?.visual_direction);
+      if (primary && (!c.media_id || c.kind !== primary.kind || c.media_id !== primary.id)) {
+        c.media_id = primary.id;
+        c.media_path = primary.path;
+        c.filename = primary.filename || path.basename(String(primary.path || ''));
+        c.kind = primary.kind;
+        c.fit = primary.kind === 'video' ? 'trim' : 'hold';
+        changed = true;
+      }
+    }
+    if (changed) {
+      saveJson(pid, 'timeline.json', tl);
+    }
+  }
   const effLogo = getEffectiveLogoMeta(pid, tl);
   if (tl) {
     if (typeof tl.logo_enabled !== 'boolean') tl.logo_enabled = effLogo.enabled;
