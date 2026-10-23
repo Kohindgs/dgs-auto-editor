@@ -1218,6 +1218,111 @@ const VoAlignBrain = {
     });
     return out;
   },
+  SYNC_DRIFT_LIMIT: 0.35,
+  /**
+   * Honest post-align audit. Measures |picture.start - narration_in|, optionally
+   * re-locks drifted cuts, and returns a report the UI must show (never fake "all synced").
+   */
+  verifyAndRepairSync(clips, voDuration, opts = {}) {
+    const repair = opts.repair !== false;
+    const limit = Number(opts.driftLimit != null ? opts.driftLimit : this.SYNC_DRIFT_LIMIT);
+    const list = Array.isArray(clips) ? clips : [];
+    const spoken = list.filter(
+      (c) => c.narration_in != null && c.narration_out != null
+        && (Number(c.narration_out) - Number(c.narration_in)) >= 0.15,
+    );
+    const driftOf = (c) => Math.abs(Number(c.narration_in) - Number(c.start));
+    let drifted = spoken
+      .filter((c) => driftOf(c) > limit)
+      .map((c) => ({
+        screen: c.screen,
+        drift: Math.round(driftOf(c) * 1000) / 1000,
+        picture_start: Math.round(Number(c.start) * 1000) / 1000,
+        narration_in: Math.round(Number(c.narration_in) * 1000) / 1000,
+      }));
+
+    let repaired = 0;
+    if (repair && drifted.length) {
+      const sorted = [...spoken].sort((a, b) => Number(a.narration_in) - Number(b.narration_in));
+      for (let i = 0; i < sorted.length; i++) {
+        const c = sorted[i];
+        const ni = Number(c.narration_in);
+        const no = Number(c.narration_out);
+        const nxt = i + 1 < sorted.length ? Number(sorted[i + 1].narration_in) : null;
+        const [picIn, picOut] = this.lockPictureToAudio(ni, no, nxt);
+        if (Math.abs(Number(c.start) - picIn) > 0.001 || Math.abs(Number(c.end) - picOut) > 0.001) repaired += 1;
+        c.start = picIn;
+        c.end = picOut;
+        c.duration = Math.round((picOut - picIn) * 1000) / 1000;
+      }
+      drifted = spoken
+        .filter((c) => driftOf(c) > limit)
+        .map((c) => ({
+          screen: c.screen,
+          drift: Math.round(driftOf(c) * 1000) / 1000,
+          picture_start: Math.round(Number(c.start) * 1000) / 1000,
+          narration_in: Math.round(Number(c.narration_in) * 1000) / 1000,
+        }));
+    }
+
+    let maxDrift = 0;
+    for (const c of spoken) maxDrift = Math.max(maxDrift, driftOf(c));
+    const voDur = Number(voDuration || 0);
+    const lastEnd = list.length ? Math.max(...list.map((c) => Number(c.end || 0))) : 0;
+    const voDelta = voDur > 1 ? Math.round((lastEnd - voDur) * 1000) / 1000 : 0;
+    const voLenOk = voDur > 1 ? Math.abs(voDelta) <= 1.0 : true;
+    const ok = drifted.length === 0 && voLenOk && spoken.length > 0;
+
+    let summary;
+    if (ok) {
+      summary = `SYNC OK · ${spoken.length}/${spoken.length} spoken scenes locked to VO · max drift ${maxDrift.toFixed(3)}s · timeline ${lastEnd.toFixed(2)}s`;
+      if (voDur > 1) summary += ` / VO ${voDur.toFixed(2)}s`;
+    } else if (!spoken.length) {
+      summary = 'SYNC FAIL · no spoken narration_in on clips — Auto-align did not lock to VO';
+    } else {
+      summary = `SYNC FAIL · ${drifted.length} scene(s) drift >${limit.toFixed(2)}s (max ${maxDrift.toFixed(3)}s)`;
+      if (!voLenOk) summary += ` · timeline–VO gap ${voDelta >= 0 ? '+' : ''}${voDelta.toFixed(2)}s`;
+      if (repaired) summary += ` · auto-repaired ${repaired} cut(s)`;
+    }
+
+    const issues = drifted.slice(0, 40).map((d) => ({
+      kind: 'vo_sync',
+      severity: 'error',
+      screen: d.screen,
+      time: d.picture_start,
+      end: d.narration_in,
+      timecode: '',
+      message: `${String(d.screen).replace('screen_', 'Scene ')}: picture at ${d.picture_start.toFixed(2)}s but VO line starts at ${d.narration_in.toFixed(2)}s (drift ${d.drift.toFixed(2)}s)`,
+      expected: `narration_in=${d.narration_in}`,
+      found: `picture_start=${d.picture_start}`,
+    }));
+    if (!voLenOk) {
+      issues.push({
+        kind: 'vo_sync',
+        severity: 'error',
+        screen: 'timeline',
+        time: lastEnd,
+        end: voDur,
+        timecode: '',
+        message: `Timeline length ${lastEnd.toFixed(2)}s vs VO ${voDur.toFixed(2)}s (gap ${voDelta >= 0 ? '+' : ''}${voDelta.toFixed(2)}s)`,
+        expected: `VO duration ${voDur.toFixed(2)}s`,
+        found: `timeline ${lastEnd.toFixed(2)}s`,
+      });
+    }
+
+    return {
+      ok,
+      summary,
+      spoken_count: spoken.length,
+      drifted_count: drifted.length,
+      max_drift: Math.round(maxDrift * 1000) / 1000,
+      repaired,
+      vo_duration: voDur,
+      timeline_end: Math.round(lastEnd * 1000) / 1000,
+      vo_delta: voDelta,
+      issues,
+    };
+  },
 };
 
 // ===========================================================================
@@ -3682,15 +3787,36 @@ app.post('/api/projects/:id/build', async (req, res) => {
       },
     };
 
-    const qaIssues = scanTimelineQA(plan, scenes);
+    // Honest VO↔picture sync audit + auto-repair (brain). Never claim synced without measuring.
+    const syncReport = VoAlignBrain.verifyAndRepairSync(plan.clips, voDur, { repair: true });
+    if (syncReport.repaired > 0) {
+      plan.clips = mergeAdjacentSameMedia(plan.clips);
+      if (plan.clips.length) {
+        plan.total_duration = Math.max(...plan.clips.map((c) => Number(c.end || 0)));
+      }
+      plan.srt_cues = buildSrtCues(plan.clips, plan);
+      saveSrt(pid, 'subtitles.srt', formatSrt(plan.srt_cues));
+      // Re-verify after repair so the report matches the saved cuts.
+      const again = VoAlignBrain.verifyAndRepairSync(plan.clips, voDur, { repair: false });
+      Object.assign(syncReport, again, { repaired: syncReport.repaired });
+    }
+    plan.sync_report = syncReport;
+    plan.manual_override = false;
+
+    const qaIssues = [
+      ...syncReport.issues,
+      ...scanTimelineQA(plan, scenes),
+    ];
     const errCount = qaIssues.filter((i) => i.severity === 'error').length;
     const warnCount = qaIssues.filter((i) => i.severity === 'warning').length;
     const uploadedVoSlots = Array.isArray(voMeta.slots)
       ? voMeta.slots.filter((sl) => Number(sl.duration || 0) > 0.5).length
       : (voDur > 1 ? 1 : 0);
-    const engineNote = marathi
-      ? ` · Marathi engine · ${silences.length} silence cuts · ${srtCues.length} SRT cues`
-      : ` · English engine · ${srtCues.length} SRT cues`;
+    const engineNote = wordAlignUsed
+      ? ` · VO-word lock · ${srtCues.length} SRT cues`
+      : marathi
+        ? ` · Marathi engine · ${silences.length} silence cuts · ${srtCues.length} SRT cues`
+        : ` · English engine · ${srtCues.length} SRT cues`;
     let partialVoNote = '';
     if (voDur > 1 && coveredSpokenCount < speechScenes.length) {
       if (uploadedVoSlots >= 2) {
@@ -3699,14 +3825,16 @@ app.post('/api/projects/:id/build', async (req, res) => {
         partialVoNote = ` · VO covers Scenes 1–${coveredSpokenCount} (add VO ${uploadedVoSlots + 1} for Scenes ${coveredSpokenCount + 1}–${speechScenes.length})`;
       }
     }
-    const qaSummary = qaIssues.length
-      ? `QA scan: ${errCount ? `${errCount} missing · ` : ''}${warnCount ? `${warnCount} mismatch thought bubble${warnCount !== 1 ? 's' : ''} · ` : ''}${clips.length} clips on timeline${engineNote}${partialVoNote}`
-      : `QA scan: no issues · ${clips.length} clips aligned${engineNote}${partialVoNote}`;
+    const qaSummary = `${syncReport.summary}${engineNote}${partialVoNote}`
+      + (warnCount || errCount
+        ? ` · also ${errCount ? `${errCount} error(s)` : ''}${errCount && warnCount ? ', ' : ''}${warnCount ? `${warnCount} warning(s)` : ''}`
+        : '');
     plan.qa_issues = qaIssues;
     plan.qa_summary = qaSummary;
+    plan.align_engine = wordAlignUsed ? 'english_word' : (marathi ? 'marathi' : plan.align_engine || 'english');
 
     saveJson(pid, 'timeline.json', plan);
-    saveJson(pid, 'qa.json', { summary: qaSummary, issues: qaIssues });
+    saveJson(pid, 'qa.json', { summary: qaSummary, issues: qaIssues, sync_report: syncReport });
     res.json({ ...plan, scenes });
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -3780,7 +3908,8 @@ app.put('/api/projects/:id/timeline', async (req, res) => {
     const existing = loadJson(pid, 'timeline.json') || {};
     const scenes = loadJson(pid, 'scenes.json') || [];
     const plan = req.body || {};
-    plan.manual_override = true;
+    // Hand edits set manual_override:true; auto sync-repair may send false.
+    plan.manual_override = plan.manual_override !== false;
     if ((!Array.isArray(plan.narration_segments) || !plan.narration_segments.length) && Array.isArray(existing.narration_segments) && existing.narration_segments.length) {
       plan.narration_segments = existing.narration_segments;
     }
@@ -3812,16 +3941,23 @@ app.put('/api/projects/:id/timeline', async (req, res) => {
       plan.srt_cues = buildSrtCues(plan.clips, plan);
       saveSrt(pid, 'subtitles.srt', formatSrt(plan.srt_cues));
     }
-    const qaIssues = scanTimelineQA(plan, scenes);
+    const voMeta = loadJson(pid, 'voiceover.json') || {};
+    const syncReport = VoAlignBrain.verifyAndRepairSync(
+      plan.clips || [],
+      Number(voMeta.duration || plan.sync_report?.vo_duration || 0),
+      { repair: false },
+    );
+    plan.sync_report = syncReport;
+    const qaIssues = [...syncReport.issues, ...scanTimelineQA(plan, scenes)];
     const errCount = qaIssues.filter((i) => i.severity === 'error').length;
     const warnCount = qaIssues.filter((i) => i.severity === 'warning').length;
-    const clipCount = Array.isArray(plan.clips) ? plan.clips.length : 0;
     plan.qa_issues = qaIssues;
-    plan.qa_summary = qaIssues.length
-      ? `QA scan: ${errCount ? `${errCount} missing · ` : ''}${warnCount ? `${warnCount} mismatch thought bubble${warnCount !== 1 ? 's' : ''} · ` : ''}${clipCount} clips on timeline`
-      : `QA scan: no issues · ${clipCount} clips aligned`;
+    plan.qa_summary = syncReport.summary
+      + (warnCount || errCount
+        ? ` · also ${errCount ? `${errCount} error(s)` : ''}${errCount && warnCount ? ', ' : ''}${warnCount ? `${warnCount} warning(s)` : ''}`
+        : '');
     saveJson(pid, 'timeline.json', plan);
-    saveJson(pid, 'qa.json', { summary: plan.qa_summary, issues: qaIssues });
+    saveJson(pid, 'qa.json', { summary: plan.qa_summary, issues: qaIssues, sync_report: syncReport });
     res.json(plan);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
