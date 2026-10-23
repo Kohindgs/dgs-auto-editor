@@ -14,6 +14,9 @@ function installAudioAlignRoutes({ app, upload, projectRoot, ffmpegPath }) {
   const worker = path.join(__dirname, 'audio-align-worker.py');
   const model = path.join(home, 'models', 'vosk-model-small-en-in-0.4');
   const pythonLib = path.join(home, 'python');
+  const mrWorker = path.join(__dirname, 'marathi-align-worker.py');
+  const mrModel = path.join(home, 'models', 'indicconformer-mr');
+  const mrLib = path.join(home, 'mr_python_legacy', 'sherpa_onnx', 'lib');
 
   function requestInfo(req) {
     const id = String(req.params.id || '');
@@ -22,10 +25,12 @@ function installAudioAlignRoutes({ app, upload, projectRoot, ffmpegPath }) {
     const slot = kind === 'poem' ? 'poem' : String(Math.min(10, Math.max(1, Number(req.query.slot || req.body?.slot || 1) || 1)));
     const root = projectRoot(id);
     if (!fs.existsSync(root)) throw new Error('Project not found');
-    return { id, slot, root, key: id + ':' + slot };
+    const language = String(req.query.lang || req.body?.lang || 'en').trim().toLowerCase();
+    if (!['en', 'mr'].includes(language)) throw new Error('Offline audio-led alignment is not yet supported for this language');
+    return { id, slot, root, language, key: id + ':' + slot + ':' + language };
   }
   function cachePath(info) {
-    return path.join(info.root, 'meta', 'audio_sync_' + info.slot + '.json');
+    return path.join(info.root, 'meta', 'audio_sync_' + (info.language === 'mr' ? 'mr_' : '') + info.slot + '.json');
   }
   function getCache(info) {
     try { return JSON.parse(fs.readFileSync(cachePath(info), 'utf8')); } catch { return null; }
@@ -42,11 +47,11 @@ function installAudioAlignRoutes({ app, upload, projectRoot, ffmpegPath }) {
       confidence: Math.max(0, Math.min(1, Number(w.confidence) || 0)),
     }));
   }
-  function cacheResult(data, hash) {
+  function cacheResult(data, hash, language) {
     return {
       status: 'ready',
       hash,
-      engine: 'vosk-small-en-in-0.4',
+      engine: language === 'mr' ? 'ai4bharat-indicconformer-mr-ctc-int8' : 'vosk-small-en-in-0.4',
       word_count: data.words.length,
       words: data.words,
       decoded_duration: data.decoded_duration,
@@ -64,11 +69,16 @@ function installAudioAlignRoutes({ app, upload, projectRoot, ffmpegPath }) {
   function launch(info, filePath, hash) {
     const job = { status: 'processing', hash, processed_seconds: 0, started: Date.now(), error: null };
     jobs.set(info.key, job);
-    const proc = spawn('python3', [worker, filePath, model], {
+    const marathi = info.language === 'mr';
+    const selectedWorker = marathi ? mrWorker : worker;
+    const selectedModel = marathi ? mrModel : model;
+    const proc = spawn('python3', [selectedWorker, filePath, selectedModel], {
       cwd: info.root,
       env: {
         ...process.env,
         DGS_VOSK_PYTHONPATH: pythonLib,
+        DGS_MR_ASR_HOME: home,
+        LD_LIBRARY_PATH: marathi ? mrLib + ':' + (process.env.LD_LIBRARY_PATH || '') : process.env.LD_LIBRARY_PATH,
         DGS_FFMPEG_BIN: ffmpegPath,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -108,7 +118,7 @@ function installAudioAlignRoutes({ app, upload, projectRoot, ffmpegPath }) {
         const doc = cacheResult({
           words,
           decoded_duration: Number(result.decoded_duration) || 0,
-        }, hash);
+        }, hash, info.language);
         doc.created_at = new Date().toISOString();
         const dest = cachePath(info);
         await fsp.mkdir(path.dirname(dest), { recursive: true });
@@ -150,7 +160,9 @@ function installAudioAlignRoutes({ app, upload, projectRoot, ffmpegPath }) {
       if (!['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.opus', '.webm', '.mp4'].includes(ext) || req.file.size > 90 * 1024 * 1024) {
         return res.status(415).json({ detail: 'Unsupported or oversized VO audio file' });
       }
-      if (!fs.existsSync(worker) || !fs.existsSync(model)) {
+      const selectedWorker = info.language === 'mr' ? mrWorker : worker;
+      const selectedModel = info.language === 'mr' ? mrModel : model;
+      if (!fs.existsSync(selectedWorker) || !fs.existsSync(selectedModel)) {
         return res.status(503).json({ detail: 'Offline audio aligner is not installed' });
       }
       const hash = await computeHash(filePath);
@@ -160,6 +172,9 @@ function installAudioAlignRoutes({ app, upload, projectRoot, ffmpegPath }) {
       if (existing?.status === 'processing') {
         if (existing.hash !== hash) return res.status(409).json({ detail: 'A different VO is currently being analyzed for this track' });
         return res.status(202).json(snapshot(info, hash));
+      }
+      if ([...jobs.values()].filter(j => j.status === 'processing').length >= 2) {
+        return res.status(429).json({ detail: 'Audio recognition is busy with two tracks. Retry when another completes.' });
       }
       const privateDir = path.join(info.root, 'audio_alignment_private');
       await fsp.mkdir(privateDir, { recursive: true });
