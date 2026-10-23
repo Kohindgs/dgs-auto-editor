@@ -1422,10 +1422,10 @@ function waClean(text) {
   return String(text == null ? '' : text).replace(/[\u2019\u2018`\u00b4]/g, "'");
 }
 function waTokens(text) {
-  return waClean(text).toLowerCase().match(/[\p{L}\p{N}]+(?:'[\p{L}\p{N}]+)?/gu) || [];
+  return waClean(text).toLowerCase().match(/[\p{L}\p{M}\p{N}\u200c\u200d]+(?:'[\p{L}\p{M}\p{N}]+)?/gu) || [];
 }
 function waNorm(text) {
-  const m = waClean(text).toLowerCase().match(/[\p{L}\p{N}]+|'/gu);
+  const m = waClean(text).toLowerCase().match(/[\p{L}\p{M}\p{N}\u200c\u200d]+|'/gu);
   return (m ? m.join('') : '').replace(/^'+|'+$/g, '');
 }
 function waConsSkeleton(text) {
@@ -3485,7 +3485,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
     // English: place every line on the words Whisper actually heard (sent by the browser). No estimating.
     let wordAlignUsed = false;
     let heardWords = null;
-    if ((alignmentMode === 'whisper' || alignmentMode === 'script_audio' || (alignmentMode === 'script_vo' && voMeta.words_source === 'vosk_offline')) && !marathi && voDur > 1 && speechScenes.length > 0) {
+    if ((alignmentMode === 'whisper' || alignmentMode === 'script_audio' || (alignmentMode === 'script_vo' && ['vosk_offline','indicconformer_mr'].includes(voMeta.words_source))) && (langRes.language === 'en' || langRes.language === 'mr') && voDur > 1 && speechScenes.length > 0) {
       const bodyWords = Array.isArray(req.body && req.body.words) ? req.body.words : null;
       if (bodyWords && bodyWords.length >= 6) {
         heardWords = bodyWords;
@@ -3494,7 +3494,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
           return { word: val, text: val, start: Number(w.start), end: Number(w.end) };
         });
         voMeta.words_dur = voDur;
-        voMeta.words_source = alignmentMode === 'whisper' ? 'whisper' : 'vosk_offline';
+        voMeta.words_source = alignmentMode === 'whisper' ? 'whisper' : marathi ? 'indicconformer_mr' : 'vosk_offline';
         saveJson(pid, 'voiceover.json', voMeta);
       } else if (Array.isArray(voMeta.words) && voMeta.words.length >= 6 && Math.abs(Number(voMeta.words_dur || 0) - voDur) <= 0.9) {
         heardWords = voMeta.words;
@@ -3574,7 +3574,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
           }
         }
         // Require strong coverage — never accept a half-matched map and guess the rest.
-        const minCover = Math.max(1, Math.ceil(speechScenes.length * 0.85));
+        const minCover = marathi ? speechScenes.length : Math.max(1, Math.ceil(speechScenes.length * 0.85));
         let credibleWordMap = Boolean(byWords && byWords.size >= minCover);
         let lastWordStart = -1;
         if (credibleWordMap) for (const sc of speechScenes) {
@@ -3604,7 +3604,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
 
     // English + real VO: refuse silence/weight estimates when the client asked for heard words only.
     const requireHeard = Boolean(req.body && req.body.require_heard_words) || (!marathi && voDur > 1 && Array.isArray(req.body?.words));
-    if (requireHeard && !marathi && voDur > 1 && speechScenes.length > 0 && !wordAlignUsed) {
+    if (requireHeard && (langRes.language === 'en' || langRes.language === 'mr') && voDur > 1 && speechScenes.length > 0 && !wordAlignUsed) {
       return res.status(422).json({
         detail:
           'Audio alignment could not match the script to the actual narration. ' +
@@ -3616,7 +3616,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
     let poemHeardWords = null;
     let poemWordAlignUsed = false;
     const poemWordsBody = Array.isArray(req.body && req.body.poem_words) ? req.body.poem_words : null;
-    if (!marathi && hasPoemVo && poemVoDur > 0.4) {
+    if (hasPoemVo && poemVoDur > 0.4 && (langRes.language === 'mr' || langRes.language === 'en')) {
       if (poemWordsBody && poemWordsBody.length >= 6) {
         poemHeardWords = poemWordsBody.map((w) => {
           const val = String(w && (w.word != null ? w.word : (w.text || '')));
@@ -3648,12 +3648,12 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const poemTrackForRequire = scenes.filter((x) => (hasPoemVo || !indic) && onPoemTrack(x));
     const requireHeardPoem =
       Boolean(req.body && req.body.require_heard_poem) ||
-      (!marathi && hasPoemVo && poemVoDur > 0.4 && Array.isArray(req.body?.poem_words));
-    if (requireHeardPoem && !marathi && hasPoemVo && poemTrackForRequire.length > 0 && !(poemHeardWords && poemHeardWords.length >= 6)) {
+      (hasPoemVo && poemVoDur > 0.4 && Array.isArray(req.body?.poem_words));
+    if (requireHeardPoem && hasPoemVo && poemTrackForRequire.length > 0 && !(poemHeardWords && poemHeardWords.length >= 6)) {
       return res.status(422).json({
         detail:
           'Refused poem estimate align — could not hear Poem VO words. ' +
-          'Re-link the Poem VO, run Auto-align again after Whisper finishes hearing the poem. No guessed poem cuts.',
+          'Re-link the appropriate poem audio and run Auto-align again. The existing cuts remain unchanged.',
       });
     }
 
@@ -4149,8 +4149,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
       language: langRes.language,
       align_engine: wordAlignUsed ? (alignmentMode === 'whisper' ? 'english_word' : 'audio_word') : (marathi ? 'marathi' : 'script_vo'),
       poem_align_engine: poemWordAlignUsed ? 'poem_word' : (hasPoemVo && poemVoDur > 0.4 ? 'estimate' : null),
-      align_note: marathi
-        ? (measuredScriptClock
+      align_note: marathi && wordAlignUsed
+        ? 'Marathi audio-led alignment: script lines matched to actual IndicConformer Marathi word timestamps. Videos are trimmed/held at 1x speed.'
+        : marathi
+          ? (measuredScriptClock
           ? 'Marathi engine: workbook scene times, snapped to the silence after each line. English Suno path was not used.'
           : 'Marathi engine: the sheet durations are a 6s/8s template, not a narration clock. Cuts follow Devanagari line length and the silence after each line. English Suno path was not used.')
         : (wordAlignUsed
