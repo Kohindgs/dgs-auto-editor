@@ -145,7 +145,7 @@ function getEffectiveLogoMeta(pid, plan = null) {
       ? plan.logo_enabled
       : typeof meta.enabled === 'boolean'
         ? meta.enabled
-        : true;
+        : false;
   const transform = normalizeLogoTransform((plan && plan.logo_transform) || meta.transform);
   if (meta.path && fs.existsSync(meta.path)) {
     return {
@@ -3562,87 +3562,8 @@ function fmtTimecodeRange(startSec, endSec) {
 }
 
 function scanTimelineQA(plan, scenesInput) {
-  const scenes = Array.isArray(scenesInput) ? scenesInput : [];
-  const byScreen = new Map(scenes.map((s) => [s.screen, s]));
-  const clips = Array.isArray(plan && plan.clips) ? plan.clips : [];
-  const qaIssues = [];
-
-  for (const c of clips) {
-    const mNum = String(c.screen || '').match(/(\d+)$/);
-    const imgNo = mNum ? parseInt(mNum[1], 10) : null;
-    const tc = fmtTimecodeRange(c.start, c.end);
-    const sc = byScreen.get(c.screen);
-
-    if (c.fit === 'missing' || (!c.media_path && !c.media_id)) {
-      const voPreview = String(c.vo_text || (sc && sc.voiceover_text) || '').trim();
-      qaIssues.push({
-        kind: 'missing_card',
-        severity: 'error',
-        screen: c.screen,
-        image_no: imgNo,
-        time: Number(c.start || 0),
-        end: Number(c.end || 0),
-        timecode: tc,
-        expected: voPreview.slice(0, 180),
-        found: 'Blank / Deleted slot on Video 1',
-        message: `Image ${imgNo || c.screen} missing at ${tc}${voPreview ? ` for VO "${voPreview.slice(0, 90)}"` : ''}. Pull an adjacent screen to cover this narration or drop ${imgNo || c.screen}.png.`,
-      });
-      continue;
-    }
-
-    // Check if clip already carries missing_words or fill-in-the-blank vs VO discrepancy
-    if (Array.isArray(c.missing_words) && c.missing_words.length > 0) {
-      const missStr = c.missing_words.map((w) => `"${w}"`).join(', ');
-      qaIssues.push({
-        kind: 'card_text',
-        severity: 'warning',
-        screen: c.screen,
-        image_no: imgNo,
-        time: Number(c.start || 0),
-        end: Number(c.end || 0),
-        timecode: tc,
-        expected: String(c.vo_text || c.script_text || '').slice(0, 180),
-        found: String(c.script_text || '').slice(0, 180),
-        missing_words: c.missing_words,
-        message: `Image ${imgNo || c.screen} (${tc}): Missing text in image (present in VO): ${missStr} missing on card. Delete this scene & pull adjacent screen to cover, or replace the image.`,
-      });
-    }
-  }
-
-  // Check if any locked narration segment is uncovered on Video 1 (e.g. after deleting a scene without pulling a screen to cover)
-  const narrSegs = Array.isArray(plan && plan.narration_segments) ? plan.narration_segments : [];
-  if (narrSegs.length > 0) {
-    const validVideoClips = clips.filter((c) => c.fit !== 'missing' && (c.media_id || c.media_path));
-    for (const seg of narrSegs) {
-      if (seg.narration_in == null || seg.narration_out == null) continue;
-      const spokenDur = Number(seg.narration_out) - Number(seg.narration_in);
-      if (spokenDur < 0.2) continue;
-      const segStart = Number(seg.start || 0);
-      const segEnd = Math.min(Number(seg.end || 0), segStart + spokenDur);
-      const mid = 0.5 * (segStart + segEnd);
-      const covered = validVideoClips.some((c) => Number(c.start || 0) - 0.15 <= mid && mid <= Number(c.end || 0) + 0.15);
-      if (!covered) {
-        const mNum = String(seg.screen || '').match(/(\d+)$/);
-        const imgNo = mNum ? parseInt(mNum[1], 10) : null;
-        const tc = fmtTimecodeRange(segStart, segEnd);
-        qaIssues.push({
-          kind: 'missing_card',
-          severity: 'warning',
-          screen: seg.screen,
-          image_no: imgNo,
-          time: segStart,
-          end: segEnd,
-          timecode: tc,
-          expected: String(seg.vo_text || '').slice(0, 180),
-          found: 'Empty gap on Video 1',
-          message: `Narration uncovered at ${tc} (${String(seg.screen || '').replace('screen_', 'Scene ')}): VO says "${String(seg.vo_text || '').slice(0, 100)}", but no screen covers this interval. Pull the previous or next screen to cover the timeline.`,
-        });
-      }
-    }
-  }
-
-  qaIssues.sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
-  return qaIssues;
+  // Error / QA module disabled per user request: return pure timeline without QA flags
+  return [];
 }
 
 async function healTimelinePaths(pid, plan) {
