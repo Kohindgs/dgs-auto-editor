@@ -1236,8 +1236,16 @@ const VoAlignBrain = {
         [],
         Number(poemDuration),
       );
-      const minCover = Math.max(1, Math.ceil(poemScenes.length * 0.7));
-      if (byWords && byWords.size >= minCover) {
+      const complete = Boolean(byWords && byWords.size === poemScenes.length
+        && poemScenes.every(scene => byWords.has(scene.screen)));
+      let chronological = complete;
+      let lastStart = -1;
+      if (complete) for (const scene of poemScenes) {
+        const [a, b] = byWords.get(scene.screen);
+        if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a + 0.18 || a < lastStart - 0.03 || b > poemDuration + 0.75) { chronological = false; break; }
+        lastStart = a;
+      }
+      if (chronological) {
         const out = [];
         for (let i = 0; i < poemScenes.length; i++) {
           const sc = poemScenes[i];
@@ -1268,50 +1276,8 @@ const VoAlignBrain = {
         }
         return out;
       }
-      // 2) Even partition of heard words across lyric cards (still heard — not script-duration guess).
-      const spans = words
-        .map((w) => {
-          const a = Number(w.start);
-          const b = Number(w.end != null ? w.end : a + 0.08);
-          return Number.isFinite(a) ? [a, Math.max(a + 0.05, b)] : null;
-        })
-        .filter(Boolean);
-      if (spans.length >= 6) {
-        const n = poemScenes.length;
-        const lastEnd = spans[spans.length - 1][1];
-        const out = [];
-        for (let i = 0; i < n; i++) {
-          let i0 = Math.round(i * (spans.length / n));
-          let i1 = Math.round((i + 1) * (spans.length / n)) - 1;
-          i0 = Math.max(0, Math.min(i0, spans.length - 1));
-          i1 = Math.max(i0, Math.min(i1, spans.length - 1));
-          const aIn = spans[i0][0];
-          const aOut = spans[i1][1];
-          let nxtIn = null;
-          if (i + 1 < n) {
-            let j0 = Math.round((i + 1) * (spans.length / n));
-            j0 = Math.max(0, Math.min(j0, spans.length - 1));
-            nxtIn = spans[j0][0];
-          }
-          let [picIn, picOut] = this.lockPictureToAudio(aIn, aOut, nxtIn);
-          if (i + 1 >= n) picOut = Math.max(picOut, lastEnd);
-          out.push({
-            screen: poemScenes[i].screen,
-            start: Math.round((origin + picIn) * 1000) / 1000,
-            end: Math.round((origin + picOut) * 1000) / 1000,
-            narration_in: Math.round((origin + aIn) * 1000) / 1000,
-            narration_out: Math.round((origin + aOut) * 1000) / 1000,
-            engine: 'poem_word',
-          });
-        }
-        if (out.length) {
-          out[out.length - 1].end = Math.round(Math.max(Number(out[out.length - 1].end), fileEnd) * 1000) / 1000;
-          out[out.length - 1].narration_out = Math.round(
-            Math.max(Number(out[out.length - 1].narration_out), fileEnd) * 1000,
-          ) / 1000;
-        }
-        return out;
-      }
+      // Do not divide unmatched poem lyrics into invented evenly-spaced word groups.
+      // Use the explicit estimate fallback, which must not claim audio lock.
     }
 
     // 3) Estimate fallback: scale script durations to fill the poem file.
@@ -3259,6 +3225,9 @@ app.get('/api/projects/:id/logo', (req, res) => {
   res.sendFile(path.resolve(eff.path));
 });
 
+// Audio-led script timing is served locally without browser Whisper.
+require('./audio-align-routes').installAudioAlignRoutes({ app, upload, projectRoot, ffmpegPath: FFMPEG_BIN });
+
 app.post('/api/projects/:id/build', async (req, res) => {
   try {
     const pid = req.params.id;
@@ -3440,7 +3409,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const langRes = resolveAlignLanguage(req.body && req.body.language, scenes);
     const marathi = langRes.marathi;
     // Script + VO silence alignment is now the default. Whisper is opt-in only.
-    const alignmentMode = String(req.body?.alignment_mode || '').trim().toLowerCase() === 'whisper' || req.body?.require_heard_words === true ? 'whisper' : 'script_vo';
+    const requestedAlignMode = String(req.body?.alignment_mode || '').trim().toLowerCase();
+    const alignmentMode = requestedAlignMode === 'script_audio' ? 'script_audio'
+      : requestedAlignMode === 'whisper' ? 'whisper'
+      : req.body?.require_heard_words === true ? 'script_audio' : 'script_vo';
     // Marathi engine is a separate path. English Auto-align never uses Indic weights / poem-in-VO.
     const indic = marathi;
     const silences = Array.isArray(voMeta.silences) && voMeta.silences.length
@@ -3513,7 +3485,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
     // English: place every line on the words Whisper actually heard (sent by the browser). No estimating.
     let wordAlignUsed = false;
     let heardWords = null;
-    if (alignmentMode === 'whisper' && !marathi && voDur > 1 && speechScenes.length > 0) {
+    if ((alignmentMode === 'whisper' || alignmentMode === 'script_audio' || (alignmentMode === 'script_vo' && voMeta.words_source === 'vosk_offline')) && !marathi && voDur > 1 && speechScenes.length > 0) {
       const bodyWords = Array.isArray(req.body && req.body.words) ? req.body.words : null;
       if (bodyWords && bodyWords.length >= 6) {
         heardWords = bodyWords;
@@ -3522,6 +3494,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
           return { word: val, text: val, start: Number(w.start), end: Number(w.end) };
         });
         voMeta.words_dur = voDur;
+        voMeta.words_source = alignmentMode === 'whisper' ? 'whisper' : 'vosk_offline';
         saveJson(pid, 'voiceover.json', voMeta);
       } else if (Array.isArray(voMeta.words) && voMeta.words.length >= 6 && Math.abs(Number(voMeta.words_dur || 0) - voDur) <= 0.9) {
         heardWords = voMeta.words;
@@ -3634,8 +3607,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
     if (requireHeard && !marathi && voDur > 1 && speechScenes.length > 0 && !wordAlignUsed) {
       return res.status(422).json({
         detail:
-          'Refused estimate align — could not lock script lines to heard VO words. ' +
-          'Re-link VO 1+2, run Auto-align again after Whisper finishes hearing the full narration. No guessed cuts.',
+          'Audio alignment could not match the script to the actual narration. ' +
+          'Check the correct VO files are linked, then retry Audio Align. Video cuts were not overwritten.',
       });
     }
 
@@ -4126,7 +4099,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       poem_lyric_start: 0,
       marathi,
       language: langRes.language,
-      align_engine: wordAlignUsed ? 'english_word' : (marathi ? 'marathi' : 'script_vo'),
+      align_engine: wordAlignUsed ? (alignmentMode === 'whisper' ? 'english_word' : 'audio_word') : (marathi ? 'marathi' : 'script_vo'),
     };
     const srtCues = buildSrtCues(clips, planOpts);
     saveSrt(pid, 'subtitles.srt', formatSrt(srtCues));
@@ -4174,7 +4147,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       poem_overlay: existingTl?.poem_overlay ? normalizePoemOverlayStyle(existingTl.poem_overlay) : normalizePoemOverlayStyle(),
       ignored_qa_keys: Array.isArray(existingTl?.ignored_qa_keys) ? existingTl.ignored_qa_keys : [],
       language: langRes.language,
-      align_engine: wordAlignUsed ? 'english_word' : (marathi ? 'marathi' : 'script_vo'),
+      align_engine: wordAlignUsed ? (alignmentMode === 'whisper' ? 'english_word' : 'audio_word') : (marathi ? 'marathi' : 'script_vo'),
       poem_align_engine: poemWordAlignUsed ? 'poem_word' : (hasPoemVo && poemVoDur > 0.4 ? 'estimate' : null),
       align_note: marathi
         ? (measuredScriptClock
@@ -4243,6 +4216,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
       syncReport.speech_verified = false;
       syncReport.estimate_only = true;
       syncReport.summary = `SCRIPT + VO ESTIMATE · ${plan.clips.length} scenes on narration clock · verify cuts against spoken words before export`;
+    } else if (alignmentMode !== 'whisper') {
+      syncReport.audio_anchored = true;
+      syncReport.speech_verified = false;
+      syncReport.summary = `AUDIO-LED CUTS · ${plan.clips.length} scenes matched to actual VO words · manually review any speech recognition errors`;
     }
     const qaSummary = `${syncReport.summary}${engineNote}${partialVoNote}`
       + (warnCount || errCount
@@ -4250,7 +4227,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
         : '');
     plan.qa_issues = qaIssues;
     plan.qa_summary = qaSummary;
-    plan.align_engine = wordAlignUsed ? 'english_word' : (marathi ? 'marathi' : 'script_vo');
+    plan.align_engine = wordAlignUsed ? (alignmentMode === 'whisper' ? 'english_word' : 'audio_word') : (marathi ? 'marathi' : 'script_vo');
 
     saveJson(pid, 'timeline.json', plan);
     saveJson(pid, 'qa.json', { summary: qaSummary, issues: qaIssues, sync_report: syncReport });
@@ -4372,6 +4349,10 @@ app.put('/api/projects/:id/timeline', async (req, res) => {
       syncReport.speech_verified = false;
       syncReport.estimate_only = true;
       syncReport.summary = `SCRIPT + VO ESTIMATE · ${Array.isArray(plan.clips) ? plan.clips.length : 0} scenes on narration clock · cuts require spoken-word review`;
+    } else if (plan.align_engine === 'audio_word') {
+      syncReport.audio_anchored = true;
+      syncReport.speech_verified = false;
+      syncReport.summary = `AUDIO-LED CUTS · ${Array.isArray(plan.clips) ? plan.clips.length : 0} scenes matched to actual VO words · review uncertain lines`;
     }
     plan.sync_report = syncReport;
     const qaIssues = [...syncReport.issues, ...scanTimelineQA(plan, scenes)];
