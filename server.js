@@ -1820,7 +1820,8 @@ function buildSrtCues(clips, planOpts = {}) {
       start = Number(c.caption_in);
       end = Number(c.caption_out);
     } else if (spoken) {
-      end = Math.min(end, start + (Number(c.narration_out) - Number(c.narration_in)));
+      start = Number(c.narration_in);
+      end = Math.max(Number(c.narration_out), start + 0.4);
     } else if (inPoem) {
       if (lyricStart > start + 0.05) start = lyricStart;
     } else if (marathi || !c.vo_text) {
@@ -3224,20 +3225,37 @@ app.post('/api/projects/:id/build', async (req, res) => {
           if (sIdx < activeSlots.length - 1) {
             const targetW = (cumSlotDur / Math.max(1, voDur)) * totalNarrW;
             let bestIdx = startIdx + 1;
-            let bestScore = Infinity;
             let runW = 0;
+            const sectionCandidates = [];
             for (let k = 1; k <= narratedScenes.length - (activeSlots.length - 1 - sIdx); k++) {
               runW += speechWeights.get(narratedScenes[k - 1].screen) || 2.0;
               if (k <= startIdx) continue;
-              const diff = Math.abs(runW - targetW);
               const curSec = String(narratedScenes[k - 1].section || '').split('|')[0].trim().toLowerCase();
               const nextSec = k < narratedScenes.length
                 ? String(narratedScenes[k].section || '').split('|')[0].trim().toLowerCase()
                 : '';
-              const secBonus = (curSec && nextSec && curSec !== nextSec && diff < 8) ? Math.min(3, diff * 0.4) : 0;
-              if (diff - secBonus < bestScore) {
-                bestScore = diff - secBonus;
-                bestIdx = k;
+              if (curSec && nextSec && curSec !== nextSec) {
+                const diff = Math.abs(runW - targetW);
+                const relDiff = diff / Math.max(1, targetW);
+                if (relDiff <= 0.35) {
+                  sectionCandidates.push({ k, diff, relDiff });
+                }
+              }
+            }
+            if (sectionCandidates.length > 0) {
+              sectionCandidates.sort((a, b) => a.diff - b.diff);
+              bestIdx = sectionCandidates[0].k;
+            } else {
+              runW = 0;
+              let bestScore = Infinity;
+              for (let k = 1; k <= narratedScenes.length - (activeSlots.length - 1 - sIdx); k++) {
+                runW += speechWeights.get(narratedScenes[k - 1].screen) || 2.0;
+                if (k <= startIdx) continue;
+                const diff = Math.abs(runW - targetW);
+                if (diff < bestScore) {
+                  bestScore = diff;
+                  bestIdx = k;
+                }
               }
             }
             endIdx = bestIdx;
