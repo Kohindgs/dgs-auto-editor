@@ -1,0 +1,26 @@
+{
+  "version": "0.9.0-beta.1",
+  "released": "2026-11-03",
+  "notes": [
+    "One Windows EXE for Windows 10 and 11, and one Mac DMG for macOS 11 and newer.",
+    "The Updates button shows this version and the change log. A newer published version shows a download link.",
+    "English and Marathi (Devanagari) card-reading files download into the app when they are missing.",
+    "The hearing model downloads on the first Auto-align."
+  ],
+  "downloads": {
+    "win": "https://github.com/Kohindgs/dgs-auto-editor/releases/latest",
+    "mac": "https://github.com/Kohindgs/dgs-auto-editor/releases/latest"
+  },
+  "history": [
+    {
+      "version": "0.9.0-beta.1",
+      "date": "2026-11-03",
+      "notes": [
+        "One Windows EXE for Windows 10 and 11, and one Mac DMG for macOS 11 and newer.",
+        "The Updates button shows this version and the change log. A newer published version shows a download link.",
+        "English and Marathi (Devanagari) card-reading files download into the app when they are missing.",
+        "The hearing model downloads on the first Auto-align."
+      ]
+    }
+  ]
+}
