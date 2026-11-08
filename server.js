@@ -4,13 +4,16 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const fsp = require('fs/promises');
 const crypto = require('crypto');
 const zlib = require('zlib');
-const { spawn, execFile } = require('child_process');
+const { spawn, execFile, spawnSync } = require('child_process');
 const { promisify } = require('util');
 const XLSX = require('xlsx');
 const AdmZip = require('adm-zip');
+const { placePoemScenes, placePoemOnSheetClock } = require('./poem_place');
+const { settleGap, peelHead, peelStolenTail, findRepeatedHearings } = require('./script_led_gap');
 
 const execFileAsync = promisify(execFile);
 
@@ -95,7 +98,8 @@ function normalizeLogoTransform(raw) {
 const DEFAULT_POEM_OVERLAY_STYLE = {
   enabled: true,
   locked: false,
-  font_family: 'Poppins',
+  font_family: 'Nirmala UI',
+  font_weight: 400,
   font_size_px: 28,
   preset_style: 'badge_pill',
   text_color: '#ffffff',
@@ -104,12 +108,22 @@ const DEFAULT_POEM_OVERLAY_STYLE = {
   border_color: '#38bdf8',
   border_width: 2,
   border_radius: 24,
-  box_shadow: true,
-  text_align: 'center',
-  x_pct: 10,
-  y_pct: 72,
-  w_pct: 80,
-  h_pct: 20,
+    box_shadow: true,
+    shadow_soft: 6,
+    text_style: 'shadow',
+    text_shadow: true,
+    text_shadow_soft: 6,
+    stroke_color: '#111111',
+    shadow_color: '#000000',
+    text_align: 'center',
+    x_pct: 10,
+    y_pct: 72,
+    w_pct: 80,
+    h_pct: 20,
+    word_balls: false,
+    ball_color: '#facc15',
+    changeover: 'fade',
+    apply_all: true,
 };
 
 function normalizePoemOverlayStyle(raw) {
@@ -121,21 +135,42 @@ function normalizePoemOverlayStyle(raw) {
     enabled: raw.enabled !== false,
     locked: Boolean(raw.locked),
     font_family: String(raw.font_family || DEFAULT_POEM_OVERLAY_STYLE.font_family).slice(0, 80),
+    font_weight: num(raw.font_weight, 100, 900, 400),
     font_size_px: num(raw.font_size_px, 12, 72, DEFAULT_POEM_OVERLAY_STYLE.font_size_px),
     preset_style: presetKey,
     text_color: String(raw.text_color || DEFAULT_POEM_OVERLAY_STYLE.text_color).slice(0, 32),
     bg_color: String(raw.bg_color || DEFAULT_POEM_OVERLAY_STYLE.bg_color).slice(0, 32),
-    bg_opacity: num(raw.bg_opacity, 0, 1, DEFAULT_POEM_OVERLAY_STYLE.bg_opacity),
+    bg_opacity: raw.bg_none ? 0 : num(raw.bg_opacity, 0, 1, DEFAULT_POEM_OVERLAY_STYLE.bg_opacity),
     border_color: String(raw.border_color || DEFAULT_POEM_OVERLAY_STYLE.border_color).slice(0, 32),
-    border_width: num(raw.border_width, 0, 16, DEFAULT_POEM_OVERLAY_STYLE.border_width),
+    border_width: raw.border_none ? 0 : num(raw.border_width, 0, 16, DEFAULT_POEM_OVERLAY_STYLE.border_width),
+    border_none: Boolean(raw.border_none),
     border_radius: num(raw.border_radius, 0, 64, DEFAULT_POEM_OVERLAY_STYLE.border_radius),
     box_shadow: raw.box_shadow !== false,
+    shadow_soft: num(raw.shadow_soft, 0, 24, 6),
+    text_style: ['plain', 'shadow', 'outline', 'sticker', 'lift', 'glow'].includes(raw.text_style) ? raw.text_style : 'shadow',
+    text_shadow: raw.text_shadow !== false,
+    text_shadow_soft: num(raw.text_shadow_soft, 0, 24, 6),
+    stroke_color: String(raw.stroke_color || '#111111').slice(0, 32),
+    bg_none: Boolean(raw.bg_none),
     text_align: raw.text_align === 'left' || raw.text_align === 'right' ? raw.text_align : 'center',
     x_pct: num(raw.x_pct, 0, 95, DEFAULT_POEM_OVERLAY_STYLE.x_pct),
     y_pct: num(raw.y_pct, 0, 95, DEFAULT_POEM_OVERLAY_STYLE.y_pct),
     w_pct: num(raw.w_pct, 10, 100, DEFAULT_POEM_OVERLAY_STYLE.w_pct),
     h_pct: num(raw.h_pct, 5, 90, DEFAULT_POEM_OVERLAY_STYLE.h_pct),
+    shadow_color: String(raw.shadow_color || DEFAULT_POEM_OVERLAY_STYLE.shadow_color).slice(0, 32),
+    word_balls: Boolean(raw.word_balls),
+    ball_color: String(raw.ball_color || DEFAULT_POEM_OVERLAY_STYLE.ball_color).slice(0, 32),
+    changeover: ['none', 'fade', 'slide', 'pop'].includes(raw.changeover) ? raw.changeover : DEFAULT_POEM_OVERLAY_STYLE.changeover,
+    apply_all: raw.apply_all !== false,
+    hidden_screens: Array.isArray(raw.hidden_screens)
+      ? [...new Set(raw.hidden_screens.map((s) => String(s || '').trim()).filter(Boolean))].slice(0, 200)
+      : [],
   };
+}
+
+function poemScreenHidden(look, clipRow) {
+  const list = look && Array.isArray(look.hidden_screens) ? look.hidden_screens : [];
+  return list.includes(String(clipRow && clipRow.screen || ''));
 }
 
 function getEffectiveLogoMeta(pid, plan = null) {
@@ -852,7 +887,8 @@ function parseProductionXlsx(filePath) {
             audioStart != null ||
             isPoemCandidate
           );
-      const vType = /video|mp4|anim|व्हिडिओ|चलचित्र/i.test(rawTypeCell || rawVisCell) ? 'Video' : 'Image';
+      // Visual Type column only — direction prose may say "documentary shot" on a still.
+      const vType = /video|mp4|\banim\b|animation|documentary|cinematic|footage|motion\s*clip|व्हिडिओ|चलचित्र/i.test(rawTypeCell || '') ? 'Video' : 'Image';
 
       scenes.push({
         screen,
@@ -866,6 +902,7 @@ function parseProductionXlsx(filePath) {
         voiceover_text: voClean,
         voiceover_raw: rawVoCell,
         visual_type: vType,
+        visual_handling: rawTypeCell || '',
         visual_direction: rawVisCell,
         text: [voClean, ostClean, currentSection].filter(Boolean).join('\n') || `Scene ${sceneNo}`,
         is_poem: isPoem,
@@ -948,15 +985,19 @@ function onPoemTrack(scene) {
 }
 
 function isIndicScript(scenes) {
+  // The engine uses one module for the whole chapter. Marathi only when the
+  // spoken lines are mostly Devanagari. A few Devanagari letters in an English
+  // chapter do not switch it to the Marathi module.
   const sample = (scenes || [])
     .slice(0, 40)
     .map((s) => String(s?.voiceover_text || s?.onscreen_text || s?.text || ''))
     .join(' ');
-  const devMatches = sample.match(/[\u0900-\u097F]/g);
-  return Boolean(devMatches && devMatches.length >= 12);
+  const dev = (sample.match(/[\u0900-\u097F]/g) || []).length;
+  const lat = (sample.match(/[A-Za-z]/g) || []).length;
+  return dev >= 12 && dev > lat;
 }
 
-/** Language dropdown is the switch. English never runs the Marathi engine. */
+/** The language box picks the module. English never runs the Marathi engine. */
 function resolveAlignLanguage(requested, scenes) {
   const raw = String(requested || '').trim().toLowerCase();
   if (raw === 'en' || raw === 'english') {
@@ -965,11 +1006,32 @@ function resolveAlignLanguage(requested, scenes) {
   if (raw === 'mr' || raw === 'marathi' || raw === 'hi' || raw === 'hindi') {
     return { language: raw === 'hi' || raw === 'hindi' ? 'hi' : 'mr', marathi: true, engine: 'marathi' };
   }
-  // auto / en+mr / empty — Devanagari script picks Marathi, otherwise English
   if (isIndicScript(scenes)) {
     return { language: 'mr', marathi: true, engine: 'marathi' };
   }
-  return { language: raw === 'auto' ? 'en' : (raw || 'en'), marathi: false, engine: 'english' };
+  return { language: 'en', marathi: false, engine: 'english' };
+}
+
+/** Heard words must be in the chapter's script. English words never lock a Devanagari line. */
+function wordsMatchAlignLanguage(words, marathi) {
+  const tags = [];
+  for (const w of words || []) {
+    const text = String(w && (w.word != null ? w.word : (w.text || '')));
+    if (/[\u0900-\u097F]/.test(text)) tags.push('mr');
+    else if (/[A-Za-z]/.test(text)) tags.push('en');
+  }
+  if (tags.length < 6) return false;
+  const dev = tags.filter((t) => t === 'mr').length / tags.length;
+  const lat = tags.filter((t) => t === 'en').length / tags.length;
+  if (marathi) return dev >= 0.7;
+  return lat >= 0.7 && dev < 0.15;
+}
+
+function alignEngineName(marathi, wordAlignUsed, alignmentMode) {
+  if (marathi) return wordAlignUsed ? 'audio_word' : 'marathi';
+  // Heard English words are the English engine, whether they came from Whisper or the desktop hearer.
+  if (wordAlignUsed) return 'english_word';
+  return 'script_vo';
 }
 
 function captionForScene(scene, isInst, marathi) {
@@ -1227,57 +1289,25 @@ const VoAlignBrain = {
     if (!poemScenes.length || poemDuration <= 0.4) return [];
     const words = Array.isArray(poemWords) ? poemWords : [];
 
-    // 1) Match lyric script lines to heard poem words (same engine as narration).
+    // 1) Match sung lines to heard poem words. Instrumental time stays on the
+    // previous screen, or on the next screen when nothing is before it.
     if (words.length >= 6) {
-      const byWords = alignSpeechByWords(
-        poemScenes,
-        allScenes || poemScenes,
-        words,
-        [],
-        Number(poemDuration),
-      );
-      const complete = Boolean(byWords && byWords.size === poemScenes.length
-        && poemScenes.every(scene => byWords.has(scene.screen)));
-      let chronological = complete;
-      let lastStart = -1;
-      if (complete) for (const scene of poemScenes) {
-        const [a, b] = byWords.get(scene.screen);
-        if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a + 0.18 || a < lastStart - 0.03 || b > poemDuration + 0.75) { chronological = false; break; }
-        lastStart = a;
+      const placed = placePoemScenes(poemScenes, words, Number(poemDuration), durFn);
+      if (placed && placed.length) {
+        return placed.map((row) => {
+          const start = Math.round((origin + Number(row.start)) * 1000) / 1000;
+          const end = Math.round((origin + Number(row.end)) * 1000) / 1000;
+          return {
+            screen: row.screen,
+            start,
+            end,
+            narration_in: start,
+            narration_out: end,
+            engine: row.engine,
+          };
+        });
       }
-      if (chronological) {
-        const out = [];
-        for (let i = 0; i < poemScenes.length; i++) {
-          const sc = poemScenes[i];
-          const span = byWords.get(sc.screen);
-          if (!span) continue;
-          const ni = Number(span[0]);
-          const no = Number(span[1]);
-          let nextIn = null;
-          for (let j = i + 1; j < poemScenes.length; j++) {
-            const nxt = byWords.get(poemScenes[j].screen);
-            if (nxt) { nextIn = Number(nxt[0]); break; }
-          }
-          const [picIn, picOut] = this.lockPictureToAudio(ni, no, nextIn);
-          out.push({
-            screen: sc.screen,
-            start: Math.round((origin + picIn) * 1000) / 1000,
-            end: Math.round((origin + picOut) * 1000) / 1000,
-            narration_in: Math.round((origin + ni) * 1000) / 1000,
-            narration_out: Math.round((origin + no) * 1000) / 1000,
-            engine: 'poem_word',
-          });
-        }
-        if (out.length) {
-          out[out.length - 1].end = Math.round(Math.max(Number(out[out.length - 1].end), fileEnd) * 1000) / 1000;
-          out[out.length - 1].narration_out = Math.round(
-            Math.max(Number(out[out.length - 1].narration_out), fileEnd) * 1000,
-          ) / 1000;
-        }
-        return out;
-      }
-      // Do not divide unmatched poem lyrics into invented evenly-spaced word groups.
-      // Use the explicit estimate fallback, which must not claim audio lock.
+      console.warn('[poem-lock] sung lines did not lock to their own heard words');
     }
 
     // 3) Estimate fallback: scale script durations to fill the poem file.
@@ -1316,28 +1346,62 @@ const VoAlignBrain = {
       (c) => c.narration_in != null && c.narration_out != null
         && (Number(c.narration_out) - Number(c.narration_in)) >= 0.15,
     );
-    const driftOf = (c) => Math.abs(Number(c.narration_in) - Number(c.start));
+    const poemSpan = Math.max(0, Number(opts.poemSpan || 0));
+    const poemEnd = Number(opts.poemEnd || 0);
+    const holds = Array.isArray(opts.qaHolds) ? opts.qaHolds : [];
+    const joins = Array.isArray(opts.voJoins) ? opts.voJoins : [];
+    const sumClock = (rows, fileT, field) => {
+      let total = 0;
+      for (const row of rows) {
+        const at = Number(row && row.file);
+        const add = Number(row && row[field]);
+        if (Number.isFinite(at) && Number.isFinite(add) && at < Number(fileT) - 0.02) total += add;
+      }
+      return total;
+    };
+    const holdBefore = (fileT) => sumClock(holds, fileT, 'extra');
+    const joinBefore = (fileT) => sumClock(joins, fileT, 'removed');
+    const voiceOnPicture = (c) => {
+      let voice = Number(c.narration_in);
+      // After a poem, narration_in is the voice-file clock and the card is
+      // later by the poem. Comparing the two clocks raised a false drift.
+      // A question-answer hold adds the same amount. A closed cut removes it.
+      // Lyric cards inside the poem keep picture time in narration_in, so the
+      // later narration holds are not added there.
+      const afterPoem = poemSpan > 0.5 && poemEnd > 0 && Number(c.start) >= poemEnd - 0.05;
+      const inPoem = poemSpan > 0.5 && poemEnd > 0 && !afterPoem
+        && Number(c.start) >= poemEnd - poemSpan - 0.05;
+      if (afterPoem) voice += poemSpan;
+      if (!inPoem) voice += holdBefore(c.narration_in) - joinBefore(c.narration_in);
+      return voice;
+    };
+    const driftOf = (c) => Math.abs(voiceOnPicture(c) - Number(c.start));
     let drifted = spoken
       .filter((c) => driftOf(c) > limit)
       .map((c) => ({
         screen: c.screen,
         drift: Math.round(driftOf(c) * 1000) / 1000,
         picture_start: Math.round(Number(c.start) * 1000) / 1000,
-        narration_in: Math.round(Number(c.narration_in) * 1000) / 1000,
+        narration_in: Math.round(voiceOnPicture(c) * 1000) / 1000,
       }));
 
     let repaired = 0;
+    const keepAfter = opts.keepAfter != null ? Number(opts.keepAfter) : null;
     if (repair && drifted.length) {
       const sorted = [...spoken].sort((a, b) => Number(a.narration_in) - Number(b.narration_in));
       for (let i = 0; i < sorted.length; i++) {
         const c = sorted[i];
+        if (keepAfter != null && Number(c.start) >= keepAfter - 0.05) continue;
         const ni = Number(c.narration_in);
         const no = Number(c.narration_out);
         const nxt = i + 1 < sorted.length ? Number(sorted[i + 1].narration_in) : null;
         const [picIn, picOut] = this.lockPictureToAudio(ni, no, nxt);
-        if (Math.abs(Number(c.start) - picIn) > 0.001 || Math.abs(Number(c.end) - picOut) > 0.001) repaired += 1;
-        c.start = picIn;
-        c.end = picOut;
+        const extra = holdBefore(ni) - joinBefore(ni);
+        const wantIn = Math.round((picIn + extra) * 1000) / 1000;
+        const wantOut = Math.round((picOut + extra) * 1000) / 1000;
+        if (Math.abs(Number(c.start) - wantIn) > 0.001 || Math.abs(Number(c.end) - wantOut) > 0.001) repaired += 1;
+        c.start = wantIn;
+        c.end = wantOut;
         c.duration = Math.round((picOut - picIn) * 1000) / 1000;
       }
       drifted = spoken
@@ -1346,7 +1410,7 @@ const VoAlignBrain = {
           screen: c.screen,
           drift: Math.round(driftOf(c) * 1000) / 1000,
           picture_start: Math.round(Number(c.start) * 1000) / 1000,
-          narration_in: Math.round(Number(c.narration_in) * 1000) / 1000,
+          narration_in: Math.round(voiceOnPicture(c) * 1000) / 1000,
         }));
     }
 
@@ -1354,7 +1418,12 @@ const VoAlignBrain = {
     for (const c of spoken) maxDrift = Math.max(maxDrift, driftOf(c));
     const voDur = Number(voDuration || 0);
     const lastEnd = list.length ? Math.max(...list.map((c) => Number(c.end || 0))) : 0;
-    const voDelta = voDur > 1 ? Math.round((lastEnd - voDur) * 1000) / 1000 : 0;
+    let compareEnd = lastEnd;
+    if (poemSpan > 0.5 && voDur > 1 && Math.abs((lastEnd - poemSpan) - voDur) + 0.05 < Math.abs(lastEnd - voDur)) {
+      compareEnd = lastEnd - poemSpan;
+    }
+    compareEnd -= holdBefore(1e9) - joinBefore(1e9);
+    const voDelta = voDur > 1 ? Math.round((compareEnd - voDur) * 1000) / 1000 : 0;
     const voLenOk = voDur > 1 ? Math.abs(voDelta) <= 1.0 : true;
     const ok = drifted.length === 0 && voLenOk && spoken.length > 0;
 
@@ -1441,18 +1510,35 @@ function waConsSkeleton(text) {
   WA_CONS_CACHE.set(s, res);
   return res;
 }
+function waIndicKey(text) {
+  let s = String(text || '');
+  if (!/[\u0900-\u097F]/.test(s)) return '';
+  s = s.replace(/\u091C\u094D\u091E/g, '\u0926\u094D\u092F');
+  s = s.replace(/[\u093E-\u094C\u0951-\u0957\u0962\u0963]/g, '');
+  s = s.replace(/[\u0901\u0902]/g, '');
+  s = s.replace(/\u094D/g, '');
+  s = s.replace(/\u0923/g, '\u0928').replace(/\u0920/g, '\u0921').replace(/\u0933/g, '\u0932');
+  return s.replace(/[^\u0900-\u097F]/g, '');
+}
 function waSameWord(h, w) {
   if (!h || !w) return false;
   if (h === w) return true;
   const lh = h.length;
   const lw = w.length;
   if (Math.min(lh, lw) >= 2 && Math.abs(lh - lw) <= 1 && (h.startsWith(w) || w.startsWith(h))) return true;
-  if (lh >= 3 && lw >= 3 && Math.abs(lh - lw) <= 2 && (h.includes(w) || w.includes(h))) return true;
+  // Substring only for longer stems — air⊂stair / the⊂there are false friends.
+  if (Math.min(lh, lw) >= 4 && Math.abs(lh - lw) <= 2 && (h.includes(w) || w.includes(h))) return true;
   if (lh >= 3 && lw >= 3 && Math.abs(lh - lw) <= 2) {
     const hc = waConsSkeleton(h.replace(/ck/g, 'k'));
     const wc = waConsSkeleton(w.replace(/ck/g, 'k'));
     if (hc.length >= 2 && hc === wc) return true;
     if (lh >= 4 && lw >= 4 && h[0] === w[0] && hc.slice(0, 2) === wc.slice(0, 2)) return true;
+  }
+  const ih = waIndicKey(h);
+  const iw = waIndicKey(w);
+  if (ih && iw && ih.length >= 2 && iw.length >= 2) {
+    if (ih === iw) return true;
+    if (Math.min(ih.length, iw.length) >= 3 && Math.abs(ih.length - iw.length) <= 1 && (ih.startsWith(iw) || iw.startsWith(ih) || ih.includes(iw) || iw.includes(ih))) return true;
   }
   return false;
 }
@@ -1467,8 +1553,27 @@ function waPairScore(scriptTok, heardTok) {
  * Returns Map(screen -> [narration_in, narration_out]) for every spoken scene it could place,
  * or null when the recording words are unusable (caller falls back to the silence/estimate path).
  */
+function expressionTagNorms(scenes) {
+  const tags = new Set();
+  const spoken = new Set();
+  for (const s of scenes || []) {
+    for (const t of waTokens(String(s.voiceover_text || ''))) spoken.add(waNorm(t));
+    const raw = String(s.voiceover_raw || '');
+    for (const block of raw.match(/\[([^\]]*)\]/g) || []) {
+      for (const t of waTokens(block)) {
+        const n = waNorm(t);
+        if (n && !/[\u0900-\u097F]/.test(n)) tags.add(n);
+      }
+    }
+  }
+  for (const w of spoken) tags.delete(w);
+  return tags;
+}
+
 function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDuration, segmentStart = 0) {
   if (!Array.isArray(wordsIn) || !speechScenes.length) return null;
+  const tagNorms = expressionTagNorms(speechScenes);
+  const indicChapter = speechScenes.some((s) => /[\u0900-\u097F]/.test(String(s.voiceover_text || '')));
   const pos = new Map((allScenes || []).map((s, i) => [s.screen, i]));
   const A = [];
   for (const w of wordsIn) {
@@ -1477,6 +1582,8 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
     const st = Number(w && w.start);
     const en = Number(w && w.end);
     if (!tok || !Number.isFinite(st)) continue;
+    if (tagNorms.has(tok)) continue;
+    if (indicChapter && !/[\u0900-\u097F]/.test(tok) && /[a-z]/i.test(tok)) continue;
     A.push({ tok, text: String(rawTxt), start: st, end: Number.isFinite(en) && en >= st ? en : st + 0.1 });
   }
   A.sort((a, b) => a.start - b.start);
@@ -1485,14 +1592,22 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
   // Script tokens for every spoken scene, in script order
   const S = [];
   const ranges = [];
+  const sceneToks = [];
   speechScenes.forEach((s, si) => {
-    const toks = waTokens(s.voiceover_text || '').map(waNorm).filter(Boolean);
+    const spokenLine = String(s.voiceover_text || '').replace(/\([^)]*\)/g, ' ');
+    const toks = waTokens(spokenLine).map(waNorm).filter(Boolean);
+    sceneToks.push(toks);
     ranges.push([S.length, S.length + toks.length]);
     for (const t of toks) S.push({ tok: t, si });
   });
   const n = S.length;
   const m = A.length;
   if (n < 3 || n * m > 36e6) return null;
+  // The English module and the Marathi module do not lock each other's words.
+  const scriptDev = S.filter((s) => /[\u0900-\u097F]/.test(s.tok)).length;
+  const heardDev = A.filter((a) => /[\u0900-\u097F]/.test(a.text)).length;
+  if (scriptDev >= n * 0.5 && heardDev < m * 0.5) return null;
+  if (scriptDev < n * 0.2 && heardDev >= m * 0.5) return null;
 
   // Overlap alignment (free leading/trailing gaps on both sides: the recording may start/end with extras
   // or cover only part of the script).
@@ -1549,28 +1664,74 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
     return { si: Math.min(...js), ei: Math.max(...js), hits: js.length, ntok: b - a };
   });
   const matchedTok = spans.reduce((acc, sp) => acc + (sp ? sp.hits : 0), 0);
-  if (matchedTok < Math.max(4, n * 0.3)) return null;
+  const indicScript = S.some((s) => /[\u0900-\u097F]/.test(s.tok));
+  const minCover = indicScript ? Math.max(4, Math.ceil(n * 0.12)) : Math.max(4, n * 0.3);
+  if (matchedTok < minCover) return null;
 
-  // Words nobody claimed between two neighbouring script lines belong to one of them: split at the strongest break.
+  // Preference: the card that owns the line keeps that VO. An orphan repeat
+  // left under the previous card is not forced onto that picture — it is
+  // listed in orphanRepeats so the voice cut can silence or delete it.
+  // A sentence the script never wrote becomes a placeholder.
+  const unscripted = [];
+  const orphanRepeats = [];
   for (let i = 0; i + 1 < speechScenes.length; i++) {
     const a = spans[i];
     const b = spans[i + 1];
     if (!a || !b) continue;
     if (pos.get(speechScenes[i + 1].screen) !== pos.get(speechScenes[i].screen) + 1) continue;
-    if (b.si <= a.ei) { b.si = Math.max(a.ei + 1, b.si); if (b.si > b.ei) b.ei = b.si; continue; }
-    const gapWords = b.si - a.ei - 1;
-    if (gapWords < 1 || gapWords > 14) continue;
-    let bestK = a.ei;
-    let bestScore = -1;
-    for (let k = a.ei; k < b.si; k++) {
-      const gap = A[k + 1].start - A[k].end;
-      const t = A[k].text.trim();
-      const punct = /[.?!]$/.test(t) ? 0.3 : (/[,;:]$/.test(t) ? 0.12 : 0);
-      const sc = gap + punct;
-      if (sc > bestScore) { bestScore = sc; bestK = k; }
+    // S1 must not keep S2's first hearing. If the previous tail is clearly
+    // the next line, peel it back to the next card.
+    {
+      const from = Math.max(a.si, 0);
+      const to = Math.max(a.ei, b.si);
+      const tailWords = [];
+      for (let k = from; k <= to && k < A.length; k++) {
+        tailWords.push({ idx: k, tok: A[k].tok, text: A[k].text, start: A[k].start, end: A[k].end });
+      }
+      const stolen = peelStolenTail(tailWords, sceneToks[i], sceneToks[i + 1], waSameWord);
+      if (stolen.prevEi != null && stolen.prevEi < a.ei) a.ei = stolen.prevEi;
+      if (stolen.nextSi != null && (b.si > stolen.nextSi || b.si <= a.ei)) {
+        // First hearing of the next card only. A later repeat is silenced.
+        b.si = stolen.nextSi;
+        if (stolen.nextEi != null) b.ei = stolen.nextEi;
+        else if (b.ei < b.si) b.ei = b.si;
+      }
     }
-    a.ei = bestK;
-    b.si = bestK + 1;
+    if (b.si <= a.ei) { b.si = Math.max(a.ei + 1, b.si); if (b.si > b.ei) b.ei = b.si; continue; }
+    const gapWords = [];
+    for (let k = a.ei + 1; k < b.si; k++) {
+      gapWords.push({ idx: k, tok: A[k].tok, text: A[k].text, start: A[k].start, end: A[k].end });
+    }
+    if (!gapWords.length) continue;
+    const settled = settleGap(gapWords, sceneToks[i], sceneToks[i + 1], waSameWord);
+    if (settled.prevEnd) a.ei = settled.prevEnd.idx;
+    if (settled.nextStart) b.si = settled.nextStart.idx;
+    for (const o of settled.orphans || []) orphanRepeats.push(o);
+    const head = [];
+    for (let k = b.si; k <= b.ei; k++) {
+      head.push({ idx: k, tok: A[k].tok, text: A[k].text, start: A[k].start, end: A[k].end });
+    }
+    const peeled = peelHead(head, sceneToks[i], sceneToks[i + 1], waSameWord);
+    if (peeled.cutIdx != null) {
+      if (peeled.prevEnd) a.ei = Math.max(a.ei, peeled.prevEnd.idx);
+      b.si = peeled.cutIdx + 1;
+    }
+    for (const o of peeled.orphans || []) orphanRepeats.push(o);
+    const found = settled.placeholders.concat(peeled.placeholders);
+    if (found.length) {
+      found.sort((p, q) => p.start - q.start);
+      a.blockOut = found[0].start;
+      b.blockIn = A[b.si].start;
+      for (const ph of found) {
+        unscripted.push({
+          after: speechScenes[i].screen,
+          before: speechScenes[i + 1].screen,
+          start: ph.start,
+          end: ph.end,
+          text: ph.text,
+        });
+      }
+    }
   }
 
   // Scenes that were not heard at all: share the time between their matched neighbours by script length.
@@ -1580,7 +1741,15 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
   while (i < speechScenes.length) {
     const sp = spans[i];
     if (sp) {
-      raw.push({ scene: speechScenes[i], ws: A[sp.si].start, we: A[sp.ei].end, si: sp.si, ei: sp.ei });
+      raw.push({
+        scene: speechScenes[i],
+        ws: A[sp.si].start,
+        we: A[sp.ei].end,
+        si: sp.si,
+        ei: sp.ei,
+        blockOut: sp.blockOut || null,
+        blockIn: sp.blockIn || null,
+      });
       i++;
       continue;
     }
@@ -1686,6 +1855,8 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
           const effWs = r.ws >= s0 + 0.25 ? r.ws : s1 - 0.16;
           const onset = Math.min(effWs, s1 - 0.16);
           srcIn = Math.max(prevOut, s0 + 0.18, Math.min(onset - 0.24, s1 - 0.38));
+        } else if (r.blockIn != null && prevOut < r.blockIn - 0.15) {
+          srcIn = r.blockIn - 0.08;
         } else {
           srcIn = prevOut;
         }
@@ -1695,49 +1866,57 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
         const nxt = raw[k + 1];
         const [s0, s1, hasSil] = gaps[k];
         const hasBreak = questionPauseSeconds(r.scene) > 0 || (pos.get(nxt.scene.screen) - pos.get(r.scene.screen) > 1);
-        const effWe = hasSil ? Math.max(s0 + 0.14, Math.min(r.we, s0 + 0.24)) : r.we;
-        const effNws = hasSil
-          ? (nxt.ws > s0 + 0.20 ? Math.min(nxt.ws, s1 - 0.12) : s1 - 0.14)
-          : nxt.ws;
+        // The last syllable has to finish. A silence mark often opens
+        // while that syllable is still sounding, so the cut stays past
+        // the heard word end and stops before the next word.
+        const roomToNext = Math.max(0, nxt.ws - r.we);
+        const wordDone = r.we + Math.min(0.18, Math.max(0, roomToNext - 0.06));
         if (hasBreak) {
-          srcOut = Math.min(s1 - 0.18, Math.max(effWe + 0.18, s0 + Math.min(0.40, 0.48 * (s1 - s0))));
-          srcOut = Math.max(s0 + 0.14, srcOut);
+          srcOut = Math.min(Math.max(wordDone, s1 - 0.18), Math.max(wordDone, s0 + Math.min(0.40, 0.48 * (s1 - s0))));
+          srcOut = Math.max(wordDone, srcOut);
+          srcOut = Math.min(srcOut, Math.max(wordDone, nxt.ws - 0.06));
         } else if (hasSil) {
           const gap = nxt.ws - r.we;
           let targetCut;
           if (gap >= 0.40) {
-            targetCut = Math.max(r.we + 0.15, Math.min(nxt.ws - 0.25, r.we + gap * 0.5));
+            targetCut = Math.max(wordDone, Math.min(nxt.ws - 0.12, r.we + gap * 0.5));
           } else {
-            targetCut = Math.max(r.we + 0.08, nxt.ws - 0.20);
+            targetCut = Math.max(wordDone, nxt.ws - 0.12);
           }
-          const minCut = Math.max(s0 + 0.10, r.we + 0.06);
-          const maxCut = Math.max(minCut, s1 - 0.18);
+          const minCut = wordDone;
+          const maxCut = Math.max(minCut, Math.min(nxt.ws - 0.05, s1 - 0.06));
           srcOut = Math.max(minCut, Math.min(maxCut, targetCut));
         } else {
-          srcOut = Math.max(r.we + 0.08, Math.min(nxt.ws - 0.18, s0 + 0.5 * (s1 - s0)));
+          srcOut = Math.max(wordDone, Math.min(nxt.ws - 0.08, s0 + 0.5 * (s1 - s0)));
         }
       } else {
         srcOut = r.we + 0.35;
       }
-      if (srcOut <= srcIn + 0.2) srcOut = srcIn + 0.3;
+      if (r.blockOut != null) srcOut = Math.min(srcOut, r.blockOut);
+      if (r.blockIn != null) srcIn = Math.max(srcIn, r.blockIn - 0.08);
+      if (srcOut <= srcIn + 0.2) srcOut = Math.min(srcIn + 0.3, r.blockOut != null ? r.blockOut : srcIn + 0.3);
+      if (srcOut <= srcIn) srcOut = srcIn + 0.2;
       out.push([Math.round(srcIn * 1000) / 1000, Math.round(srcOut * 1000) / 1000]);
     }
     raw.forEach((r, k) => placed.set(r.scene.screen, out[k]));
   } else {
     raw.forEach((r, k) => {
-      const a = r.si != null ? lead(r.si) : r.ws;
-      const b = r.ei != null ? tail(r.ei) : r.we;
+      let a = r.si != null ? lead(r.si) : r.ws;
+      let b = r.ei != null ? tail(r.ei) : r.we;
+      if (r.blockIn != null) a = Math.max(a, r.blockIn - 0.08);
+      if (r.blockOut != null) b = Math.min(b, r.blockOut);
       placed.set(r.scene.screen, [Math.round(a * 1000) / 1000, Math.round(Math.max(a + 0.3, b) * 1000) / 1000]);
     });
   }
 
-  // Continuous lines share one cut: never let a line start before the previous one ended, never leave a hole.
+  // A line must not start before the previous one ended. A placeholder keeps its hole.
   let prevOut = 0;
   for (let k = 0; k < raw.length; k++) {
     const scr = raw[k].scene.screen;
     const [a, b] = placed.get(scr);
     let ni = a;
-    if (k > 0 && ni < prevOut) ni = prevOut;
+    const keepHole = raw[k].blockIn != null && prevOut < raw[k].blockIn - 0.15;
+    if (k > 0 && ni < prevOut && !keepHole) ni = prevOut;
     const no = Math.max(b, ni + 0.3);
     placed.set(scr, [Math.round(ni * 1000) / 1000, Math.round(no * 1000) / 1000]);
     prevOut = no;
@@ -1747,7 +1926,72 @@ function alignSpeechByWords(speechScenes, allScenes, wordsIn, silences, voDurati
     if (a >= maxT) placed.delete(scr);
     else if (b > maxT) placed.set(scr, [a, Math.round(maxT * 1000) / 1000]);
   }
+  // A scene starts on its own first word, even when that word was not
+  // transcribed. A question stops when its own words end, so an early
+  // saying of the next answer is not kept on the question.
+  for (let i = 0; i < speechScenes.length; i++) {
+    const scene = speechScenes[i];
+    const win = placed.get(scene.screen);
+    const sp = spans[i];
+    const toks = sceneToks[i] || [];
+    if (!win || !sp || !toks.length) continue;
+    const [tokA] = ranges[i];
+    if (matchOf[tokA] < 0) {
+      const wordStart = A[sp.si].start;
+      const prev = i > 0 ? placed.get(speechScenes[i - 1].screen) : null;
+      const prevOut = prev ? prev[1] : 0;
+      if (wordStart - prevOut >= 0.5) {
+        const pull = Math.max(prevOut + 0.05, wordStart - 0.42);
+        if (pull < win[0] - 0.08) {
+          placed.set(scene.screen, [Math.round(pull * 1000) / 1000, win[1]]);
+        }
+      }
+    }
+  }
+  for (let i = 0; i < speechScenes.length - 1; i++) {
+    const scene = speechScenes[i];
+    const nxt = speechScenes[i + 1];
+    if (!sceneIsQuestion(scene) || !sceneIsAnswer(nxt)) continue;
+    const qWin = placed.get(scene.screen);
+    const aWin = placed.get(nxt.screen);
+    if (!qWin || !aWin) continue;
+    const qToks = sceneToks[i] || [];
+    const aToks = (sceneToks[i + 1] || []).filter((tok) => !qToks.some((q) => waSameWord(q, tok)));
+    if (!qToks.length || !aToks.length) continue;
+    let lastQ = null;
+    for (const w of A) {
+      if (w.start < qWin[0] - 0.08 || w.end > aWin[0] + 0.05) continue;
+      if (qToks.some((tok) => waSameWord(tok, w.tok))) lastQ = w.end;
+    }
+    if (lastQ == null) continue;
+    const hitsAnswer = A.some((w) => (
+      w.start >= lastQ + 0.4
+      && w.end <= aWin[0] + 0.05
+      && aToks.some((tok) => waSameWord(tok, w.tok))
+    ));
+    if (!hitsAnswer) continue;
+    const cut = Math.min(lastQ + 0.18, aWin[0] - 0.06);
+    if (cut < qWin[1] - 0.05) {
+      placed.set(scene.screen, [qWin[0], Math.round(cut * 1000) / 1000]);
+    }
+  }
+  placed.unscripted = unscripted;
+  placed.orphanRepeats = orphanRepeats;
   return placed;
+}
+
+function sceneIsQuestion(scene) {
+  const sec = String(scene?.section || '');
+  const tail = sec.split('·').pop().trim();
+  if (tail === 'प्रश्न') return true;
+  return /\bquestion\b/i.test(sec) && !/\banswer\b/i.test(sec);
+}
+
+function sceneIsAnswer(scene) {
+  const sec = String(scene?.section || '');
+  const tail = sec.split('·').pop().trim();
+  if (tail === 'उत्तर') return true;
+  return /\banswer\b/i.test(sec);
 }
 
 /** Flat 6s/8s sheet values are a template, not a measured narration clock. */
@@ -1785,8 +2029,11 @@ function alignMarathiBySpeech(segScenes, speechWeights, segStart, segEnd, silenc
     const ss = Number(pair[0]);
     const se = Number(pair[1]);
     if (!(se > ss) || se - ss < 0.12) continue;
-    // silence_start is where the previous word finished. Do not cut at silence_end.
-    const cutT = ss + 0.1;
+    // silence_start is where the previous word finished. Keep enough of the
+    // tail for that syllable to be heard, and do not cut at silence_end.
+    const room = se - ss;
+    const tail = Math.min(0.26, Math.max(0.18, room * 0.5));
+    const cutT = Math.min(ss + tail, se - 0.08);
     if (cutT > segStart + 0.3 && cutT < segEnd - 0.2) cuts.push(cutT);
   }
   cuts.sort((a, b) => a - b);
@@ -2080,15 +2327,15 @@ function buildSrtCues(clips, planOpts = {}) {
       start + 0.05 >= poemStart &&
       start < poemEnd + 0.05;
 
+    // The cue stays on the picture clock (clip.start). narration_in is the
+    // voice-file clock. After a poem is inserted, that file clock is earlier
+    // than the card, so using it laid the later lines back across the poem.
     if (c.caption_in != null && c.caption_out != null && Number(c.caption_out) > Number(c.caption_in) + 0.2) {
       start = Number(c.caption_in);
       end = Number(c.caption_out);
-    } else if (spoken) {
-      start = Number(c.narration_in);
-      end = Math.max(Number(c.narration_out), start + 0.4);
     } else if (inPoem) {
       if (lyricStart > start + 0.05) start = lyricStart;
-    } else if (marathi || !c.vo_text) {
+    } else if (!spoken && (marathi || !c.vo_text)) {
       // Marathi leftover cards after the VO ends must not get fake captions
       continue;
     }
@@ -3058,15 +3305,42 @@ app.post('/api/projects/:id/poem-voiceover-meta', (req, res) => {
     touchProjectClient(pid, req);
     const root = projectRoot(pid);
     if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
-    const origName = path.basename(String(req.body?.filename || 'poem.mp3'));
+    const slot = Math.max(1, Math.min(10, parseInt(req.body?.slot || '1', 10) || 1));
+    const origName = path.basename(String(req.body?.filename || `poem_${slot}.mp3`));
     const duration = Math.max(0.1, Number(req.body?.duration || 0));
-    const localPath = String(req.body?.local_path || '').trim() || path.join(root, 'voiceover', `poem_${origName}`);
-    const meta = {
-      path: localPath,
+    const localPath = String(req.body?.local_path || '').trim() || path.join(root, 'voiceover', `poem_${slot}_${origName}`);
+    const existing = loadJson(pid, 'poem_voiceover.json') || {};
+    let slots = Array.isArray(existing.slots) ? existing.slots.filter((s) => s && Number(s.slot) !== slot) : [];
+    if (!slots.length && existing.path && slot !== 1) {
+      slots.push({
+        slot: 1,
+        filename: existing.filename || path.basename(existing.path),
+        path: existing.path,
+        duration: Number(existing.duration) || 0,
+      });
+    }
+    slots.push({
+      slot,
       filename: origName,
+      path: localPath,
       duration: Math.round(duration * 1000) / 1000,
+    });
+    slots.sort((a, b) => Number(a.slot) - Number(b.slot));
+    let cursor = 0;
+    for (const s of slots) {
+      const dur = Math.max(0.1, Number(s.duration) || 0);
+      s.start_offset = Math.round(cursor * 1000) / 1000;
+      s.end_offset = Math.round((cursor + dur) * 1000) / 1000;
+      cursor = s.end_offset + 0.5;
+    }
+    const total = Math.round((cursor - (slots.length ? 0.5 : 0)) * 1000) / 1000;
+    const meta = {
+      path: slots[0].path,
+      filename: slots.map((s) => s.filename).join(' + '),
+      duration: total,
       kind: 'poem',
       local_only: true,
+      slots,
     };
     saveJson(pid, 'poem_voiceover.json', meta);
 
@@ -3080,7 +3354,11 @@ app.post('/api/projects/:id/poem-voiceover-meta', (req, res) => {
     const tl = loadJson(pid, 'timeline.json');
     if (tl) {
       tl.poem_voiceover_path = localPath;
+      tl.poem_slots = slots;
       tl.has_poem = true;
+      if (slots.length > 1 && Number(tl.poem_start_time) >= 0 && Number(tl.poem_end_time) > Number(tl.poem_start_time)) {
+        tl.poem_end_time = Math.round((Number(tl.poem_start_time) + total) * 1000) / 1000;
+      }
       if (tl.poem) {
         tl.poem.has_poem = true;
         tl.poem.poem_uploaded = true;
@@ -3088,6 +3366,48 @@ app.post('/api/projects/:id/poem-voiceover-meta', (req, res) => {
       saveJson(pid, 'timeline.json', tl);
     }
 
+    res.json(meta);
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
+app.delete('/api/projects/:id/poem-voiceover/:slot', (req, res) => {
+  try {
+    const pid = req.params.id;
+    const root = projectRoot(pid);
+    if (!fs.existsSync(root)) return res.status(404).json({ detail: 'Project not found' });
+    const slot = Math.max(1, Math.min(10, parseInt(req.params.slot, 10) || 1));
+    const existing = loadJson(pid, 'poem_voiceover.json') || {};
+    let slots = Array.isArray(existing.slots) ? existing.slots.filter((s) => s && Number(s.slot) !== slot) : [];
+    if (!slots.length) {
+      saveJson(pid, 'poem_voiceover.json', { kind: 'poem', slots: [], duration: 0, path: '', filename: '' });
+      return res.json({ removed: slot, slots: [] });
+    }
+    slots.sort((a, b) => Number(a.slot) - Number(b.slot));
+    let cursor = 0;
+    for (const s of slots) {
+      const dur = Math.max(0.1, Number(s.duration) || 0);
+      s.start_offset = Math.round(cursor * 1000) / 1000;
+      s.end_offset = Math.round((cursor + dur) * 1000) / 1000;
+      cursor = s.end_offset + 0.5;
+    }
+    const total = Math.round((cursor - 0.5) * 1000) / 1000;
+    const meta = {
+      path: slots[0].path,
+      filename: slots.map((s) => s.filename).join(' + '),
+      duration: total,
+      kind: 'poem',
+      local_only: true,
+      slots,
+    };
+    saveJson(pid, 'poem_voiceover.json', meta);
+    const tl = loadJson(pid, 'timeline.json');
+    if (tl) {
+      tl.poem_voiceover_path = meta.path;
+      tl.poem_slots = slots;
+      saveJson(pid, 'timeline.json', tl);
+    }
     res.json(meta);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -3421,6 +3741,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
 
     // Separate scenes into spoken narration vs poem/instrumental so poem scenes do not eat narration VO
     // Note: For Marathi/Indic chapters without a separate Poem VO (!hasPoemVo), poem lyrics live inside the narration VO!
+    let missingCards = [];
+    let alignedOrphanRepeats = [];
     const speechScenes = scenes.filter((s) => {
       if (hasPoemVo && onPoemTrack(s)) return false;
       if (!indic && onPoemTrack(s)) return false;
@@ -3435,7 +3757,6 @@ app.post('/api/projects/:id/build', async (req, res) => {
       const noEll = txt.replace(/\.{2,}/g, ' ');
       const words = (noEll.match(/[\w\u0900-\u097F']+/g) || []).length;
       const devChars = (txt.match(/[\u0900-\u097F]/g) || []).length;
-      const isDevanagari = marathi || devChars > 0;
       const sentBreaks = Math.max(0, (noEll.match(/[.!?।]/g) || []).length - 1);
       const sents = Math.max(1, (noEll.match(/[.!?।]+/g) || []).length);
       const commas = (noEll.match(/[,;:]/g) || []).length;
@@ -3443,12 +3764,12 @@ app.post('/api/projects/:id/build', async (req, res) => {
       const qp = questionPauseSeconds(s);
       const hasMidPause = qp === 0 && /\d+(?:\.\d+)?\s*-\s*second\s+pause/i.test(String(s.voiceover_raw || ''));
       const listItems = commas + sents;
-      const isWordBank = !marathi && !isDevanagari && ((commas >= 3 && words <= commas * 2.5) || (sents >= 4 && words <= sents * 1.8));
+      const isWordBank = !marathi && ((commas >= 3 && words <= commas * 2.5) || (sents >= 4 && words <= sents * 1.8));
       let w;
       if (marathi && measuredScriptClock && Number(s.duration) > 0.4) {
         // Real per-scene times from the workbook. Flat 6s/8s templates never reach here.
         w = Number(s.duration);
-      } else if ((marathi || isDevanagari) && voDur > 1) {
+      } else if (marathi && voDur > 1) {
         // Marathi/Hindi: Devanagari character + word + danda weights. Never the English word-bank / repeat-word clock.
         w = Math.max(1.2, (devChars || words) * 0.105 + words * 0.22 + sentBreaks * 0.25 + 0.25);
       } else if (voDur > 1) {
@@ -3461,7 +3782,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
             : (Number(s.duration) || 2.0);
         }
       } else {
-        const wordEst = words > 0 ? Math.max(1.2, words * (isDevanagari ? 0.55 : 0.38) + 0.25) : (Number(s.duration) || 2.0);
+        const wordEst = words > 0 ? Math.max(1.2, words * (marathi ? 0.55 : 0.38) + 0.25) : (Number(s.duration) || 2.0);
         w = s.duration && Number(s.duration) > 0 ? 0.55 * wordEst + 0.45 * Number(s.duration) : wordEst;
       }
       // Speech rate varies substantially for spelled-out letters and vocabulary lists.
@@ -3482,22 +3803,27 @@ app.post('/api/projects/:id/build', async (req, res) => {
     const alignedSpeechMap = new Map();
     let coveredSpokenCount = speechScenes.length;
 
-    // English: place every line on the words Whisper actually heard (sent by the browser). No estimating.
+    // Each language locks only to words in its own script. English never consumes a Devanagari transcript.
     let wordAlignUsed = false;
     let heardWords = null;
-    if ((alignmentMode === 'whisper' || alignmentMode === 'script_audio' || (alignmentMode === 'script_vo' && ['vosk_offline','indicconformer_mr'].includes(voMeta.words_source))) && (langRes.language === 'en' || langRes.language === 'mr') && voDur > 1 && speechScenes.length > 0) {
-      const bodyWords = Array.isArray(req.body && req.body.words) ? req.body.words : null;
-      if (bodyWords && bodyWords.length >= 6) {
-        heardWords = bodyWords;
-        voMeta.words = bodyWords.map((w) => {
+    const bodyWords = Array.isArray(req.body && req.body.words) ? req.body.words : null;
+    const narrationWordsFit = wordsMatchAlignLanguage(bodyWords, marathi);
+    if ((alignmentMode === 'whisper' || alignmentMode === 'script_audio' || (alignmentMode === 'script_vo' && ['vosk_offline','indicconformer_mr'].includes(voMeta.words_source)) || (marathi && narrationWordsFit)) && (langRes.language === 'en' || langRes.language === 'mr') && voDur > 1 && speechScenes.length > 0) {
+      if (bodyWords && bodyWords.length >= 6 && narrationWordsFit) {
+        heardWords = bodyWords.map((w) => {
           const val = String(w && (w.word != null ? w.word : (w.text || '')));
           return { word: val, text: val, start: Number(w.start), end: Number(w.end) };
         });
+        voMeta.words = heardWords;
         voMeta.words_dur = voDur;
-        voMeta.words_source = alignmentMode === 'whisper' ? 'whisper' : marathi ? 'indicconformer_mr' : 'vosk_offline';
+        voMeta.words_source = marathi ? 'indicconformer_mr' : (alignmentMode === 'whisper' ? 'whisper' : 'vosk_offline');
         saveJson(pid, 'voiceover.json', voMeta);
-      } else if (Array.isArray(voMeta.words) && voMeta.words.length >= 6 && Math.abs(Number(voMeta.words_dur || 0) - voDur) <= 0.9) {
+      } else if (bodyWords && bodyWords.length >= 6) {
+        console.warn(`[align] Ignoring ${marathi ? 'non-Devanagari' : 'non-English'} narration words on a ${marathi ? 'Marathi' : 'English'} chapter`);
+      } else if (Array.isArray(voMeta.words) && voMeta.words.length >= 6 && Math.abs(Number(voMeta.words_dur || 0) - voDur) <= 0.9 && wordsMatchAlignLanguage(voMeta.words, marathi)) {
         heardWords = voMeta.words;
+      } else if (Array.isArray(voMeta.words) && voMeta.words.length >= 6) {
+        console.warn(`[align] Ignoring saved narration words that are not ${marathi ? 'Devanagari' : 'English'}`);
       }
       // Reject partial Whisper (e.g. only VO 1 heard while meta duration is VO1+VO2) — that forces
       // late scenes onto a fake tlCursor and desyncs from ~mid-story onward.
@@ -3514,12 +3840,16 @@ app.post('/api/projects/:id/build', async (req, res) => {
           ? voMeta.slots.filter((sl) => Number(sl.duration || 0) > 0.5)
           : [];
         let byWords = alignSpeechByWords(speechScenes, scenes, heardWords, silences, voDur);
+        let gapCards = byWords && Array.isArray(byWords.unscripted) ? byWords.unscripted.slice() : [];
+        let orphanRepeats = byWords && Array.isArray(byWords.orphanRepeats) ? byWords.orphanRepeats.slice() : [];
         // One continuous script/VO clock across all narration files.
         // Only fall back to duration-based slot partitioning if global word lock is incomplete.
         if (multiSlots.length > 1 && (!byWords || byWords.size < Math.ceil(speechScenes.length * 0.85))) {
           // Per-slot word lock: story lines only match VO1 words, later sections only VO2+.
           // Stops repeated phrases ("Death to the wolf") from yanking mid/late scenes onto the wrong file.
           byWords = new Map();
+          gapCards = [];
+          orphanRepeats = [];
           const totalNarrW = speechScenes.reduce((acc, s) => acc + (speechWeights.get(s.screen) || 2.0), 0) || 1;
           let startIdx = 0;
           let cumSlotDur = 0;
@@ -3568,7 +3898,11 @@ app.post('/api/projects/:id/build', async (req, res) => {
             });
             if (subScenes.length && slotWords.length >= 4) {
               const subMap = alignSpeechByWords(subScenes, scenes, slotWords, silences, slEnd, slStart);
-              if (subMap) for (const [k, v] of subMap.entries()) byWords.set(k, v);
+              if (subMap) {
+                for (const [k, v] of subMap.entries()) byWords.set(k, v);
+                if (Array.isArray(subMap.unscripted)) gapCards.push(...subMap.unscripted);
+                if (Array.isArray(subMap.orphanRepeats)) orphanRepeats.push(...subMap.orphanRepeats);
+              }
             }
             startIdx = endIdx;
           }
@@ -3593,6 +3927,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
           // Script order wins: never let a late scene (e.g. S58) land at VO 00:00 ahead of S2.
           VoAlignBrain.enforceMonotonicSpeechMap(speechScenes, alignedSpeechMap);
           wordAlignUsed = true;
+          missingCards = gapCards;
+          alignedOrphanRepeats = orphanRepeats;
           let lastIdx = 0;
           speechScenes.forEach((sc, ix) => { if (alignedSpeechMap.has(sc.screen)) lastIdx = ix + 1; });
           coveredSpokenCount = lastIdx;
@@ -3612,25 +3948,34 @@ app.post('/api/projects/:id/build', async (req, res) => {
       });
     }
 
-    // Poem VO words (browser Whisper on the poem file). Times are relative to poem file 0.
+    // Poem words stay in the chapter language. A Latin or Urdu transcript does not lock a Devanagari lyric.
     let poemHeardWords = null;
     let poemWordAlignUsed = false;
+    let poemSheetUsed = false;
     const poemWordsBody = Array.isArray(req.body && req.body.poem_words) ? req.body.poem_words : null;
     if (hasPoemVo && poemVoDur > 0.4 && (langRes.language === 'mr' || langRes.language === 'en')) {
-      if (poemWordsBody && poemWordsBody.length >= 6) {
+      if (poemWordsBody && poemWordsBody.length >= 6 && wordsMatchAlignLanguage(poemWordsBody, marathi)) {
         poemHeardWords = poemWordsBody.map((w) => {
           const val = String(w && (w.word != null ? w.word : (w.text || '')));
           return { word: val, text: val, start: Number(w.start), end: Number(w.end) };
         });
         poemVoMeta.words = poemHeardWords;
         poemVoMeta.words_dur = poemVoDur;
+        poemVoMeta.words_source = (req.body && req.body.poem_words_source) === 'mms_fa'
+          ? 'mms_fa'
+          : (marathi ? 'indicconformer_mr' : 'whisper');
         saveJson(pid, 'poem_voiceover.json', poemVoMeta);
+      } else if (poemWordsBody && poemWordsBody.length >= 6) {
+        console.warn(`[align] Ignoring ${marathi ? 'non-Devanagari' : 'non-English'} poem words on a ${marathi ? 'Marathi' : 'English'} chapter`);
       } else if (
         Array.isArray(poemVoMeta.words) &&
         poemVoMeta.words.length >= 6 &&
-        Math.abs(Number(poemVoMeta.words_dur || 0) - poemVoDur) <= 0.9
+        Math.abs(Number(poemVoMeta.words_dur || 0) - poemVoDur) <= 0.9 &&
+        wordsMatchAlignLanguage(poemVoMeta.words, marathi)
       ) {
         poemHeardWords = poemVoMeta.words;
+      } else if (Array.isArray(poemVoMeta.words) && poemVoMeta.words.length >= 6) {
+        console.warn(`[align] Ignoring saved poem words that are not ${marathi ? 'Devanagari' : 'English'}`);
       }
       if (poemHeardWords && poemHeardWords.length >= 6) {
         let maxPoemT = 0;
@@ -3788,6 +4133,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
     let poemStartTime = 0;
     let poemEndTime = 0;
     let inPoemBlock = false;
+    let poemPlaced = false;
     const anyPoemScene = scenes.some((s) => s.is_poem || onPoemTrack(s));
 
     // Pre-calculate exact poem scene durations so they always sum to poemVoDur when a Poem VO is present
@@ -3846,36 +4192,54 @@ app.post('/api/projects/:id/build', async (req, res) => {
           else break;
         }
         poemStartTime = tlCursor;
-        const lockedPoem = (hasPoemVo && poemVoDur > 0.4)
-          ? VoAlignBrain.lockPoemScenes(
+        // Poem VO + lyric cards + pictures must share the song file clock.
+        // Prefer heard Poem VO words. Workbook Suno cuts are provisional only —
+        // they must not beat a real word lock (that left Ch 3.8 lyrics early/late).
+        const poemDurFn = (sc) => poemRawDurs.get(sc.screen) || Number(sc.duration) || (poemVoDur / Math.max(1, run.length));
+        let lockedPoem = null;
+        if (hasPoemVo && poemVoDur > 0.4) {
+          lockedPoem = VoAlignBrain.lockPoemScenes(
             run,
             poemStartTime,
             poemVoDur,
-            (sc) => poemRawDurs.get(sc.screen) || Number(sc.duration) || (poemVoDur / Math.max(1, run.length)),
+            poemDurFn,
             poemHeardWords,
             scenes,
-          )
-          : run.map((sc) => {
-            const base = poemRawDurs.get(sc.screen) || (poemVoDur > 0 ? poemVoDur / Math.max(1, run.length) : 6.0);
+          );
+        }
+        const wordLocked = Array.isArray(lockedPoem)
+          && lockedPoem.some((lr) => lr && lr.engine === 'poem_word');
+        let sheetPoem = null;
+        if (!wordLocked) {
+          sheetPoem = placePoemOnSheetClock(run, poemStartTime, poemHeardWords);
+          if (sheetPoem) lockedPoem = sheetPoem;
+        }
+        if (!lockedPoem || !lockedPoem.length) {
+          lockedPoem = run.map((sc) => {
+            const base = poemDurFn(sc) || (poemVoDur > 0 ? poemVoDur / Math.max(1, run.length) : 6.0);
             const d = Math.max(0.4, Math.round(base * poemScale * 1000) / 1000);
             const start = Math.round(tlCursor * 1000) / 1000;
             const end = Math.round((tlCursor + d) * 1000) / 1000;
             tlCursor = end;
             return { screen: sc.screen, start, end, narration_in: start, narration_out: end, engine: 'estimate' };
           });
-        if (
-          requireHeardPoem &&
-          (!lockedPoem.length || lockedPoem.some((lr) => lr.engine !== 'poem_word'))
-        ) {
-          return res.status(422).json({
-            detail:
-              'Refused poem estimate align — heard Poem VO words but could not lock lyric cards to them. ' +
-              'Re-link Poem VO and retry Auto-align. No guessed poem cuts.',
-          });
         }
-        if (lockedPoem.length && lockedPoem.every((lr) => lr.engine === 'poem_word')) {
-          poemWordAlignUsed = true;
-        } else if (lockedPoem.some((lr) => lr.engine === 'poem_word')) {
+        if (requireHeardPoem) {
+          const sungRows = lockedPoem.filter((lr) => {
+            const sc = run.find((x) => x.screen === lr.screen);
+            return sc && !isInstrumentalScene(sc);
+          });
+          const heardSung = sungRows.filter((lr) => lr.engine === 'poem_word' || lr.engine === 'poem_sheet');
+          if (!lockedPoem.length || !heardSung.length) {
+            return res.status(422).json({
+              detail:
+                'Refused poem estimate align — heard Poem VO words but could not lock lyric cards to them. ' +
+                'Re-link Poem VO and retry Auto-align. No guessed poem cuts.',
+            });
+          }
+        }
+        if (sheetPoem && !wordLocked) poemSheetUsed = true;
+        if (lockedPoem.some((lr) => lr && lr.engine === 'poem_word')) {
           poemWordAlignUsed = true;
         }
         for (const lr of lockedPoem) {
@@ -3888,7 +4252,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
             sc,
             true,
           );
-          const dur = Math.max(0.4, Number(lr.end) - Number(lr.start));
+          const span = Math.max(0.12, Number(lr.end) - Number(lr.start));
+          const dur = span;
           const capTxt = captionForScene(sc, isInstP, marathi);
           rawClips.push({
             screen: sc.screen,
@@ -3911,6 +4276,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
           poemEndTime = Math.max(poemEndTime, Number(lr.end));
           tlCursor = Math.max(tlCursor, Number(lr.end));
         }
+        poemPlaced = true;
         continue;
       } else if (spoken && alignedSpeechMap.has(s.screen)) {
         const [ni, no] = alignedSpeechMap.get(s.screen);
@@ -3951,6 +4317,11 @@ app.post('/api/projects/:id/build', async (req, res) => {
       let clipStart;
       if (voLocked) {
         clipStart = Number(s.__picStart != null ? s.__picStart : narrIn);
+        // The narration file has no song in it. Lesson lines that the script puts
+        // after the poem must sit after the song, not on top of the lyric cards.
+        if (poemPlaced && poemEndTime > poemStartTime + 0.5 && clipStart < poemEndTime - 0.05) {
+          clipStart = poemEndTime + Math.max(0, clipStart - poemStartTime);
+        }
       } else if (spoken && voDur > 1 && !marathi) {
         // Park unmapped English spoken cards after the VO ends — do not weave them into the VO clock.
         clipStart = Math.max(tlCursor, voDur + 0.05);
@@ -4070,6 +4441,56 @@ app.post('/api/projects/:id/build', async (req, res) => {
         tlCursor += pDur;
       }
     }
+    // A sentence the script never wrote gets its own empty card, between the
+    // line before it and the line after it. An extra hearing of a line that
+    // already has one card is not a missing card: the voice cut removes it.
+    if (missingCards.length && Array.isArray(heardWords) && heardWords.length) {
+      const narrLines = speechScenes.map((s) => ({ id: s.screen, text: String(s.voiceover_text || '') }));
+      const groups = findRepeatedHearings(heardWords, narrLines);
+      const drops = [];
+      for (const g of groups) {
+        if (g && (g.kind === 'card' || g.kind === 'no_card')) {
+          for (const d of g.drop || []) drops.push(d);
+        }
+      }
+      missingCards = missingCards.filter((ph) => {
+        const a = Number(ph.start);
+        const b = Number(ph.end);
+        return !drops.some((d) => Number(d.start) < b - 0.15 && Number(d.end) > a + 0.15);
+      });
+    }
+    missingCards
+      .filter((ph) => ph && Number(ph.end) - Number(ph.start) >= 0.3 && String(ph.text || '').trim())
+      .sort((a, b) => Number(a.start) - Number(b.start))
+      .forEach((ph, i) => {
+        const ni = Math.round(Number(ph.start) * 1000) / 1000;
+        const no = Math.round(Math.max(Number(ph.end), ni + 0.3) * 1000) / 1000;
+        let clipStart = ni;
+        if (poemPlaced && poemEndTime > poemStartTime + 0.5 && clipStart < poemEndTime - 0.05) {
+          clipStart = poemEndTime + Math.max(0, clipStart - poemStartTime);
+        }
+        const dur = Math.round((no - ni) * 1000) / 1000;
+        const clipEnd = Math.round((clipStart + dur) * 1000) / 1000;
+        const said = String(ph.text).trim();
+        rawClips.push({
+          screen: `missing_vo_${i + 1}`,
+          media_id: null,
+          media_path: '',
+          kind: 'image',
+          start: Math.round(clipStart * 1000) / 1000,
+          end: clipEnd,
+          duration: dur,
+          source_in: 0,
+          source_out: dur,
+          script_text: said,
+          vo_text: said,
+          caption_text: said,
+          narration_in: ni,
+          narration_out: no,
+          fit: 'missing',
+        });
+        console.log(`[align] Missing card ${i + 1} at ${ni.toFixed(2)}s: ${said}`);
+      });
     // Keep absolute VO-locked clips in time order (word-align may place them out of loop order).
     rawClips.sort((a, b) => Number(a.start) - Number(b.start) || Number(a.end) - Number(b.end));
     for (let k = 0; k < rawClips.length - 1; k++) {
@@ -4099,7 +4520,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       poem_lyric_start: 0,
       marathi,
       language: langRes.language,
-      align_engine: wordAlignUsed ? (alignmentMode === 'whisper' ? 'english_word' : 'audio_word') : (marathi ? 'marathi' : 'script_vo'),
+      align_engine: alignEngineName(marathi, wordAlignUsed, alignmentMode),
     };
     const srtCues = buildSrtCues(clips, planOpts);
     saveSrt(pid, 'subtitles.srt', formatSrt(srtCues));
@@ -4129,6 +4550,7 @@ app.post('/api/projects/:id/build', async (req, res) => {
       total_duration: Math.round(tlCursor * 1000) / 1000,
       clips,
       narration_segments: narrationSegments,
+      vo_orphan_repeats: alignedOrphanRepeats,
       manual_override: false,
       voiceover_path: voMeta.path || null,
       voiceover_slots: placedSlots,
@@ -4147,8 +4569,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
       poem_overlay: existingTl?.poem_overlay ? normalizePoemOverlayStyle(existingTl.poem_overlay) : normalizePoemOverlayStyle(),
       ignored_qa_keys: Array.isArray(existingTl?.ignored_qa_keys) ? existingTl.ignored_qa_keys : [],
       language: langRes.language,
-      align_engine: wordAlignUsed ? (alignmentMode === 'whisper' ? 'english_word' : 'audio_word') : (marathi ? 'marathi' : 'script_vo'),
-      poem_align_engine: poemWordAlignUsed ? 'poem_word' : (hasPoemVo && poemVoDur > 0.4 ? 'estimate' : null),
+      align_engine: alignEngineName(marathi, wordAlignUsed, alignmentMode),
+      poem_align_engine: poemSheetUsed ? 'poem_sheet' : (poemWordAlignUsed ? 'poem_word' : (hasPoemVo && poemVoDur > 0.4 ? 'estimate' : null)),
       align_note: marathi && wordAlignUsed
         ? 'Marathi audio-led alignment: script lines matched to actual IndicConformer Marathi word timestamps. Videos are trimmed/held at 1x speed.'
         : marathi
@@ -4157,7 +4579,9 @@ app.post('/api/projects/:id/build', async (req, res) => {
           : 'Marathi engine: the sheet durations are a 6s/8s template, not a narration clock. Cuts follow Devanagari line length and the silence after each line. English Suno path was not used.')
         : (wordAlignUsed
           ? `English engine: every spoken line is placed on the words actually heard in the VO (${heardWords.length} words), cuts snapped to the silences. Class pauses come from the script.`
-            + (poemWordAlignUsed
+            + (poemSheetUsed
+              ? ' Poem lyric cards follow the song times written in the workbook.'
+              : poemWordAlignUsed
               ? ` Poem lyric cards locked to heard Poem VO words (${poemHeardWords.length} words).`
               : (hasPoemVo ? ' Poem VO present but lyric cards used duration scale (no poem words heard).' : ''))
           : (voDur > 1
@@ -4170,12 +4594,19 @@ app.post('/api/projects/:id/build', async (req, res) => {
         has_poem: planOpts.has_poem,
         poem_start_time: planOpts.poem_start_time,
         poem_uploaded: Boolean(poemVoMeta.path),
-        poem_align_engine: poemWordAlignUsed ? 'poem_word' : (hasPoemVo && poemVoDur > 0.4 ? 'estimate' : null),
+        poem_align_engine: poemSheetUsed ? 'poem_sheet' : (poemWordAlignUsed ? 'poem_word' : (hasPoemVo && poemVoDur > 0.4 ? 'estimate' : null)),
       },
     };
 
     // Honest VO↔picture sync audit + auto-repair (brain). Never claim synced without measuring.
-    const syncReport = VoAlignBrain.verifyAndRepairSync(plan.clips, voDur, { repair: true });
+    const syncReport = VoAlignBrain.verifyAndRepairSync(plan.clips, voDur, {
+      repair: true,
+      keepAfter: planOpts.poem_end_time > planOpts.poem_start_time ? planOpts.poem_start_time : null,
+      poemSpan: planOpts.poem_end_time > planOpts.poem_start_time ? planOpts.poem_end_time - planOpts.poem_start_time : 0,
+      poemEnd: planOpts.poem_end_time,
+      qaHolds: plan.qa_holds || [],
+      voJoins: plan.vo_joins || [],
+    });
     if (syncReport.repaired > 0) {
       plan.clips = mergeAdjacentSameMedia(plan.clips);
       if (plan.clips.length) {
@@ -4184,7 +4615,13 @@ app.post('/api/projects/:id/build', async (req, res) => {
       plan.srt_cues = buildSrtCues(plan.clips, plan);
       saveSrt(pid, 'subtitles.srt', formatSrt(plan.srt_cues));
       // Re-verify after repair so the report matches the saved cuts.
-      const again = VoAlignBrain.verifyAndRepairSync(plan.clips, voDur, { repair: false });
+      const again = VoAlignBrain.verifyAndRepairSync(plan.clips, voDur, {
+        repair: false,
+        poemSpan: planOpts.poem_end_time > planOpts.poem_start_time ? planOpts.poem_end_time - planOpts.poem_start_time : 0,
+        poemEnd: planOpts.poem_end_time,
+        qaHolds: plan.qa_holds || [],
+      voJoins: plan.vo_joins || [],
+      });
       Object.assign(syncReport, again, { repaired: syncReport.repaired });
     }
     plan.sync_report = syncReport;
@@ -4201,10 +4638,10 @@ app.post('/api/projects/:id/build', async (req, res) => {
       ? voMeta.slots.filter((sl) => Number(sl.duration || 0) > 0.5).length
       : (voDur > 1 ? 1 : 0);
     const engineNote = wordAlignUsed
-      ? ` · VO-word lock${poemWordAlignUsed ? ' · Poem-word lock' : ''} · ${srtCues.length} SRT cues`
+      ? ` · VO-word lock${poemSheetUsed ? ' · Poem sheet clock' : (poemWordAlignUsed ? ' · Poem-word lock' : '')} · ${srtCues.length} SRT cues`
       : marathi
         ? ` · Marathi engine · ${silences.length} silence cuts · ${srtCues.length} SRT cues`
-        : ` · Script + VO estimates${poemWordAlignUsed ? ' · Poem-word lock' : ''} · ${srtCues.length} SRT cues`;
+        : ` · Script + VO estimates${poemSheetUsed ? ' · Poem sheet clock' : (poemWordAlignUsed ? ' · Poem-word lock' : '')} · ${srtCues.length} SRT cues`;
     let partialVoNote = '';
     if (voDur > 1 && coveredSpokenCount < speechScenes.length) {
       if (uploadedVoSlots >= 2) {
@@ -4229,7 +4666,8 @@ app.post('/api/projects/:id/build', async (req, res) => {
         : '');
     plan.qa_issues = qaIssues;
     plan.qa_summary = qaSummary;
-    plan.align_engine = wordAlignUsed ? (alignmentMode === 'whisper' ? 'english_word' : 'audio_word') : (marathi ? 'marathi' : 'script_vo');
+    plan.align_engine = alignEngineName(marathi, wordAlignUsed, alignmentMode);
+    plan.language_choice = marathi ? 'mr' : 'en';
 
     saveJson(pid, 'timeline.json', plan);
     saveJson(pid, 'qa.json', { summary: qaSummary, issues: qaIssues, sync_report: syncReport });
@@ -4336,15 +4774,29 @@ app.put('/api/projects/:id/timeline', async (req, res) => {
     if (!Array.isArray(plan.ignored_qa_keys) && Array.isArray(existing.ignored_qa_keys)) {
       plan.ignored_qa_keys = existing.ignored_qa_keys;
     }
+    if (!plan.language_choice && existing.language_choice) {
+      plan.language_choice = existing.language_choice;
+    }
+    if (!plan.language_choice && (plan.language === 'en' || plan.language === 'mr' || plan.language === 'hi')) {
+      plan.language_choice = plan.language === 'en' ? 'en' : 'mr';
+    }
     if (Array.isArray(plan.clips)) {
       plan.srt_cues = buildSrtCues(plan.clips, plan);
       saveSrt(pid, 'subtitles.srt', formatSrt(plan.srt_cues));
     }
     const voMeta = loadJson(pid, 'voiceover.json') || {};
+    const poemStart = Number(plan.poem_start_time || 0);
+    const poemEnd = Number(plan.poem_end_time || 0);
     const syncReport = VoAlignBrain.verifyAndRepairSync(
       plan.clips || [],
       Number(voMeta.duration || plan.sync_report?.vo_duration || 0),
-      { repair: false },
+      {
+        repair: false,
+        poemSpan: poemEnd > poemStart ? poemEnd - poemStart : 0,
+        poemEnd,
+        qaHolds: plan.qa_holds || [],
+      voJoins: plan.vo_joins || [],
+      },
     );
     // PUT /timeline must not turn an approximate script+VO cut into a false "SYNC OK".
     if (plan.align_engine === 'script_vo') {
@@ -4599,11 +5051,14 @@ function buildVideoRateArgs(settings, fps = 30) {
     }
     effectiveKbps = capKbps;
   } else if (settings.advanced_compression && settings.compression_mode === 'by_bitrate') {
-    effectiveKbps = Math.max(350, Math.round(effectiveKbps * 0.25 * keepRatio));
-    if (vcodec === 'libx264' || vcodec === 'libx265') {
-      const crf = effectiveKbps >= 10000 ? 20 : effectiveKbps >= 5000 ? 23 : effectiveKbps >= 2500 ? 26 : 29;
-      return [...base, '-crf', String(crf), '-maxrate', `${effectiveKbps}k`, '-bufsize', `${effectiveKbps * 2}k`];
+    // Same cap the export window shows. The old 0.25 factor encoded about a quarter of that.
+    effectiveKbps = Math.max(350, Math.round(effectiveKbps * keepRatio));
+    const br = `${effectiveKbps}k`;
+    const buf = `${effectiveKbps * 2}k`;
+    if (settings.bitrate_mode === 'cbr') {
+      return [...base, '-b:v', br, '-minrate', br, '-maxrate', br, '-bufsize', buf];
     }
+    return [...base, '-b:v', br, '-maxrate', br, '-bufsize', buf];
   } else if (settings.bitrate_mode !== 'cbr' && (vcodec === 'libx264' || vcodec === 'libx265')) {
     const baseCrf = settings.quality_preset === 'low' ? 26 : settings.quality_preset === 'medium' ? 22 : 19;
     return [...base, '-crf', String(baseCrf), '-maxrate', `${effectiveKbps}k`, '-bufsize', `${effectiveKbps * 2}k`];
@@ -4680,7 +5135,13 @@ app.post('/api/projects/:id/export', async (req, res) => {
       const ext = ['mp4', 'mov', 'mkv', 'avi', 'mp3', 'wav'].includes(String(settings.format || '').toLowerCase())
         ? String(settings.format).toLowerCase()
         : 'mp4';
-      const outPath = path.join(EXPORTS_DIR, pid, `${safeTitle}.${ext}`);
+      let outPath = path.join(EXPORTS_DIR, pid, `${safeTitle}.${ext}`);
+      const requestedDest = String(req.body?.dest || '').trim();
+      if (requestedDest) {
+        outPath = path.resolve(requestedDest);
+        if (path.extname(outPath).toLowerCase() !== `.${ext}`) outPath += `.${ext}`;
+      }
+      outPath = nextFreePath(outPath);
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
       const movFlags = ext === 'mp4' || ext === 'mov' ? ['-movflags', '+faststart'] : [];
 
@@ -4692,12 +5153,8 @@ app.post('/api/projects/:id/export', async (req, res) => {
         !settings.export_video_only,
       );
 
-      if (ext === 'mp3' || ext === 'wav') {
-        const srcAudio = plan.voiceover_path || plan.poem_voiceover_path;
-        if (srcAudio && fs.existsSync(srcAudio)) {
-          await runFfmpeg(['-y', '-i', srcAudio, ...aEncArgs, outPath], { timeout: 600000, skipReap: true });
-        }
-      } else {
+      const audioOnly = ext === 'mp3' || ext === 'wav';
+      {
         // Pre-scale logo ONCE so it is composited on each scene without a second full-video re-encode pass
         const effLogo = getEffectiveLogoMeta(pid, plan);
         const logoFilePath = (plan.logo_path && fs.existsSync(plan.logo_path)) ? plan.logo_path : effLogo.path;
@@ -4727,15 +5184,93 @@ app.post('/api/projects/:id/export', async (req, res) => {
 
         const partFiles = [];
         const commonOutArgs = ['-r', String(fps), '-video_track_timescale', '90000', '-an'];
+        const poemFontFile = (family, indic) => {
+          const dir = 'C:/Windows/Fonts';
+          const named = {
+            arial: 'arial.ttf',
+            'segoe ui': 'segoeui.ttf',
+            'nirmala ui': 'Nirmala.ttc',
+            georgia: 'georgia.ttf',
+            verdana: 'verdana.ttf',
+            'trebuchet ms': 'trebuc.ttf',
+            'comic sans ms': 'comic.ttf',
+            impact: 'impact.ttf',
+            calibri: 'calibri.ttf',
+            'times new roman': 'times.ttf',
+            'courier new': 'cour.ttf',
+            tahoma: 'tahoma.ttf',
+          };
+          const pick = (file) => (file && fs.existsSync(path.join(dir, file)) ? path.join(dir, file) : '');
+          if (indic) return pick('Nirmala.ttc') || pick('segoeui.ttf');
+          const key = String(family || '').trim().toLowerCase();
+          return pick(named[key]) || pick('segoeui.ttf') || pick('arial.ttf') || pick('Nirmala.ttc');
+        };
+        const poemHex = (color, fallback) => {
+          const raw = String(color || fallback || '#ffffff').replace('#', '').slice(0, 6);
+          return /^[0-9a-fA-F]{6}$/.test(raw) ? raw : String(fallback || 'ffffff').replace('#', '');
+        };
+        const poemDrawFor = (clipRow) => {
+          const look = plan.poem_overlay && typeof plan.poem_overlay === 'object' ? plan.poem_overlay : {};
+          if (look.enabled === false || !plan.has_poem || poemScreenHidden(look, clipRow)) return '';
+          const poemS = Number(plan.poem_start_time || 0);
+          const poemE = Number(plan.poem_end_time || 0);
+          const start = Number(clipRow && clipRow.start || 0);
+          const end = Number(clipRow && clipRow.end || 0);
+          if (!(poemE > poemS + 0.2) || end <= poemS + 0.05 || start >= poemE - 0.05) return '';
+          const raw = String(clipRow.vo_text || clipRow.caption_text || '').replace(/\s+/g, ' ').trim();
+          if (!raw || /instrumental/i.test(raw)) return '';
+          const indic = /[\u0900-\u097F]/.test(raw);
+          const poemFont = poemFontFile(look.font_family, indic);
+          if (!poemFont) return '';
+          const kind = ['plain', 'shadow', 'outline', 'sticker', 'lift', 'glow'].includes(look.text_style) ? look.text_style : 'shadow';
+          const fontPx = Math.max(28, Math.min(96, Math.round((Number(look.font_size_px) || 28) * 1.6 * (height / 1080))));
+          const boxW = Math.max(160, Math.round(width * (Number(look.w_pct) || 80) / 100));
+          const per = Math.max(8, Math.floor(boxW / Math.max(14, fontPx * 0.72)));
+          const words = raw.split(' ');
+          const lines = [];
+          let cur = '';
+          for (const word of words) {
+            const next = cur ? `${cur} ${word}` : word;
+            if (next.length > per && cur) {
+              lines.push(cur);
+              cur = word;
+            } else cur = next;
+          }
+          if (cur) lines.push(cur);
+          const file = path.join(jobDir, `poem_${String(clipRow.screen || lines.length).replace(/[^\w.-]/g, '_')}.txt`);
+          fs.writeFileSync(file, lines.join('\n'), 'utf8');
+          const esc = (p) => p.replace(/\\/g, '/').replace(/:/g, '\\:');
+          const x = Math.round(width * (Number(look.x_pct) || 3) / 100);
+          const y = Math.round(height * (Number(look.y_pct) || 70) / 100);
+          let deco = '';
+          if (kind === 'outline' || kind === 'sticker') {
+            const bw = kind === 'sticker' ? Math.max(2, Math.round(fontPx * 0.035)) : Math.max(1, Math.round(fontPx * 0.02));
+            deco += `:borderw=${bw}:bordercolor=0x${poemHex(look.stroke_color, '111111')}`;
+          } else if (kind === 'glow') {
+            const bw = Math.max(2, Math.round(fontPx * 0.04));
+            deco += `:borderw=${bw}:bordercolor=0x${poemHex(look.shadow_color, '38bdf8')}`;
+          }
+          if (look.text_shadow !== false && kind !== 'plain' && kind !== 'outline') {
+            const dist = kind === 'glow' ? 0 : kind === 'lift' ? Math.max(3, Math.round(fontPx * 0.06)) : Math.max(2, Math.round(fontPx * 0.04));
+            deco += `:shadowcolor=0x${poemHex(look.shadow_color, '000000')}:shadowx=${dist}:shadowy=${dist}`;
+          }
+          if (!look.bg_none && Number(look.bg_opacity) > 0.02) {
+            const op = Math.max(0, Math.min(1, Number(look.bg_opacity) || 0.88)).toFixed(2);
+            deco += `:box=1:boxcolor=0x${poemHex(look.bg_color, '0f172a')}@${op}:boxborderw=${Math.max(8, Math.round(fontPx * 0.28))}`;
+          }
+          return `drawtext=fontfile='${esc(poemFont)}':textfile='${esc(file)}':fontcolor=0x${poemHex(look.text_color, 'ffffff')}:fontsize=${fontPx}:x=${x}:y=${y}${deco}`;
+        };
 
-        const encodeSceneWithCodec = async (c, clipDur, outPart, codecArgs) => {
-          const totalFrames = Math.max(1, Math.round(clipDur * fps));
+        const encodeSceneWithCodec = async (c, clipDur, outPart, codecArgs, frameCount) => {
+          const totalFrames = Math.max(1, frameCount || Math.round(clipDur * fps));
           const loopCount = Math.max(0, totalFrames - 1);
           const scalePad = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p`;
+          const poemDraw = poemDrawFor(c);
+          const drawn = poemDraw ? `,${poemDraw}` : '';
 
           if (!c.media_path || !fs.existsSync(c.media_path) || c.fit === 'missing') {
             if (logoScaledPath) {
-              const fg = `[0:v][1:v]overlay=${overlayX}:${overlayY}:format=auto,format=yuv420p,loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
+              const fg = `[0:v][1:v]overlay=${overlayX}:${overlayY}:format=auto,format=yuv420p${drawn},loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
               await runFfmpeg([
                 '-y', '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:r=${fps}:d=0.04`,
                 '-i', logoScaledPath,
@@ -4744,16 +5279,17 @@ app.post('/api/projects/:id/export', async (req, res) => {
                 ...codecArgs, ...commonOutArgs, outPart,
               ], { skipReap: true });
             } else {
-              await runFfmpeg([
+              const args = [
                 '-y', '-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:r=${fps}:d=${clipDur.toFixed(3)}`,
-                '-frames:v', String(totalFrames),
-                ...codecArgs, ...commonOutArgs, outPart,
-              ], { skipReap: true });
+              ];
+              if (poemDraw) args.push('-vf', poemDraw);
+              args.push('-frames:v', String(totalFrames), ...codecArgs, ...commonOutArgs, outPart);
+              await runFfmpeg(args, { skipReap: true });
             }
           } else if (c.kind === 'image') {
             // Decode still image ONCE, scale/pad/logo 1 frame, then loop in memory for ultra-fast P_SKIP encoding
             if (logoScaledPath) {
-              const fg = `[0:v]${scalePad}[bg];[bg][1:v]overlay=${overlayX}:${overlayY}:format=auto,format=yuv420p,loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
+              const fg = `[0:v]${scalePad}[bg];[bg][1:v]overlay=${overlayX}:${overlayY}:format=auto,format=yuv420p${drawn},loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
               await runFfmpeg([
                 '-y', '-i', c.media_path, '-i', logoScaledPath,
                 '-filter_complex', fg, '-map', '[vout]',
@@ -4761,7 +5297,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
                 ...codecArgs, ...commonOutArgs, outPart,
               ], { skipReap: true });
             } else {
-              const vfImg = `${scalePad},loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)`;
+              const vfImg = `${scalePad}${drawn},loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)`;
               await runFfmpeg([
                 '-y', '-i', c.media_path,
                 '-vf', vfImg,
@@ -4770,36 +5306,77 @@ app.post('/api/projects/:id/export', async (req, res) => {
               ], { skipReap: true });
             }
           } else {
+            // A scene video that is shorter than its slot must hold the last
+            // frame. Ending the part early pulls every later picture ahead of the voice.
             const srcIn = Number(c.source_in || 0);
-            const rawSrcDur = (c.source_out && Number(c.source_out) > srcIn)
-              ? (Number(c.source_out) - srcIn)
-              : ((await probeDuration(c.media_path)) || clipDur);
-            const playDur = Math.min(clipDur, Math.max(0.1, rawSrcDur));
-            const freeze = Math.max(0, clipDur - playDur);
-            const vfVidBase = freeze > 0.05
-              ? `${scalePad},fps=${fps},tpad=stop_mode=clone:stop_duration=${freeze.toFixed(3)}`
-              : `${scalePad},fps=${fps}`;
+            let span = clipDur;
+            if (c.source_out != null && Number(c.source_out) > srcIn + 0.05) {
+              span = Number(c.source_out) - srcIn;
+            }
+            const fileDur = await probeDuration(c.media_path);
+            const available = fileDur ? Math.max(0.04, fileDur - srcIn) : span;
+            const ni = Number(c.narration_in);
+            const no = Number(c.narration_out);
+            let line = clipDur;
+            let holdAfter = false;
+            if (Number.isFinite(ni) && Number.isFinite(no) && no > ni + 0.05 && (no - ni) + 0.2 < clipDur) {
+              line = Math.max(0.05, no - ni);
+              holdAfter = true;
+            }
+            const shortVideo = span + 0.12 < line && span >= line * 0.2;
+            let rate = 1;
+            let play = Math.min(span, available);
+            if (c.fit === 'stretch' || c.fit === 'passthrough' || shortVideo) {
+              rate = line ? Math.min(4, span / line) : 1;
+            } else if (holdAfter && span > line + 0.12) {
+              rate = Math.min(1.28, span / line);
+              play = Math.min(play, line * rate);
+            }
+            play = Math.max(0.04, Math.min(play, available));
+            const moveDur = Math.min(clipDur, play / Math.max(0.05, rate));
+            const freeze = Math.max(0, clipDur - moveDur);
+            const speed = Math.abs(rate - 1) > 0.02 ? `,setpts=PTS/${rate.toFixed(4)}` : '';
+            const pad = freeze > 0.5 / fps
+              ? `,tpad=stop_mode=clone:stop_duration=${(freeze + 0.2).toFixed(3)}`
+              : '';
+            const vfVidBase = `${scalePad},fps=${fps}${speed}${pad}`;
+            const readFor = Math.max(0.1, play + 0.08).toFixed(3);
             if (logoScaledPath) {
-              const fgVid = `[0:v]${vfVidBase}[bg];[bg][1:v]overlay=${overlayX}:${overlayY}:eof_action=repeat:format=auto,format=yuv420p[vout]`;
+              const fgVid = `[0:v]${vfVidBase}[bg];[bg][1:v]overlay=${overlayX}:${overlayY}:eof_action=repeat:format=auto,format=yuv420p${drawn}[vout]`;
               await runFfmpeg([
-                '-y', '-ss', String(srcIn), '-i', c.media_path, '-i', logoScaledPath,
-                '-t', String(clipDur), '-filter_complex', fgVid, '-map', '[vout]',
+                '-y', '-ss', String(srcIn), '-t', readFor, '-i', c.media_path, '-i', logoScaledPath,
+                '-filter_complex', fgVid, '-map', '[vout]',
+                '-frames:v', String(totalFrames),
                 ...codecArgs, ...commonOutArgs, outPart,
               ], { skipReap: true });
             } else {
               await runFfmpeg([
-                '-y', '-ss', String(srcIn), '-i', c.media_path,
-                '-t', String(clipDur), '-vf', vfVidBase,
+                '-y', '-ss', String(srcIn), '-t', readFor, '-i', c.media_path,
+                '-vf', `${vfVidBase}${drawn}`,
+                '-frames:v', String(totalFrames),
                 ...codecArgs, ...commonOutArgs, outPart,
               ], { skipReap: true });
             }
           }
         };
 
+        let concatTxt = '';
+        let exportFrame = 0;
+        if (!audioOnly) {
         for (let i = 0; i < plan.clips.length; i++) {
           if (exportStatus[pid]?.cancelled) throw new Error('Export cancelled');
           const c = plan.clips[i];
-          const clipDur = Math.max(0.2, Number(c.duration) || (Number(c.end || 0) - Number(c.start || 0)) || 2.0);
+          // One shared frame clock. Rounding each scene on its own was
+          // pushing later pictures late while the voice stayed on the timeline.
+          const startFrame = Math.max(exportFrame, Math.round(Number(c.start || 0) * fps));
+          let endFrame = Math.max(startFrame + 1, Math.round(Number(c.end || 0) * fps));
+          if (i + 1 < plan.clips.length) {
+            const nextFrame = Math.round(Number(plan.clips[i + 1].start || 0) * fps);
+            if (nextFrame > endFrame) endFrame = nextFrame;
+          }
+          const totalFrames = Math.max(1, endFrame - startFrame);
+          exportFrame = startFrame + totalFrames;
+          const clipDur = totalFrames / fps;
           exportStatus[pid] = {
             running: true,
             percent: 5 + Math.round(((i + 1) / plan.clips.length) * 76),
@@ -4808,16 +5385,17 @@ app.post('/api/projects/:id/export', async (req, res) => {
           };
           const outPart = path.join(partsDir, `part_${String(i).padStart(4, '0')}.mp4`);
           try {
-            await encodeSceneWithCodec(c, clipDur, outPart, activeVRateArgs);
+            await encodeSceneWithCodec(c, clipDur, outPart, activeVRateArgs, totalFrames);
           } catch {
             activeVRateArgs = vRateFallbackArgs;
-            await encodeSceneWithCodec(c, clipDur, outPart, activeVRateArgs);
+            await encodeSceneWithCodec(c, clipDur, outPart, activeVRateArgs, totalFrames);
           }
           partFiles.push(outPart);
         }
 
-        const concatTxt = path.join(jobDir, 'concat.txt');
+        concatTxt = path.join(jobDir, 'concat.txt');
         fs.writeFileSync(concatTxt, partFiles.map((p) => `file '${p.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n'), 'utf-8');
+        }
 
         let mixedAudioPath = null;
         if (hasVo || hasPoem) {
@@ -4829,6 +5407,8 @@ app.post('/api/projects/:id/export', async (req, res) => {
           };
           // Merge consecutive clips with continuous timeline-to-VO offset so a continuous VO is processed as 1 run
           const narrRuns = [];
+          const usePieces = Array.isArray(plan.vo_pieces) && plan.vo_pieces.length > 0;
+          if (!usePieces) {
           for (const c of plan.clips) {
             if (c.narration_in == null || c.narration_out == null) continue;
             const ni = Number(c.narration_in);
@@ -4847,6 +5427,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
             }
             narrRuns.push([cs, ni, no]);
           }
+          }
 
           const audioInputs = [];
           const filterParts = [];
@@ -4854,7 +5435,43 @@ app.post('/api/projects/:id/export', async (req, res) => {
           let nextAudioIdx = 0;
 
           if (hasVo) {
-            if (narrRuns.length <= 1) {
+            if (usePieces) {
+              const pieceFile = (piece) => {
+                if (piece.replace_path && fs.existsSync(piece.replace_path)) return piece.replace_path;
+                const slots = Array.isArray(plan.voiceover_slots) ? plan.voiceover_slots : [];
+                const hit = slots.find((s) => Number(s.slot) === Number(piece.slot || 1));
+                if (hit && hit.path && fs.existsSync(hit.path)) return hit.path;
+                if (plan.voiceover_path && fs.existsSync(plan.voiceover_path)) return plan.voiceover_path;
+                return '';
+              };
+              const concatLbls = [];
+              let cursor = 0;
+              let segIdx = 0;
+              const pieces = plan.vo_pieces.slice().sort((a, b) => Number(a.start || 0) - Number(b.start || 0));
+              for (const piece of pieces) {
+                const tlStart = Number(piece.start || 0);
+                const srcIn = Number(piece.source_in || 0);
+                const srcOut = Number(piece.source_out || srcIn);
+                const segDur = Math.max(0, Math.min(Number(piece.end || 0) - tlStart, srcOut - srcIn));
+                const file = pieceFile(piece);
+                if (!file || segDur < 0.05) continue;
+                if (tlStart > cursor + 0.04) {
+                  const glbl = `ngap${segIdx++}`;
+                  filterParts.push(`anullsrc=r=44100:cl=stereo,atrim=0:${(tlStart - cursor).toFixed(3)},asetpts=PTS-STARTPTS[${glbl}]`);
+                  concatLbls.push(`[${glbl}]`);
+                }
+                const inIdx = nextAudioIdx++;
+                audioInputs.push('-ss', srcIn.toFixed(3), '-t', segDur.toFixed(3), '-i', file);
+                const slbl = `nseg${segIdx++}`;
+                filterParts.push(`[${inIdx}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo[${slbl}]`);
+                concatLbls.push(`[${slbl}]`);
+                cursor = Math.max(cursor, tlStart) + segDur;
+              }
+              if (concatLbls.length) {
+                filterParts.push(`${concatLbls.join('')}concat=n=${concatLbls.length}:v=0:a=1[nr_main]`);
+                mixLabels.push('[nr_main]');
+              }
+            } else if (narrRuns.length <= 1) {
               const voIdx = nextAudioIdx++;
               audioInputs.push('-i', plan.voiceover_path);
               if (narrRuns.length === 1) {
@@ -4913,11 +5530,12 @@ app.post('/api/projects/:id/export', async (req, res) => {
             mixLabels.push('[poem]');
           }
 
+          const audioDur = exportFrame > 0 ? exportFrame / fps : totalTlDur;
           let filterComplex = '';
           if (mixLabels.length === 1) {
-            filterComplex = `${filterParts.join(';')};${mixLabels[0]}apad=whole_dur=${totalTlDur.toFixed(3)}[aout]`;
+            filterComplex = `${filterParts.join(';')};${mixLabels[0]}apad=whole_dur=${audioDur.toFixed(3)}[aout]`;
           } else {
-            filterComplex = `${filterParts.join(';')};${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:dropout_transition=0,volume=${mixLabels.length},apad=whole_dur=${totalTlDur.toFixed(3)}[aout]`;
+            filterComplex = `${filterParts.join(';')};${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:dropout_transition=0,volume=${mixLabels.length},apad=whole_dur=${audioDur.toFixed(3)}[aout]`;
           }
 
           const audioExt = settings.audio_encoder === 'mp3' ? 'mp3' : settings.audio_encoder === 'pcm' ? 'wav' : 'm4a';
@@ -4929,7 +5547,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
             '-map', '[aout]',
             '-vn',
             ...aEncArgs,
-            '-t', totalTlDur.toFixed(3),
+            '-t', (exportFrame > 0 ? exportFrame / fps : totalTlDur).toFixed(3),
             mixedAudioPath,
           ], { timeout: 300000, skipReap: true });
         }
@@ -4937,11 +5555,16 @@ app.post('/api/projects/:id/export', async (req, res) => {
         exportStatus[pid] = {
           running: true,
           percent: 95,
-          message: 'Finalizing & multiplexing MP4 container…',
+          message: audioOnly ? 'Writing the audio file…' : 'Finalizing the video…',
           bitrate_info: initialBitrateInfo,
         };
 
-        if (mixedAudioPath && fs.existsSync(mixedAudioPath)) {
+        if (audioOnly) {
+          if (!mixedAudioPath || !fs.existsSync(mixedAudioPath)) {
+            throw new Error('No narration or poem audio to export');
+          }
+          await runFfmpeg(['-y', '-i', mixedAudioPath, '-c', 'copy', outPath], { timeout: 180000, skipReap: true });
+        } else if (mixedAudioPath && fs.existsSync(mixedAudioPath)) {
           try {
             await runFfmpeg([
               '-y',
@@ -4976,11 +5599,8 @@ app.post('/api/projects/:id/export', async (req, res) => {
         }
       }
 
-      if (settings.export_srt_sidecar) {
-        const cues = buildSrtCues(plan.clips || [], plan);
-        const srtSidecarPath = path.join(EXPORTS_DIR, pid, `${safeTitle}.srt`);
-        fs.writeFileSync(srtSidecarPath, formatSrt(cues), 'utf-8');
-      }
+      // The caption file is a separate export. A matching .srt beside the
+      // video is what players draw as white text on the picture.
 
       try { if (jobDir) fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
 
@@ -5476,6 +6096,10 @@ function normSlash(p) {
 function fileMd5Hex(p) {
   const h = crypto.createHash('md5');
   try {
+    const st = fs.statSync(p);
+    h.update(`${st.size}:${Math.floor(st.mtimeMs / 1000)}`);
+  } catch {}
+  try {
     const fd = fs.openSync(p, 'r');
     const buf = Buffer.alloc(65536);
     const n = fs.readSync(fd, buf, 0, 65536, 0);
@@ -5535,6 +6159,13 @@ function udGuid64(guidStr, key) {
   const raw = Buffer.alloc(64, 0);
   raw.write(String(guidStr).slice(0, 38), 0, 'ascii');
   return { data: raw.toString('base64'), key, size: 64 };
+}
+function udGuid47(guidStr, key) {
+  const hex = String(guidStr).replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+  const pairs = [];
+  for (let i = 0; i + 1 < hex.length; i += 2) pairs.push(hex.slice(i, i + 2));
+  const raw = Buffer.from(pairs.join('-'), 'ascii');
+  return { data: raw.toString('base64'), key, size: raw.length };
 }
 
 function imageMediaJson(absPath, mtimeSec = 0) {
@@ -5826,8 +6457,9 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
       md5Str = crypto.createHash('md5').update(normAbs, 'utf-8').digest('hex');
     }
 
-    const mid = filmoraGuid(`media:${pid}:${normAbs}`);
-    const resUid = uidLower(`res:${pid}:${normAbs}`);
+    const ident = existsOnServer ? `${fileSize}:${mtimeSec}` : 'missing';
+    const mid = filmoraGuid(`media:${pid}:${normAbs}:${ident}`);
+    const resUid = uidLower(`res:${pid}:${normAbs}:${ident}`);
     const durSec = Math.max(0.5, Number(approxDurSec) || 5.0);
     const durTicks = kind === 'image' ? 0 : secToTicks(durSec);
     const baseName = path.posix.basename(normAbs);
@@ -6325,10 +6957,226 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     );
   }
 
+  // A Filmora subtitle clip only draws when the line is in the template Filmora
+  // saved, not when it is only an SRT cue. This is that template.
+  let subtitleTemplate = null;
+  const loadSubtitleTemplate = () => {
+    if (subtitleTemplate) return subtitleTemplate;
+    try {
+      subtitleTemplate = JSON.parse(fs.readFileSync(path.join(__dirname, 'filmora_subtitle_template.json'), 'utf-8'));
+    } catch {
+      subtitleTemplate = null;
+    }
+    return subtitleTemplate;
+  };
+  const makeSubtitleClip = (clipKey, text, tlBeginTicks, tlEndTicks, look) => {
+    const base = loadSubtitleTemplate();
+    if (!base) return null;
+    const line = String(text || '').replace(/\r\n/g, '\n').trim();
+    if (!line) return null;
+    const durTicks = Math.max(1, tlEndTicks - tlBeginTicks);
+    const src = JSON.parse(JSON.stringify(base));
+    let n = 0;
+    const retarget = (node) => {
+      if (Array.isArray(node)) { node.forEach(retarget); return; }
+      if (!node || typeof node !== 'object') return;
+      for (const k of Object.keys(node)) {
+        if ((k === 'thisUId' || k === 'Uuid') && typeof node[k] === 'string') node[k] = uidLower(`${clipKey}:${n++}`);
+        else retarget(node[k]);
+      }
+    };
+    retarget(src);
+    const style = look && typeof look === 'object' ? look : {};
+    const hex = String(style.text_color || '#f43f5e').replace('#', '');
+    const rgb = hex.length === 6 ? parseInt(hex, 16) : 0xf43f5e;
+    const colorRef = ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff);
+    const fontPx = Math.max(28, Math.min(72, Math.round((Number(style.font_size_px) || 28) * 1.6)));
+    const boxX = Number.isFinite(Number(style.x_pct)) ? Number(style.x_pct) : 10;
+    const boxY = Number.isFinite(Number(style.y_pct)) ? Number(style.y_pct) : 72;
+    const boxW = Number.isFinite(Number(style.w_pct)) ? Number(style.w_pct) : 80;
+    const boxH = Number.isFinite(Number(style.h_pct)) ? Number(style.h_pct) : 22;
+    const posX = Math.max(0.08, Math.min(0.92, (boxX + boxW / 2) / 100));
+    const posY = Math.max(0.08, Math.min(0.92, (boxY + boxH / 2) / 100));
+    const scaleX = Math.max(0.42, Math.min(1, boxW / 100));
+    const scaleY = Math.max(0.16, Math.min(1, boxH / 100));
+    const indic = /[\u0900-\u097F]/.test(line);
+    const fontName = indic ? 'Nirmala UI' : String(style.font_family || 'Nirmala UI');
+    const noBox = style.bg_none === true || Number(style.bg_opacity) === 0;
+    const align = style.text_align === 'left' || style.text_align === 'right' ? style.text_align : 'center';
+    const filmoraColor = (hex, fallback) => {
+      const raw = String(hex || fallback || '#ffffff').replace('#', '');
+      const rgb = /^[0-9a-fA-F]{6}$/.test(raw) ? parseInt(raw, 16) : 0xffffff;
+      return ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff);
+    };
+    const letterKind = ['plain', 'shadow', 'outline', 'sticker', 'lift', 'glow'].includes(style.text_style) ? style.text_style : 'shadow';
+    const setNamed = (list, name, value) => {
+      if (!Array.isArray(list)) return;
+      for (const item of list) {
+        if (item && item.name === name && item.fxParam) item.fxParam.unValue = value;
+      }
+    };
+    const visit = (node) => {
+      if (Array.isArray(node)) { node.forEach(visit); return; }
+      if (!node || typeof node !== 'object') return;
+      if (Array.isArray(node.paramList)) {
+        setNamed(node.paramList, 'Position_x', posX);
+        setNamed(node.paramList, 'Position_y', posY);
+        setNamed(node.paramList, 'Scale_x', scaleX * 100);
+        setNamed(node.paramList, 'Scale_y', scaleY * 100);
+      }
+      for (const k of Object.keys(node)) visit(node[k]);
+    };
+    visit(src.AniTemplates);
+    for (const name of ['Base', 'Base1', 'Base2']) {
+      const tpl = src.Templates && src.Templates[name];
+      if (!tpl) continue;
+      tpl.Text = line;
+      tpl.PosX = posX;
+      tpl.PosY = posY;
+      tpl.ScaleX = scaleX;
+      tpl.ScaleY = scaleY;
+      if (tpl.Layout) tpl.Layout.TextAlign = align;
+      const td = tpl.TextData && tpl.TextData[0];
+      if (td) {
+        td.CharData = line;
+        if (td.Basic) {
+          td.Basic.FontName = fontName;
+          td.Basic.FontSize = fontPx;
+          td.Basic.FontHSize = fontPx;
+          td.Basic.FontVSize = fontPx;
+          td.Basic.TextAlpha = 255;
+          td.Basic.UseDefaultSliderColor = 0;
+          td.Basic.TextColor = [{ Color: colorRef }];
+        }
+        if (td.Border) {
+          const outline = letterKind === 'outline' || letterKind === 'sticker' || letterKind === 'glow';
+          td.Border.Enable = outline ? 1 : 0;
+          td.Border.Color = filmoraColor(letterKind === 'glow' ? style.shadow_color : style.stroke_color, letterKind === 'glow' ? '#38bdf8' : '#111111');
+          td.Border.Size = letterKind === 'sticker' ? 3 : letterKind === 'glow' ? 4 : letterKind === 'outline' ? 2 : 0;
+          td.Border.BlurRadius = letterKind === 'glow' ? 10 : 0;
+          td.Border.Alpha = letterKind === 'glow' ? 170 : 255;
+        }
+        if (td.Shadow) {
+          const on = style.text_shadow !== false && letterKind !== 'plain' && letterKind !== 'outline';
+          td.Shadow.Enable = on ? 1 : 0;
+          td.Shadow.Color = filmoraColor(style.shadow_color, '#000000');
+          td.Shadow.Alpha = letterKind === 'glow' ? 150 : 220;
+          td.Shadow.BlurRadius = letterKind === 'glow' ? 14 : Math.max(0, Math.min(16, Number(style.text_shadow_soft) || 4));
+          td.Shadow.Distance = letterKind === 'lift' ? 6 : letterKind === 'glow' ? 0 : 3;
+        }
+        if (td.Basic) td.Basic.TextBlurRadius = letterKind === 'glow' ? 1 : 0;
+      }
+      if (tpl.Background) {
+        tpl.Background.Enable = noBox ? 0 : 1;
+        tpl.Background.Color = filmoraColor(style.bg_color, '#0f172a');
+        tpl.Background.Alpha = noBox ? 0 : Math.round(255 * Math.max(0, Math.min(1, Number(style.bg_opacity) || 0.88)));
+      }
+    }
+    src.Start = 0;
+    src.End = durTicks;
+    src.Items = [{
+      AniTemplate: 'Base2',
+      Content: line,
+      Start: 0,
+      End: durTicks,
+      Layer: 0,
+      Template: 'Base1',
+      Uuid: uidLower(`subitem:${clipKey}`),
+    }];
+    const clipGuid = filmoraGuid(`sub_g:${clipKey}`);
+    return {
+      allLocked: false,
+      effectChainList: [
+        {
+          effectList: [
+            {
+              display: 'crop-pan-zoom',
+              id: 'video/effect/crop-pan-zoom',
+              placeholder: false,
+              placeholderStatus: 0,
+              thisUId: uidLower(`subcrop:${clipKey}`),
+              type: 3,
+              userData: [udBytes(Buffer.from([0x01]), 7), udGuid64(filmoraGuid(`subcrop_g:${clipKey}`), 3)],
+            },
+            {
+              display: 'transform',
+              id: 'video/effect/transform',
+              paramList: [
+                { fxParam: { paramType: 5, unValue: 1186339 }, name: 'dwValue' },
+                { fxParam: { paramType: 5, unValue: 1 }, name: 'EnableTransform' },
+              ],
+              placeholder: false,
+              placeholderStatus: 0,
+              thisUId: uidLower(`subtrans:${clipKey}`),
+              type: 3,
+              userData: [
+                udStr('1', 36880, true),
+                udStr('1.0', 15005, false),
+                udGuid64(filmoraGuid(`subtrans_g:${clipKey}`), 3),
+                udBytes(Buffer.from([0x01]), 7),
+              ],
+            },
+          ],
+          name: 'Basic',
+        },
+        { effectList: [], name: 'Effect' },
+        { effectList: [], name: '_wes_hold_effectchain_' },
+      ],
+      inPoint: 0,
+      outPoint: durTicks,
+      pipBuf: '{"Algorithm":"Bilinear","BlendMode":0,"BlenderName":"video/blender/simple-pip","Enable":true,"Opacity":100.0}',
+      pipBufSize: 110,
+      placeholder: false,
+      placeholderStatus: 0,
+      subtitleSource: JSON.stringify(src),
+      thisUId: uidLower(`sub:${clipKey}`),
+      tlBegin: tlBeginTicks,
+      tlEnd: tlEndTicks,
+      type: 22,
+      userData: [
+        udGuid47(clipGuid, 10),
+        udInt32(0, 2),
+        udStr('Caption', 50, false),
+        udInt32(0, 103),
+        udGuid64(clipGuid, 3),
+        udInt32(4, 102),
+        udInt32(10, 6),
+        udInt32(29, 1),
+      ],
+    };
+  };
+
   // 2. Narration VO audio track
+  // The picture clock includes the poem and the 4-second pauses. A whole VO
+  // file laid from its file start plays the wrong words under those pictures.
+  // Each heard piece is placed on its own, with the file range it actually uses.
   const voClipsTrack = [];
   const slots = Array.isArray(plan.voiceover_slots) ? plan.voiceover_slots : [];
-  if (slots.length > 0 && slots.some((s) => Boolean(s && s.path))) {
+  const slotByNo = new Map();
+  for (const s of slots) {
+    if (s && s.path) slotByNo.set(Number(s.slot || slotByNo.size + 1), s);
+  }
+  const heardPieces = (Array.isArray(plan.vo_pieces) ? plan.vo_pieces : [])
+    .filter((p) => p && Number(p.end) > Number(p.start) + 0.05 && p.source_out != null)
+    .slice()
+    .sort((a, b) => Number(a.start) - Number(b.start));
+  if (heardPieces.length && slotByNo.size) {
+    heardPieces.forEach((piece, idx) => {
+      const slot = slotByNo.get(Number(piece.slot || 1)) || slots[0];
+      if (!slot || !slot.path) return;
+      const sDur = Math.max(Number(slot.duration || 0), Number(piece.source_out) || 0, 5.0);
+      const [mid, resUid] = registerMedia(slot.path, 'audio', sDur);
+      if (!mid) return;
+      const srcIn = Math.max(0, Number(piece.source_in) || 0);
+      const srcOut = Math.max(srcIn + 0.05, Number(piece.source_out) || srcIn);
+      const tlBegin = secToTicks(piece.start);
+      const tlEnd = Math.max(tlBegin + 1, secToTicks(piece.end));
+      const metaM = mediaItemsMeta[mid];
+      voClipsTrack.push(
+        makeAudioClip(`vo_piece_${idx}`, mid, resUid, metaM._clip_ref_path, tlBegin, tlEnd, srcIn, srcOut, metaM._dur_sec),
+      );
+    });
+  } else if (slots.length > 0 && slots.some((s) => Boolean(s && s.path))) {
     for (let idx = 0; idx < slots.length; idx++) {
       const s = slots[idx];
       if (!s || !s.path) continue;
@@ -6455,6 +7303,35 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
       trackType: 1,
       userData: [udInt32(70, 12000)],
       uuid: uidLower('track_v_logo'),
+    });
+  }
+
+  const subtitleClips = [];
+  const poemS = Number(plan.poem_start_time || 0);
+  const poemE = Number(plan.poem_end_time || 0);
+  const poemLook = plan.poem_overlay && typeof plan.poem_overlay === 'object' ? plan.poem_overlay : null;
+  const poemOn = Boolean(plan.has_poem) && poemE > poemS + 0.2 && (!poemLook || poemLook.enabled !== false);
+  // Narration stays in the SRT and is not a Filmora caption. Poem screens
+  // carry the lyric in the place and colour set in the preview.
+  (plan.clips || []).forEach((clipRow, idx) => {
+    if (!poemOn) return;
+    const start = Number(clipRow && clipRow.start || 0);
+    const end = Number(clipRow && clipRow.end || 0);
+    if (end <= poemS + 0.05 || start >= poemE - 0.05) return;
+    const text = String(clipRow.vo_text || clipRow.caption_text || '').trim();
+    if (!text || /instrumental/i.test(text) || poemScreenHidden(poemLook, clipRow)) return;
+    const tlBegin = secToTicks(Math.max(start, poemS));
+    const tlEnd = Math.max(tlBegin + 1, secToTicks(Math.min(end, poemE)));
+    const clip = makeSubtitleClip(`poem_${idx}`, text, tlBegin, tlEnd, poemLook || {});
+    if (clip) subtitleClips.push(clip);
+  });
+  if (subtitleClips.length) {
+    tracks.push({
+      clipList: subtitleClips,
+      trackTag: 4,
+      trackType: 1,
+      userData: [udInt32(1, 21)],
+      uuid: uidLower('track_subtitle'),
     });
   }
 
@@ -6602,12 +7479,124 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
   addDeflated(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/extra.json`, Buffer.from(JSON.stringify(extraJson), 'utf-8'));
   addDeflated(`ProjectFolder/Medias/${TIMELINE_MEDIA_ID}/timeline.wesproj`, Buffer.from(JSON.stringify(wesproj), 'utf-8'));
   addDeflated('ProjectFolder/project_info.json', Buffer.from(JSON.stringify(projectInfo), 'utf-8'));
+  // The zip comment is limited to 65,000 characters, and this chapter is larger
+  // than that. Without this file the import rebuilds the timeline from Filmora
+  // tracks and the voice lineup is lost.
+  addDeflated('ProjectFolder/dgs_project.json', Buffer.from(rawDgs, 'utf-8'));
   addDeflated('ProjectFolder/Anon/Cover/thumb.fsthumb', COVER_160_90);
   if (dgsComment) {
     zip.addZipComment(dgsComment);
   }
 
   return { wfpBuffer: zip.toBuffer(), mediaGuidToPath, dgsComment };
+}
+
+function crc32Buf(buf, crc = 0) {
+  let c = (crc ^ 0xffffffff) >>> 0;
+  for (let i = 0; i < buf.length; i++) {
+    c = (c >>> 8) ^ CRC32_TABLE[(c ^ buf[i]) & 0xff];
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function fileCrcAndSize(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  const buf = Buffer.alloc(1024 * 1024);
+  let crc = 0;
+  let size = 0;
+  try {
+    let n = 0;
+    while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+      crc = crc32Buf(buf.subarray(0, n), crc);
+      size += n;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return { crc, size };
+}
+
+function writeStoredZip(outPath, entries, commentText) {
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  const fd = fs.openSync(outPath, 'w');
+  const chunk = Buffer.alloc(1024 * 1024);
+  const centrals = [];
+  let offset = 0;
+  try {
+    for (const ent of entries) {
+      const name = Buffer.from(String(ent.name || '').replace(/\\/g, '/'), 'utf8');
+      let crc = 0;
+      let size = 0;
+      if (ent.buffer) {
+        crc = crc32Buf(ent.buffer);
+        size = ent.buffer.length;
+      } else {
+        const measured = fileCrcAndSize(ent.filePath);
+        crc = measured.crc;
+        size = measured.size;
+      }
+      const local = Buffer.alloc(30);
+      local.writeUInt32LE(0x04034b50, 0);
+      local.writeUInt16LE(20, 4);
+      local.writeUInt16LE(0, 8);
+      local.writeUInt32LE(crc, 14);
+      local.writeUInt32LE(size, 18);
+      local.writeUInt32LE(size, 22);
+      local.writeUInt16LE(name.length, 26);
+      fs.writeSync(fd, local);
+      fs.writeSync(fd, name);
+      if (ent.buffer) {
+        fs.writeSync(fd, ent.buffer);
+      } else {
+        const src = fs.openSync(ent.filePath, 'r');
+        try {
+          let n = 0;
+          while ((n = fs.readSync(src, chunk, 0, chunk.length, null)) > 0) fs.writeSync(fd, chunk, 0, n);
+        } finally {
+          fs.closeSync(src);
+        }
+      }
+      centrals.push({ name, crc, size, offset });
+      offset += 30 + name.length + size;
+    }
+    const cdStart = offset;
+    for (const item of centrals) {
+      const head = Buffer.alloc(46);
+      head.writeUInt32LE(0x02014b50, 0);
+      head.writeUInt16LE(20, 4);
+      head.writeUInt16LE(20, 6);
+      head.writeUInt32LE(item.crc, 16);
+      head.writeUInt32LE(item.size, 20);
+      head.writeUInt32LE(item.size, 24);
+      head.writeUInt16LE(item.name.length, 28);
+      head.writeUInt32LE(item.offset, 42);
+      fs.writeSync(fd, head);
+      fs.writeSync(fd, item.name);
+      offset += 46 + item.name.length;
+    }
+    const comment = Buffer.from(String(commentText || ''), 'utf8');
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(centrals.length, 8);
+    eocd.writeUInt16LE(centrals.length, 10);
+    eocd.writeUInt32LE(offset - cdStart, 12);
+    eocd.writeUInt32LE(cdStart, 16);
+    eocd.writeUInt16LE(comment.length, 20);
+    fs.writeSync(fd, eocd);
+    if (comment.length) fs.writeSync(fd, comment);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function buildWfpBundleFileOnDisk(pid, rawTitle, bundlePath, progressCb = null) {
@@ -6619,46 +7608,58 @@ function buildWfpBundleFileOnDisk(pid, rawTitle, bundlePath, progressCb = null) 
     archiveMode: true,
   });
 
-  const bundleZip = new AdmZip();
   const items = Array.from(mediaGuidToPath.entries());
   const total = Math.max(1, items.length);
+  const entries = [];
   for (let idx = 0; idx < items.length; idx++) {
     const [mid, srcPath] = items[idx];
     if (progressCb) {
-      const pct = 15 + Math.round(((idx + 1) / total) * 75);
+      const pct = 15 + Math.round(((idx + 1) / total) * 70);
       progressCb(pct, `Packing ${path.basename(srcPath)} into .wfpbundle (${idx + 1}/${total})…`);
     }
     if (fs.existsSync(srcPath) && fs.statSync(srcPath).isFile()) {
-      bundleZip.addLocalFile(srcPath, `Medias/${mid}`, path.basename(srcPath));
-      // Set STORED method on media entries so Filmora 15 opens .wfpbundle directly
-      const entry = bundleZip.getEntry(`Medias/${mid}/${path.basename(srcPath)}`);
-      if (entry) entry.header.method = 0;
+      entries.push({ name: `Medias/${mid}/${path.basename(srcPath)}`, filePath: srcPath });
     }
   }
   if (progressCb) progressCb(94, `Writing ${innerWfpName} into ${path.basename(bundlePath)}…`);
-  bundleZip.addFile(innerWfpName, wfpBuffer);
-  const wfpEntry = bundleZip.getEntry(innerWfpName);
-  if (wfpEntry) wfpEntry.header.method = 0;
-  if (dgsComment) {
-    bundleZip.addZipComment(dgsComment);
-  }
+  entries.push({ name: innerWfpName, buffer: wfpBuffer });
   fs.mkdirSync(path.dirname(bundlePath), { recursive: true });
-  bundleZip.writeZip(bundlePath);
-  return { bundlePath, fileCount: items.length + 1, innerWfpBuffer: wfpBuffer };
+  writeStoredZip(bundlePath, entries, dgsComment);
+  return { bundlePath, fileCount: entries.length, innerWfpBuffer: wfpBuffer };
 }
 
-function generateProjectFileOnDisk(pid, rawTitle, fmt) {
+function nextFreePath(filePath) {
+  const resolved = path.resolve(String(filePath || ''));
+  if (!resolved || !fs.existsSync(resolved)) return resolved;
+  const dir = path.dirname(resolved);
+  const ext = path.extname(resolved);
+  const stem = path.basename(resolved, ext).replace(/ \(\d+\)$/, '');
+  for (let n = 2; n < 1000; n++) {
+    const candidate = path.join(dir, `${stem} (${n})${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return resolved;
+}
+
+function generateProjectFileOnDisk(pid, rawTitle, fmt, dest) {
   const plan = loadJson(pid, 'timeline.json') || {
     project_id: pid,
     total_duration: 10,
     clips: [],
   };
-  const safeTitle = String(rawTitle || `Project_${pid}`).trim().replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
+  const safeTitle = String(rawTitle || `Project_${pid}`).trim().replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '') || `Project_${pid}`;
   const outDir = path.join(EXPORTS_DIR, pid);
   fs.mkdirSync(outDir, { recursive: true });
 
   let filename = `${safeTitle}.${fmt}`;
   let outPath = path.join(outDir, filename);
+  if (dest) {
+    outPath = path.resolve(String(dest));
+    if (path.extname(outPath).toLowerCase() !== `.${fmt}`) outPath += `.${fmt}`;
+    outPath = nextFreePath(outPath);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    filename = path.basename(outPath);
+  }
 
   if (fmt === 'wfp') {
     const { wfpBuffer } = buildWfpAndMediaMap(pid, rawTitle, { wfpSavePath: outPath, archiveMode: false });
@@ -6717,7 +7718,8 @@ app.post('/api/projects/:id/save-wfp-to', (req, res) => {
     const pid = req.params.id;
     if (!fs.existsSync(projectRoot(pid))) return res.status(404).json({ detail: 'Project not found' });
     const rawTitle = String(req.query.title || req.body?.title || `Project_${pid}`).trim();
-    const { outPath, filename } = generateProjectFileOnDisk(pid, rawTitle, 'wfp');
+    const dest = String(req.body?.dest || '').trim();
+    const { outPath, filename } = generateProjectFileOnDisk(pid, rawTitle, 'wfp', dest);
     res.json({
       ok: true,
       cancelled: false,
@@ -6812,55 +7814,57 @@ app.get('/api/projects/:id/collect/status', (req, res) => {
 
 app.post('/api/projects/:id/collect', async (req, res) => {
   const pid = req.params.id;
+  if (collectStatus[pid] && collectStatus[pid].running) {
+    return res.json({ started: true, running: true, ...collectStatus[pid] });
+  }
   const mode = String(req.body?.mode || req.query?.mode || 'wfpbundle').toLowerCase();
   const rawTitle = String(req.body?.title || req.query?.title || `Project_${pid}`).trim();
-  const safeTitle = rawTitle.replace(/[^a-zA-Z0-9._ ()-]/g, '_') || `Project_${pid}`;
-
-  collectStatus[pid] = { running: true, percent: 10, message: 'Packing Filmora 15 .wfpbundle & media…' };
-  try {
-    let plan = loadJson(pid, 'timeline.json');
-    if (plan) {
-      plan = await healTimelinePaths(pid, plan);
-      saveJson(pid, 'timeline.json', plan);
-    }
-    const outDir = path.join(EXPORTS_DIR, pid);
-    fs.mkdirSync(outDir, { recursive: true });
-    const extSuffix = mode === 'wfpbundle' ? 'wfpbundle' : 'zip';
-    const bundleFilename = mode === 'wfpbundle' ? `${safeTitle}.wfpbundle` : `${safeTitle}_Collected.zip`;
-    const bundlePath = path.join(outDir, bundleFilename);
-    const standaloneWfpPath = path.join(outDir, `${safeTitle}.wfp`);
-
-    const { fileCount, innerWfpBuffer } = buildWfpBundleFileOnDisk(pid, rawTitle, bundlePath, (pct, msg) => {
-      collectStatus[pid] = { running: true, percent: pct, message: msg };
-    });
-    fs.writeFileSync(standaloneWfpPath, innerWfpBuffer);
-
-    const sizeMb = Math.round((fs.statSync(bundlePath).size / (1024 * 1024)) * 100) / 100;
-    const dlEndpoint = `/api/projects/${pid}/collect/download?kind=${extSuffix}`;
-    const payload = {
-      ok: true,
-      mode,
-      filename: bundleFilename,
-      path: bundlePath,
-      bundle_path: bundlePath,
-      zip_path: bundlePath,
-      folder_path: outDir,
-      wfp_path: standaloneWfpPath,
-      file_count: fileCount,
-      saved_to: bundlePath,
-      wfpbundle_saved_to: bundlePath,
-      size_mb: sizeMb,
-      download: dlEndpoint,
-      download_url: dlEndpoint,
-      wfpbundle_download: dlEndpoint,
-    };
-    saveJson(pid, 'last_collect.json', payload);
-    collectStatus[pid] = { running: false, percent: 100, message: 'Bundle ready!', ...payload };
-    res.json(payload);
-  } catch (e) {
-    collectStatus[pid] = { running: false, percent: 0, message: String(e) };
-    res.status(500).json({ detail: String(e) });
+  const safeTitle = rawTitle.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '') || `Project_${pid}`;
+  const dest = String(req.body?.dest || '').trim();
+  const outDir = path.join(EXPORTS_DIR, pid);
+  fs.mkdirSync(outDir, { recursive: true });
+  const extSuffix = mode === 'wfpbundle' ? 'wfpbundle' : 'zip';
+  const bundleFilename = mode === 'wfpbundle' ? `${safeTitle}.wfpbundle` : `${safeTitle}_Collected.zip`;
+  let bundlePath = path.join(outDir, bundleFilename);
+  if (dest) {
+    bundlePath = path.resolve(dest);
+    if (path.extname(bundlePath).toLowerCase() !== `.${extSuffix}`) bundlePath += `.${extSuffix}`;
+    fs.mkdirSync(path.dirname(bundlePath), { recursive: true });
   }
+  bundlePath = nextFreePath(bundlePath);
+  collectStatus[pid] = { running: true, percent: 8, message: `Packing ${path.basename(bundlePath)}…` };
+  res.json({ started: true, running: true, path: bundlePath });
+  setImmediate(async () => {
+    try {
+      let plan = loadJson(pid, 'timeline.json');
+      if (plan) {
+        plan = await healTimelinePaths(pid, plan);
+        saveJson(pid, 'timeline.json', plan);
+      }
+      const { fileCount } = buildWfpBundleFileOnDisk(pid, rawTitle, bundlePath, (pct, msg) => {
+        collectStatus[pid] = { running: true, percent: pct, message: msg, path: bundlePath };
+      });
+      const sizeMb = Math.round((fs.statSync(bundlePath).size / (1024 * 1024)) * 100) / 100;
+      const payload = {
+        ok: true,
+        mode,
+        filename: path.basename(bundlePath),
+        path: bundlePath,
+        bundle_path: bundlePath,
+        zip_path: bundlePath,
+        wfp_path: bundlePath,
+        file_count: fileCount,
+        saved_to: bundlePath,
+        size_mb: sizeMb,
+        message: `Bundle ready (${sizeMb} MB)`,
+      };
+      saveJson(pid, 'last_collect.json', payload);
+      collectStatus[pid] = { running: false, percent: 100, error: null, ...payload };
+    } catch (e) {
+      const err = String((e && e.message) || e);
+      collectStatus[pid] = { running: false, percent: 0, error: err, message: err };
+    }
+  });
 });
 
 app.get('/api/projects/:id/collect/download', (req, res) => {
@@ -6869,7 +7873,28 @@ app.get('/api/projects/:id/collect/download', (req, res) => {
   res.download(path.resolve(meta.path), meta.filename);
 });
 
-async function handleOpenProjectFile(tempPath, origName) {
+function extractBundleOnDisk(src, root) {
+  const py = [
+    process.env.DGS_PYTHON,
+    path.join(ROOT, '..', 'backend', '.venv', 'Scripts', 'python.exe'),
+  ].find((c) => c && fs.existsSync(c));
+  const script = path.join(ROOT, 'open_bundle.py');
+  if (!py || !fs.existsSync(script)) return null;
+  const run = spawnSync(py, [script, src, root], {
+    encoding: 'utf-8',
+    maxBuffer: 64 * 1024 * 1024,
+    windowsHide: true,
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+  });
+  if (run.status !== 0 || !run.stdout) return null;
+  try {
+    return JSON.parse(run.stdout);
+  } catch {
+    return null;
+  }
+}
+
+async function handleOpenProjectFile(tempPath, origName, opts = {}) {
   const ext = path.extname(origName).toLowerCase();
   const pid = createProject();
   const root = projectRoot(pid);
@@ -6877,7 +7902,9 @@ async function handleOpenProjectFile(tempPath, origName) {
 
   if (ext === '.json' || ext === '.dgsproj') {
     const rawObj = JSON.parse(fs.readFileSync(tempPath, 'utf-8'));
-    try { fs.unlinkSync(tempPath); } catch {}
+    if (!opts.keep) {
+      try { fs.unlinkSync(tempPath); } catch {}
+    }
     if (rawObj.dgs_format && rawObj.timeline) {
       rawObj.project_id = pid;
       rawObj.timeline.project_id = pid;
@@ -6917,9 +7944,18 @@ async function handleOpenProjectFile(tempPath, origName) {
     };
   }
 
+  // A collected bundle is unpacked on disk. AdmZip reads the whole zip into
+  // memory, and a chapter bundle is about a gigabyte, so that path never
+  // finished. A plain .wfp is small and still uses AdmZip below.
+  const streamed = ext === '.wfpbundle' ? extractBundleOnDisk(tempPath, root) : null;
+
   // Extract .wfpbundle, .wfp, or .zip
-  const outerZip = new AdmZip(tempPath);
-  try { fs.unlinkSync(tempPath); } catch {}
+  const outerZip = streamed
+    ? { getZipComment: () => streamed.comment || '', getEntries: () => [] }
+    : new AdmZip(tempPath);
+  if (!opts.keep && !streamed) {
+    try { fs.unlinkSync(tempPath); } catch {}
+  }
   const entries = outerZip.getEntries();
 
   const parseDgsComment = (zObj) => {
@@ -6969,11 +8005,31 @@ async function handleOpenProjectFile(tempPath, origName) {
   }
 
   let wfpZip = outerZip;
-  const innerWfpEntry =
-    entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp') && !e.entryName.includes('/')) ||
-    entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp'));
-  if (innerWfpEntry) {
-    wfpZip = new AdmZip(innerWfpEntry.getData());
+  if (streamed && streamed.inner_wfp && fs.existsSync(streamed.inner_wfp)) {
+    for (const file of streamed.files || []) {
+      const norm = String(file.name || '').replace(/\\/g, '/');
+      const destFile = String(file.path || '');
+      if (!norm || !destFile) continue;
+      extractedMap[norm] = destFile;
+      wfpbundleNameMap[path.basename(norm).toLowerCase()] = destFile;
+      const mediasIdx = norm.toLowerCase().indexOf('medias/');
+      if (mediasIdx >= 0) {
+        const subParts = norm.slice(mediasIdx).split('/');
+        if (subParts.length >= 3 && subParts[1]) {
+          wfpbundleGuidMap[subParts[1]] = destFile;
+          extractedMap[subParts.slice(0, 3).join('/')] = destFile;
+        }
+      }
+    }
+    wfpZip = new AdmZip(streamed.inner_wfp);
+    try { fs.unlinkSync(streamed.inner_wfp); } catch {}
+  } else {
+    const innerWfpEntry =
+      entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp') && !e.entryName.includes('/')) ||
+      entries.find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.wfp'));
+    if (innerWfpEntry) {
+      wfpZip = new AdmZip(innerWfpEntry.getData());
+    }
   }
 
   const wfpEntries = wfpZip.getEntries();
@@ -7509,6 +8565,23 @@ async function handleOpenProjectFile(tempPath, origName) {
   };
 }
 
+// Open a project file that is already on this PC. The desktop editor sends the path.
+// The file is left where it is. The upload route deletes its own temp copy.
+app.post('/api/projects/open-path', async (req, res) => {
+  try {
+    const src = String((req.body && req.body.path) || '').trim();
+    if (!src || !fs.existsSync(src) || !fs.statSync(src).isFile()) {
+      return res.status(400).json({ detail: 'Project file not found' });
+    }
+    const origName = path.basename(src);
+    const result = await handleOpenProjectFile(src, origName, { keep: true });
+    if (result?.project_id) touchProjectClient(result.project_id, req);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ detail: String(e) });
+  }
+});
+
 // Open Project File (.wfpbundle, .wfp, .json)
 app.post('/api/projects/open-file', upload.single('file'), async (req, res) => {
   try {
@@ -7615,6 +8688,189 @@ async function processChunkUpload(req, res) {
 app.post('/api/upload-chunk', upload.single('chunk'), processChunkUpload);
 app.post('/api/projects/:id/upload-chunk', upload.single('chunk'), processChunkUpload);
 
+// Desktop hearing. The Windows program hears on this PC. The live site does not use this.
+if (process.env.DGS_DESKTOP === '1') {
+  function desktopPython() {
+    const candidates = [
+      process.env.DGS_PYTHON,
+      path.join(ROOT, '..', 'backend', '.venv', 'Scripts', 'python.exe'),
+    ].filter(Boolean);
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+    return process.env.DGS_PYTHON || 'python';
+  }
+
+  function poemHearPrompt(pid) {
+    // English module only. A Devanagari line is never used as an English prompt.
+    const scenes = loadJson(pid, 'script.json');
+    const lines = [];
+    for (const s of Array.isArray(scenes) ? scenes : []) {
+      if (s && s.is_poem === false) continue;
+      const t = String((s && s.voiceover_text) || '').replace(/\s+/g, ' ').trim();
+      const raw = String((s && s.voiceover_raw) || '').toLowerCase();
+      if (!t || raw.includes('instrumental') || /^instrumental/i.test(t)) continue;
+      if (/[\u0900-\u097F]/.test(t) || !/[A-Za-z]/.test(t)) continue;
+      lines.push(t);
+      if (lines.length >= 4) break;
+    }
+    return lines.join(' ').slice(0, 120);
+  }
+
+  function marathiModelDir() {
+    const home = process.env.DGS_AUDIO_ALIGN_HOME || path.join(os.homedir(), 'dgs_audio_align');
+    const candidates = [
+      process.env.DGS_MR_MODEL,
+      path.join(home, 'models', 'indicconformer-mr'),
+      path.join(ROOT, '..', 'dgs_data', 'models', 'indicconformer-mr'),
+    ].filter(Boolean);
+    for (const dir of candidates) {
+      if (fs.existsSync(path.join(dir, 'model.int8.onnx')) && fs.existsSync(path.join(dir, 'tokens.txt'))) return dir;
+    }
+    return '';
+  }
+
+  function hearMarathiFile(file) {
+    const model = marathiModelDir();
+    const script = path.join(ROOT, 'marathi-align-worker.py');
+    if (!model || !fs.existsSync(script)) {
+      return Promise.reject(new Error('Marathi speech model is not installed'));
+    }
+    return new Promise((resolve, reject) => {
+      const proc = spawn(desktopPython(), [script, file, model], {
+        windowsHide: true,
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8', DGS_MR_ASR_HOME: path.dirname(path.dirname(model)) },
+      });
+      let out = '';
+      let err = '';
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch {}
+        reject(new Error('Marathi hearing timed out'));
+      }, 20 * 60 * 1000);
+      proc.stdout.on('data', (d) => { out += d.toString('utf8'); });
+      proc.stderr.on('data', (d) => { err += d.toString('utf8'); });
+      proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+      proc.on('exit', (code) => {
+        clearTimeout(timer);
+        const line = out.split(/\r?\n/).map((l) => l.trim()).reverse().find((l) => l.startsWith('RESULT '));
+        if (code !== 0 || !line) {
+          const msg = (out.split(/\r?\n/).map((l) => l.trim()).reverse().find((l) => l.startsWith('ERROR ')) || err || `Marathi hear exit ${code}`).slice(-600);
+          reject(new Error(msg.replace(/^ERROR\s*/, '')));
+          return;
+        }
+        try {
+          const data = JSON.parse(line.slice(7));
+          const words = Array.isArray(data.words) ? data.words.map((w) => ({
+            word: String(w.word || ''),
+            text: String(w.word || ''),
+            start: Number(w.start),
+            end: Number(w.end),
+          })) : [];
+          resolve(words);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+  }
+
+  function hearAudioFile(file, language, opts = {}) {
+    const script = path.join(ROOT, '..', 'native_editor', 'engine', 'native_hear.py');
+    const lang = 'en';
+    const prompt = String(opts.prompt || '');
+    const vad = opts.vad === false ? '0' : '1';
+    return new Promise((resolve, reject) => {
+      const proc = spawn(desktopPython(), [script, file, lang, process.env.WHISPER_MODEL || 'base', 'cpu', 'int8', prompt, vad], {
+        windowsHide: true,
+        env: process.env,
+      });
+      let out = '';
+      let err = '';
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch {}
+        reject(new Error('Hearing timed out'));
+      }, 20 * 60 * 1000);
+      proc.stdout.on('data', (d) => { out += d.toString('utf8'); });
+      proc.stderr.on('data', (d) => { err += d.toString('utf8'); });
+      proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+      proc.on('exit', (code) => {
+        clearTimeout(timer);
+        if (code !== 0) {
+          reject(new Error((err || out || `hear exit ${code}`).slice(-600)));
+          return;
+        }
+        const line = out.trim().split(/\r?\n/).filter((l) => l.trim().startsWith('{')).pop();
+        if (!line) {
+          reject(new Error((err || 'Whisper returned no words').slice(-600)));
+          return;
+        }
+        try {
+          const data = JSON.parse(line);
+          resolve(Array.isArray(data.words) ? data.words : []);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+  }
+
+  app.get('/api/engine/status', (_req, res) => {
+    const py = desktopPython();
+    const script = path.join(ROOT, '..', 'native_editor', 'engine', 'native_hear.py');
+    const mrScript = path.join(ROOT, 'marathi-align-worker.py');
+    res.json({
+      hear: fs.existsSync(py) && fs.existsSync(script),
+      hear_marathi: fs.existsSync(py) && fs.existsSync(mrScript) && Boolean(marathiModelDir()),
+      desktop: true,
+    });
+  });
+
+  app.post('/api/projects/:id/engine/hear', async (req, res) => {
+    try {
+      const kind = req.body && req.body.kind === 'poem' ? 'poem' : 'narration';
+      const language = String((req.body && req.body.language) || 'en').trim().toLowerCase();
+      const marathiHear = language === 'mr' || language === 'hi' || language === 'marathi' || language === 'hindi';
+      const pid = req.params.id;
+      let words = [];
+      if (kind === 'poem') {
+        const poem = loadJson(pid, 'poem_voiceover.json') || {};
+        if (!poem.path || !fs.existsSync(poem.path)) {
+          return res.status(404).json({ detail: 'Poem VO file is not on this PC' });
+        }
+        words = marathiHear
+          ? await hearMarathiFile(poem.path)
+          : await hearAudioFile(poem.path, 'en', { vad: false, prompt: poemHearPrompt(pid) });
+      } else {
+        const vo = loadJson(pid, 'voiceover.json') || {};
+        const slots = (Array.isArray(vo.slots) ? vo.slots : []).filter((sl) => sl && sl.path && fs.existsSync(sl.path));
+        if (slots.length) {
+          for (const sl of slots) {
+            const part = marathiHear ? await hearMarathiFile(sl.path) : await hearAudioFile(sl.path, 'en');
+            const off = Number(sl.start_offset || 0);
+            for (const w of part) {
+              words.push({
+                word: w.word,
+                text: w.text || w.word,
+                start: Number(w.start) + off,
+                end: Number(w.end) + off,
+              });
+            }
+          }
+        } else if (vo.path && fs.existsSync(vo.path)) {
+          words = marathiHear ? await hearMarathiFile(vo.path) : await hearAudioFile(vo.path, 'en');
+        } else {
+          return res.status(404).json({ detail: 'Narration file is not on this PC' });
+        }
+      }
+      let maxWordT = 0;
+      for (const w of words) maxWordT = Math.max(maxWordT, Number(w.end || w.start || 0));
+      res.json({ words, maxWordT, count: words.length });
+    } catch (e) {
+      res.status(500).json({ detail: String(e && e.message ? e.message : e) });
+    }
+  });
+}
+
 // Serve built React frontend
 const PUBLIC_DIR = path.join(ROOT, 'public');
 if (fs.existsSync(PUBLIC_DIR)) {
@@ -7640,6 +8896,10 @@ if (fs.existsSync(PUBLIC_DIR)) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`DGS Auto Editor Cloud Server running on port ${PORT} (Data: ${DATA_DIR} | FFmpeg: ${FFMPEG_BIN})`);
 });
+if (process.env.DGS_DESKTOP === '1') {
+  server.requestTimeout = 20 * 60 * 1000;
+  server.headersTimeout = 21 * 60 * 1000;
+}
