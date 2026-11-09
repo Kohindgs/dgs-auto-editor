@@ -1,3 +1,7 @@
 node_modules/
 data/
 .env
+
+desktop/node_modules/
+desktop/release/
+

@@ -1,0 +1,104 @@
+{
+  "name": "dgs-auto-editor-desktop",
+  "version": "0.9.0-beta.1",
+  "private": true,
+  "description": "DGS Auto Editor standalone beta — local editor, no Hostinger.",
+  "author": "D Genius Solutions",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win portable nsis --x64",
+    "dist:mac": "electron-builder --mac dmg zip --universal"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.dgeniussolutions.autoeditor",
+    "productName": "DGS Auto Editor Beta",
+    "copyright": "D Genius Solutions",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "..",
+        "to": "server",
+        "filter": [
+          "server.js",
+          "nativeEngine.js",
+          "appUpdate.js",
+          "native_hear.py",
+          "native_player.py",
+          "package.json",
+          "package-lock.json",
+          "public/**/*",
+          "node_modules/**/*",
+          "!data/**",
+          "!**/.git/**",
+          "!**/*.zip",
+          "!**/README*",
+          "!**/*.md"
+        ]
+      }
+    ],
+    "asar": true,
+    "compression": "store",
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ],
+      "signAndEditExecutable": false,
+      "extraResources": [
+        {
+          "from": "../native_editor/vendor/mpv",
+          "to": "mpv",
+          "filter": [
+            "libmpv-2.dll"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "DGS-Auto-Editor-Beta-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "DGS-Auto-Editor-Beta-Setup-${version}.${ext}",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["universal"] },
+        { "target": "zip", "arch": ["universal"] }
+      ],
+      "category": "public.app-category.video",
+      "artifactName": "DGS-Auto-Editor-Beta-${version}.${ext}",
+      "minimumSystemVersion": "11.0",
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "extraResources": [
+        {
+          "from": "../native_editor/vendor/mpv-mac",
+          "to": "mpv",
+          "filter": [
+            "libmpv*.dylib",
+            "**/*"
+          ]
+        }
+      ]
+    }
+  }
+}
+

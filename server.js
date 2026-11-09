@@ -50,6 +50,61 @@ const PROJECTS_DIR = path.join(DATA_DIR, 'projects');
 const EXPORTS_DIR = path.join(DATA_DIR, 'exports');
 const PRESETS_FILE = path.join(DATA_DIR, 'presets.json');
 const UPLOAD_TMP = path.join(DATA_DIR, 'tmp_uploads');
+// Desktop engine cwd is hostinger_deploy/, while chapter JSON often stores
+// workspace-relative paths like dgs_data\projects\...\Scene 3.mp4. Resolve those
+// before existsSync / ffmpeg so export never falls through to a black lavfi plate.
+const WORKSPACE_ROOT = path.dirname(DATA_DIR);
+
+function resolveDiskPath(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (path.isAbsolute(s) && fs.existsSync(s)) return path.resolve(s);
+  if (fs.existsSync(s)) return path.resolve(s);
+  const posix = s.replace(/\\/g, '/').replace(/^\.\//, '');
+  const candidates = [
+    path.resolve(WORKSPACE_ROOT, s),
+    path.resolve(DATA_DIR, s),
+    path.resolve(ROOT, s),
+    path.resolve(process.cwd(), s),
+  ];
+  const stripped = posix.replace(/^(?:dgs_data|data)\//i, '');
+  if (stripped && stripped !== posix) {
+    candidates.push(path.resolve(DATA_DIR, stripped));
+    candidates.push(path.resolve(ROOT, 'data', stripped));
+    candidates.push(path.resolve(WORKSPACE_ROOT, 'dgs_data', stripped));
+  }
+  if (/^(projects|exports)\//i.test(posix)) {
+    candidates.push(path.resolve(DATA_DIR, posix));
+  }
+  for (const cand of candidates) {
+    try {
+      if (cand && fs.existsSync(cand)) return path.resolve(cand);
+    } catch {}
+  }
+  return '';
+}
+
+function isExportPartPath(p) {
+  const s = String(p || '').replace(/\\/g, '/');
+  const base = path.posix.basename(s).toLowerCase();
+  if (/^part_\d+\.(mp4|mov|mkv|webm)$/i.test(base)) return true;
+  if (/\/exports\/[^/]+\/.*parts\//i.test(s)) return true;
+  if (/\/dgs_studio_test\//i.test(s) || /\/blank_parts\//i.test(s) || /\/blank_verify\//i.test(s)) return true;
+  return false;
+}
+
+function projectIdInPath(p) {
+  const m = String(p || '').replace(/\\/g, '/').match(/\/projects\/([a-f0-9]{12})\//i);
+  return m ? m[1].toLowerCase() : '';
+}
+
+function isForeignOrExportMedia(p, pid) {
+  const s = String(p || '');
+  if (!s) return true;
+  if (isExportPartPath(s)) return true;
+  const other = projectIdInPath(s);
+  return Boolean(other && other !== String(pid || '').toLowerCase());
+}
 
 for (const d of [DATA_DIR, PROJECTS_DIR, EXPORTS_DIR, UPLOAD_TMP]) {
   fs.mkdirSync(d, { recursive: true });
@@ -57,7 +112,9 @@ for (const d of [DATA_DIR, PROJECTS_DIR, EXPORTS_DIR, UPLOAD_TMP]) {
 
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.svg', '.avif', '.jfif', '.heic']);
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.3gp', '.ts', '.mts', '.flv', '.wmv', '.mpeg', '.mpg']);
-const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.opus', '.wma', '.webm', '.mp4']);
+// Narration / poem audio only. Do NOT include .mp4/.webm — Filmora often parks
+// those on audio tracks and Auto-align then invents broken VO slots (Scene N.mp4).
+const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.opus', '.wma']);
 const TICKS_PER_SEC = 10000000;
 const IMAGE_BASE_OFFSET_TICKS = 36000000000;
 const EXEC_OPTS = { timeout: 180000, maxBuffer: 50 * 1024 * 1024 };
@@ -563,10 +620,12 @@ async function reindexMedia(pid) {
     const prev = byPath.get(f) || byNameKind.get(nk);
     const screens = detectScreens(fname, path.basename(path.dirname(f)));
     const dur = kind === 'video' ? (prev?.duration ?? (await probeDuration(f))) : null;
+    // Always keep the absolute on-disk path from the project media walk. Relative
+    // local_only leftovers (dgs_data\projects\...) break Node export from hostinger_deploy/.
     items.push({
       id: prev?.id || crypto.randomUUID(),
       filename: fname,
-      path: prev?.local_only ? (prev.path || f) : f,
+      path: f,
       kind,
       screen: screens[0] || null,
       screens,
@@ -575,17 +634,22 @@ async function reindexMedia(pid) {
     });
   }
 
-  // Preserve any external or local-only metadata items registered in media.json (e.g. from opened .wfp or browser)
+  // Preserve external / local-only media.json rows, but never keep another
+  // chapter's files or export part leftovers in this project's library.
   for (const m of existing) {
     if (!m || !m.filename) continue;
     const nk = `${m.kind}:${String(m.filename || '').toLowerCase()}`;
     if (seenNameKind.has(nk)) continue;
+    const resolved = resolveDiskPath(m.path);
+    const keepPath = resolved || m.path;
+    if (isForeignOrExportMedia(keepPath, pid)) continue;
     seenNameKind.add(nk);
-    const existsOnDisk = Boolean(m.path && fs.existsSync(m.path));
+    const existsOnDisk = Boolean(resolved);
     const screens = Array.isArray(m.screens) && m.screens.length ? m.screens : detectScreens(m.filename);
     items.push({
       ...m,
       id: m.id || crypto.randomUUID(),
+      path: keepPath,
       screen: m.screen || screens[0] || null,
       screens,
       local_only: !existsOnDisk,
@@ -978,9 +1042,13 @@ function onPoemTrack(scene) {
   const raw = String(scene.voiceover_raw || '');
   const sec = String(scene.section || '').trim().toLowerCase();
   if (text.startsWith('instrumental') || isInstrumentalScene(scene)) return true;
-  if (scene.audio_start != null) return true;
   if (/suno\s*master|original\s+suno|attached\s+poem\s+track/i.test(raw)) return true;
   if (/\bpoem\b/i.test(sec) || sec.includes('song intro')) return true;
+  // Suno sheet clocks set audio_start on lyric cards that are already is_poem.
+  // Filmora imports used to stamp audio_start on every story clip (picture time);
+  // treating that as poem muted narration after Auto-align. Require is_poem (or
+  // poem section / Suno raw above) — never audio_start alone.
+  if (scene.audio_start != null && scene.is_poem) return true;
   return Boolean(scene.is_poem);
 }
 
@@ -1526,8 +1594,7 @@ function waSameWord(h, w) {
   const lh = h.length;
   const lw = w.length;
   if (Math.min(lh, lw) >= 2 && Math.abs(lh - lw) <= 1 && (h.startsWith(w) || w.startsWith(h))) return true;
-  // Substring only for longer stems — air⊂stair / the⊂there are false friends.
-  if (Math.min(lh, lw) >= 4 && Math.abs(lh - lw) <= 2 && (h.includes(w) || w.includes(h))) return true;
+  if (lh >= 3 && lw >= 3 && Math.abs(lh - lw) <= 2 && (h.includes(w) || w.includes(h))) return true;
   if (lh >= 3 && lw >= 3 && Math.abs(lh - lw) <= 2) {
     const hc = waConsSkeleton(h.replace(/ck/g, 'k'));
     const wc = waConsSkeleton(w.replace(/ck/g, 'k'));
@@ -3564,6 +3631,14 @@ app.post('/api/projects/:id/build', async (req, res) => {
           changedVo = true;
         }
       }
+      // Older Filmora imports stamped picture times into audio_start/audio_end.
+      // Those fields are the Suno poem clock — clear them on non-poem story cards
+      // so Auto-align does not invent a poem window and mute narration.
+      if (String(s.source || '') === 'filmora' && !s.is_poem && (s.audio_start != null || s.audio_end != null)) {
+        s.audio_start = null;
+        s.audio_end = null;
+        changedVo = true;
+      }
     }
     if (changedVo) saveJson(pid, 'script.json', scenes);
 
@@ -3604,6 +3679,134 @@ app.post('/api/projects/:id/build', async (req, res) => {
     // If project was imported from a .wfpbundle / .wfp and neither script nor master VO was replaced,
     // preserve the bundle's exact clip timings/alignment while refreshing newly uploaded media, captions, logo, and QA!
     const explicitAlign = Boolean(req.body && (req.body.language || req.body.force_realign));
+    const filmoraNoScriptVo = Boolean(
+      scriptMeta.imported_bundle
+      && Array.isArray(scenes)
+      && scenes.length > 0
+      && scenes.every((s) => {
+        const vo = String(s?.voiceover_text || '').trim();
+        if (!vo) return true;
+        // Filmora import labels like "1", "Scene 3" are not spoken script lines.
+        return /^(scene\s*)?\d+$/i.test(vo);
+      }),
+    );
+    // Auto-align with no real script must NOT invent estimate cuts — that shrunk
+    // My Profile from ~148s to ~85s and desynced VO. Keep Filmora picture times.
+    if (filmoraNoScriptVo && existingTl && Array.isArray(existingTl.clips) && existingTl.clips.length) {
+      const cleanedSlots = [];
+      const rawSlots = Array.isArray(voMeta.slots) ? voMeta.slots : [];
+      const seenPaths = new Set();
+      for (const s of rawSlots) {
+        const pth = String(s?.path || voMeta.path || '');
+        const ext = path.extname(pth || String(s?.filename || '')).toLowerCase();
+        if (!pth || !fs.existsSync(pth)) continue;
+        if (VIDEO_EXT.has(ext) || !AUDIO_EXT.has(ext)) continue;
+        const key = path.resolve(pth);
+        if (seenPaths.has(key)) continue;
+        seenPaths.add(key);
+        const dur = Math.max(
+          0.4,
+          Number(s.duration) || Number(voMeta.duration) || (await probeDuration(pth)) || 0,
+        );
+        cleanedSlots.push({
+          slot: cleanedSlots.length + 1,
+          filename: path.basename(pth),
+          duration: Math.round(dur * 1000) / 1000,
+          start_offset: 0,
+          end_offset: Math.round(dur * 1000) / 1000,
+          start: cleanedSlots.length === 0 ? 0 : Number(s.start) || 0,
+          end: (cleanedSlots.length === 0 ? 0 : Number(s.start) || 0) + dur,
+          path: pth,
+        });
+      }
+      if (!cleanedSlots.length && voMeta.path && fs.existsSync(voMeta.path)) {
+        const pth = voMeta.path;
+        const dur = Math.max(0.4, Number(voMeta.duration) || (await probeDuration(pth)) || 0);
+        cleanedSlots.push({
+          slot: 1,
+          filename: path.basename(pth),
+          duration: Math.round(dur * 1000) / 1000,
+          start_offset: 0,
+          end_offset: Math.round(dur * 1000) / 1000,
+          start: 0,
+          end: Math.round(dur * 1000) / 1000,
+          path: pth,
+        });
+      }
+      if (cleanedSlots.length) {
+        const primary = cleanedSlots[0];
+        // Prefer the real file length — Filmora imports often stored a short first-clip duration.
+        const probed = (await probeDuration(primary.path)) || 0;
+        if (probed > primary.duration + 0.5) {
+          primary.duration = Math.round(probed * 1000) / 1000;
+          primary.end_offset = primary.duration;
+        }
+        // Single narration file: picture clock == file clock (Filmora already cut to VO).
+        if (cleanedSlots.length === 1) {
+          primary.start = 0;
+          primary.end = primary.duration;
+          primary.start_offset = 0;
+          primary.end_offset = primary.duration;
+        }
+        voMeta.path = primary.path;
+        voMeta.filename = cleanedSlots.map((s) => s.filename).join(' + ');
+        voMeta.duration = cleanedSlots.length === 1
+          ? primary.duration
+          : Math.max(...cleanedSlots.map((s) => Number(s.end) || 0));
+        voMeta.kind = 'narration';
+        voMeta.slots = cleanedSlots;
+        saveJson(pid, 'voiceover.json', voMeta);
+      }
+
+      const clips = existingTl.clips.map((c) => ({ ...c }));
+      // Restore narration windows onto the picture clock when Auto-align wiped them.
+      for (const c of clips) {
+        if (c.narration_in == null || c.narration_out == null) {
+          c.narration_in = Number(c.start) || 0;
+          c.narration_out = Number(c.end) || c.narration_in;
+        }
+      }
+      const totalDur = Math.max(
+        clips.reduce((acc, c) => Math.max(acc, Number(c.end) || 0), 0),
+        Number(voMeta.duration) || 0,
+        Number(existingTl.total_duration) || 0,
+        10,
+      );
+      const plan = {
+        ...existingTl,
+        project_id: pid,
+        clips,
+        total_duration: Math.round(totalDur * 1000) / 1000,
+        voiceover_path: voMeta.path || existingTl.voiceover_path || null,
+        voiceover_slots: voMeta.slots || existingTl.voiceover_slots || [],
+        has_poem: false,
+        poem_start_time: 0,
+        poem_end_time: 0,
+        poem_lyric_start: 0,
+        poem_voiceover_path: null,
+        vo_pieces: [],
+        align_engine: 'filmora_keep',
+        poem_align_engine: null,
+        align_note: 'Filmora import kept. No spoken script lines — picture times and VO file clock were left as imported (Auto-align did not invent estimate cuts).',
+        qa_issues: [],
+        qa_summary: `FILMORA KEEP · ${clips.length} scenes · VO left on the imported clock`,
+        manual_override: true,
+      };
+      // Rebuild vo_pieces 1:1 with the cleaned slots on the picture clock.
+      plan.vo_pieces = (plan.voiceover_slots || []).map((s, i) => ({
+        id: `vo-s${s.slot || i + 1}-0`,
+        slot: Number(s.slot || i + 1),
+        filename: s.filename,
+        start: Number(s.start) || 0,
+        end: Number(s.end) || Number(s.duration) || 0,
+        source_in: Number(s.start_offset) || 0,
+        source_out: Number(s.end_offset) || Number(s.duration) || 0,
+      }));
+      plan.srt_cues = buildSrtCues(plan.clips, plan);
+      saveSrt(pid, 'subtitles.srt', formatSrt(plan.srt_cues));
+      saveJson(pid, 'timeline.json', plan);
+      return res.json(plan);
+    }
     if (scriptMeta.imported_bundle && !explicitAlign && existingTl && Array.isArray(existingTl.clips) && existingTl.clips.length) {
       const sceneMap = new Map(scenes.map((s) => [normScreenId(s.screen), s]));
       for (const c of existingTl.clips) {
@@ -4511,17 +4714,24 @@ app.post('/api/projects/:id/build', async (req, res) => {
       tlCursor = Math.max(tlCursor, ...placedSlots.map((s) => Number(s.end || 0)));
     }
 
+    // Real poem only: Poem VO file and/or lyric scenes. Never invent a poem
+    // window from Filmora picture times (that muted narration after Auto-align).
+    const realPoem = Boolean(hasPoemVo) || scenes.some((s) => s && s.is_poem);
     const planOpts = {
       poem_voiceover_path: poemVoMeta.path || null,
       // Marathi poems live in the narration VO unless a separate Poem file was uploaded.
-      has_poem: marathi && !hasPoemVo ? false : (anyPoemScene || hasPoemVo),
-      poem_start_time: Math.round(poemStartTime * 1000) / 1000,
-      poem_end_time: Math.round(poemEndTime * 1000) / 1000,
+      has_poem: marathi && !hasPoemVo ? false : (realPoem && (anyPoemScene || hasPoemVo)),
+      poem_start_time: realPoem ? Math.round(poemStartTime * 1000) / 1000 : 0,
+      poem_end_time: realPoem ? Math.round(poemEndTime * 1000) / 1000 : 0,
       poem_lyric_start: 0,
       marathi,
       language: langRes.language,
       align_engine: alignEngineName(marathi, wordAlignUsed, alignmentMode),
     };
+    if (!planOpts.has_poem) {
+      planOpts.poem_start_time = 0;
+      planOpts.poem_end_time = 0;
+    }
     const srtCues = buildSrtCues(clips, planOpts);
     saveSrt(pid, 'subtitles.srt', formatSrt(srtCues));
 
@@ -4696,19 +4906,30 @@ async function healTimelinePaths(pid, plan) {
   const logoMeta = loadJson(pid, 'logo.json') || {};
   const mediaItems = await reindexMedia(pid);
 
-  if (voMeta.path && !voMeta.local_only && fs.existsSync(voMeta.path)) {
+  const resolvedVo = resolveDiskPath(voMeta.path);
+  if (resolvedVo && !voMeta.local_only) {
+    plan.voiceover_path = resolvedVo;
+  } else if (resolvedVo && !plan.voiceover_path) {
+    plan.voiceover_path = resolvedVo;
+  } else if (voMeta.path && !voMeta.local_only && fs.existsSync(voMeta.path)) {
     plan.voiceover_path = voMeta.path;
   } else if (voMeta.path && !plan.voiceover_path) {
     plan.voiceover_path = voMeta.path;
   }
-  if (poemVoMeta.path && !poemVoMeta.local_only && fs.existsSync(poemVoMeta.path)) {
+  const resolvedPoem = resolveDiskPath(poemVoMeta.path);
+  if (resolvedPoem && !poemVoMeta.local_only) {
+    plan.poem_voiceover_path = resolvedPoem;
+  } else if (resolvedPoem && !plan.poem_voiceover_path) {
+    plan.poem_voiceover_path = resolvedPoem;
+  } else if (poemVoMeta.path && !poemVoMeta.local_only && fs.existsSync(poemVoMeta.path)) {
     plan.poem_voiceover_path = poemVoMeta.path;
   } else if (poemVoMeta.path && !plan.poem_voiceover_path) {
     plan.poem_voiceover_path = poemVoMeta.path;
   }
   const effLogo = getEffectiveLogoMeta(pid, plan);
-  if (effLogo.path && (!plan.logo_path || !fs.existsSync(plan.logo_path))) {
-    plan.logo_path = effLogo.path;
+  const resolvedLogo = resolveDiskPath(effLogo.path) || effLogo.path;
+  if (resolvedLogo && (!plan.logo_path || !fs.existsSync(plan.logo_path))) {
+    plan.logo_path = resolvedLogo;
   }
   plan.logo_enabled = effLogo.enabled;
   plan.logo_transform = effLogo.transform;
@@ -4717,22 +4938,52 @@ async function healTimelinePaths(pid, plan) {
     const byId = new Map(mediaItems.map((m) => [m.id, m]));
     const byName = new Map(mediaItems.map((m) => [String(m.filename || '').toLowerCase(), m]));
     for (const c of plan.clips) {
-      if (!c.media_path || !fs.existsSync(c.media_path)) {
-        const baseName = path.basename(String(c.media_path || '')).toLowerCase();
-        const picked = pickMediaForScreen(c.screen, mediaItems, '');
-        const matched =
-          (c.media_id && byId.get(c.media_id)) ||
-          (baseName && byName.get(baseName)) ||
-          picked.video ||
-          picked.image ||
-          null;
-        if (matched && matched.path && fs.existsSync(matched.path)) {
-          c.media_id = matched.id;
-          c.media_path = matched.path;
-          c.filename = matched.filename || path.basename(matched.path);
-          c.kind = matched.kind;
-          if (c.fit === 'missing') c.fit = matched.kind === 'video' ? 'trim' : 'hold';
+      const resolved = resolveDiskPath(c.media_path);
+      // Keep a real file that belongs to this chapter. Rematch export leftovers
+      // and other projects' media onto this chapter's own media/ tree only.
+      if (resolved && fs.existsSync(resolved) && !isForeignOrExportMedia(resolved, pid)) {
+        c.media_path = resolved;
+        continue;
+      }
+      const baseName = path.basename(String(c.media_path || '')).toLowerCase();
+      const picked = pickMediaForScreen(c.screen, mediaItems, '');
+      const byIdHit = c.media_id ? byId.get(c.media_id) : null;
+      const byNameHit = baseName ? byName.get(baseName) : null;
+      const matchedCand =
+        (byIdHit && !isForeignOrExportMedia(byIdHit.path, pid) ? byIdHit : null) ||
+        (byNameHit && !isForeignOrExportMedia(byNameHit.path, pid) ? byNameHit : null) ||
+        picked.video ||
+        picked.image ||
+        null;
+      const matched = matchedCand && !isForeignOrExportMedia(matchedCand.path, pid) ? matchedCand : null;
+      const matchedPath = matched ? (resolveDiskPath(matched.path) || matched.path) : '';
+      if (matched && matchedPath && fs.existsSync(matchedPath) && !isForeignOrExportMedia(matchedPath, pid)) {
+        c.media_id = matched.id;
+        c.media_path = matchedPath;
+        c.filename = matched.filename || path.basename(matchedPath);
+        c.kind = matched.kind;
+        if (c.fit === 'missing' || isForeignOrExportMedia(resolved || c.media_path, pid)) {
+          c.fit = matched.kind === 'video' ? (c.fit === 'stretch' ? 'stretch' : 'trim') : 'hold';
         }
+      } else if (resolved && fs.existsSync(resolved) && !isForeignOrExportMedia(resolved, pid)) {
+        c.media_path = resolved;
+      } else if (isForeignOrExportMedia(resolved || c.media_path, pid)) {
+        // Never leave another chapter's encode leftover on the timeline.
+        c.media_path = '';
+        c.media_id = '';
+        c.filename = '';
+        c.fit = 'missing';
+      }
+    }
+  } else if (Array.isArray(plan.clips)) {
+    for (const c of plan.clips) {
+      const resolved = resolveDiskPath(c.media_path);
+      if (resolved && !isForeignOrExportMedia(resolved, pid)) c.media_path = resolved;
+      else if (isForeignOrExportMedia(resolved || c.media_path, pid)) {
+        c.media_path = '';
+        c.media_id = '';
+        c.filename = '';
+        c.fit = 'missing';
       }
     }
   }
@@ -5267,8 +5518,10 @@ app.post('/api/projects/:id/export', async (req, res) => {
           const scalePad = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p`;
           const poemDraw = poemDrawFor(c);
           const drawn = poemDraw ? `,${poemDraw}` : '';
+          const mediaPath = resolveDiskPath(c.media_path) || c.media_path;
+          if (mediaPath && mediaPath !== c.media_path) c.media_path = mediaPath;
 
-          if (!c.media_path || !fs.existsSync(c.media_path) || c.fit === 'missing') {
+          if (!mediaPath || !fs.existsSync(mediaPath) || c.fit === 'missing') {
             if (logoScaledPath) {
               const fg = `[0:v][1:v]overlay=${overlayX}:${overlayY}:format=auto,format=yuv420p${drawn},loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
               await runFfmpeg([
@@ -5287,19 +5540,21 @@ app.post('/api/projects/:id/export', async (req, res) => {
               await runFfmpeg(args, { skipReap: true });
             }
           } else if (c.kind === 'image') {
-            // Decode still image ONCE, scale/pad/logo 1 frame, then loop in memory for ultra-fast P_SKIP encoding
+            // Still → video: -loop 1 keeps the JPG/PNG feeding every frame (filter-only
+            // loop can go black on some FFmpeg builds after the first frame).
+            const stillIn = ['-loop', '1', '-framerate', String(fps), '-t', clipDur.toFixed(3), '-i', mediaPath];
             if (logoScaledPath) {
-              const fg = `[0:v]${scalePad}[bg];[bg][1:v]overlay=${overlayX}:${overlayY}:format=auto,format=yuv420p${drawn},loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)[vout]`;
+              const fg = `[0:v]${scalePad}[bg];[bg][1:v]overlay=${overlayX}:${overlayY}:format=auto,format=yuv420p${drawn}[vout]`;
               await runFfmpeg([
-                '-y', '-i', c.media_path, '-i', logoScaledPath,
+                '-y', ...stillIn, '-i', logoScaledPath,
                 '-filter_complex', fg, '-map', '[vout]',
                 '-frames:v', String(totalFrames),
                 ...codecArgs, ...commonOutArgs, outPart,
               ], { skipReap: true });
             } else {
-              const vfImg = `${scalePad}${drawn},loop=loop=${loopCount}:size=1:start=0,setpts=N/(${fps}*TB)`;
+              const vfImg = `${scalePad}${drawn}`;
               await runFfmpeg([
-                '-y', '-i', c.media_path,
+                '-y', ...stillIn,
                 '-vf', vfImg,
                 '-frames:v', String(totalFrames),
                 ...codecArgs, ...commonOutArgs, outPart,
@@ -5313,7 +5568,7 @@ app.post('/api/projects/:id/export', async (req, res) => {
             if (c.source_out != null && Number(c.source_out) > srcIn + 0.05) {
               span = Number(c.source_out) - srcIn;
             }
-            const fileDur = await probeDuration(c.media_path);
+            const fileDur = await probeDuration(mediaPath);
             const available = fileDur ? Math.max(0.04, fileDur - srcIn) : span;
             const ni = Number(c.narration_in);
             const no = Number(c.narration_out);
@@ -5344,14 +5599,14 @@ app.post('/api/projects/:id/export', async (req, res) => {
             if (logoScaledPath) {
               const fgVid = `[0:v]${vfVidBase}[bg];[bg][1:v]overlay=${overlayX}:${overlayY}:eof_action=repeat:format=auto,format=yuv420p${drawn}[vout]`;
               await runFfmpeg([
-                '-y', '-ss', String(srcIn), '-t', readFor, '-i', c.media_path, '-i', logoScaledPath,
+                '-y', '-ss', String(srcIn), '-t', readFor, '-i', mediaPath, '-i', logoScaledPath,
                 '-filter_complex', fgVid, '-map', '[vout]',
                 '-frames:v', String(totalFrames),
                 ...codecArgs, ...commonOutArgs, outPart,
               ], { skipReap: true });
             } else {
               await runFfmpeg([
-                '-y', '-ss', String(srcIn), '-t', readFor, '-i', c.media_path,
+                '-y', '-ss', String(srcIn), '-t', readFor, '-i', mediaPath,
                 '-vf', `${vfVidBase}${drawn}`,
                 '-frames:v', String(totalFrames),
                 ...codecArgs, ...commonOutArgs, outPart,
@@ -7157,18 +7412,22 @@ function buildWfpAndMediaMap(pid, title = 'Project', opts = {}) {
     if (s && s.path) slotByNo.set(Number(s.slot || slotByNo.size + 1), s);
   }
   const heardPieces = (Array.isArray(plan.vo_pieces) ? plan.vo_pieces : [])
-    .filter((p) => p && Number(p.end) > Number(p.start) + 0.05 && p.source_out != null)
+    .filter((p) => p && Number(p.end) > Number(p.start) + 0.05 && (p.source_out != null || p.replace_path))
     .slice()
     .sort((a, b) => Number(a.start) - Number(b.start));
-  if (heardPieces.length && slotByNo.size) {
+  if (heardPieces.length && (slotByNo.size || heardPieces.some((p) => p && p.replace_path))) {
     heardPieces.forEach((piece, idx) => {
-      const slot = slotByNo.get(Number(piece.slot || 1)) || slots[0];
-      if (!slot || !slot.path) return;
-      const sDur = Math.max(Number(slot.duration || 0), Number(piece.source_out) || 0, 5.0);
-      const [mid, resUid] = registerMedia(slot.path, 'audio', sDur);
-      if (!mid) return;
+      const slot = slotByNo.get(Number(piece.slot || 1)) || slots[0] || {};
+      // Filmora-style section replace: use the swapped file when present so Export / .wfp / .wfpbundle hear it.
+      const audioPath = (piece.replace_path && fs.existsSync(piece.replace_path))
+        ? piece.replace_path
+        : (slot && slot.path);
+      if (!audioPath) return;
       const srcIn = Math.max(0, Number(piece.source_in) || 0);
       const srcOut = Math.max(srcIn + 0.05, Number(piece.source_out) || srcIn);
+      const sDur = Math.max(Number(slot.duration || 0), srcOut, Number(piece.end || 0) - Number(piece.start || 0), 5.0);
+      const [mid, resUid] = registerMedia(audioPath, 'audio', sDur);
+      if (!mid) return;
       const tlBegin = secToTicks(piece.start);
       const tlEnd = Math.max(tlBegin + 1, secToTicks(piece.end));
       const metaM = mediaItemsMeta[mid];
@@ -8388,8 +8647,10 @@ async function handleOpenProjectFile(tempPath, origName, opts = {}) {
               voiceover_raw: voTxt,
               visual_type: kind === 'image' ? 'Image' : 'Video',
               visual_direction: path.basename(fn),
-              audio_start: Math.round(tlB * 1000) / 1000,
-              audio_end: Math.round(tlE * 1000) / 1000,
+              // Do NOT write audio_start/audio_end here. Those fields are the
+              // Suno poem clock on lyric cards. Picture times live on the clips.
+              audio_start: null,
+              audio_end: null,
               is_poem: false,
               source: 'filmora',
             });
@@ -8421,14 +8682,20 @@ async function handleOpenProjectFile(tempPath, origName, opts = {}) {
 
     const voSlots = [];
     let voPath = null;
-    if (voClipsRaw.length) {
-      voClipsRaw.sort((a, b) => a.tl_b - b.tl_b);
-      const uniqueVoPaths = Array.from(new Set(voClipsRaw.map((v) => v.path)));
+    // Drop video files that landed on audio tracks; keep real narration audio only.
+    const audioOnly = voClipsRaw.filter((v) => {
+      const ext = path.extname(String(v.filename || v.path || '')).toLowerCase();
+      return AUDIO_EXT.has(ext) && !VIDEO_EXT.has(ext);
+    });
+    if (audioOnly.length) {
+      audioOnly.sort((a, b) => a.tl_b - b.tl_b);
+      const uniqueVoPaths = Array.from(new Set(audioOnly.map((v) => path.resolve(v.path))));
+      // One narration file used in several Filmora audio clips → one VO slot on the file clock.
       if (uniqueVoPaths.length === 1) {
         voPath = uniqueVoPaths[0];
         const fullDur =
           resDurMap[path.basename(voPath).toLowerCase()] ||
-          Math.max(...voClipsRaw.map((v) => v.tl_e), ...voClipsRaw.map((v) => v.out_p), 10);
+          Math.max(...audioOnly.map((v) => Number(v.out_p) || 0), ...audioOnly.map((v) => Number(v.dur) || 0), 10);
         voSlots.push({
           slot: 1,
           filename: path.basename(voPath),
@@ -8440,20 +8707,25 @@ async function handleOpenProjectFile(tempPath, origName, opts = {}) {
           path: voPath,
         });
       } else {
-        for (let i = 0; i < voClipsRaw.length; i++) {
-          const vc = voClipsRaw[i];
+        for (let i = 0; i < uniqueVoPaths.length; i++) {
+          const pth = uniqueVoPaths[i];
+          const parts = audioOnly.filter((v) => path.resolve(v.path) === pth);
+          const dur =
+            resDurMap[path.basename(pth).toLowerCase()] ||
+            Math.max(...parts.map((v) => Number(v.dur) || 0), 1);
+          const start = Math.min(...parts.map((v) => Number(v.tl_b) || 0));
           voSlots.push({
             slot: i + 1,
-            filename: vc.filename,
-            duration: vc.dur,
-            start_offset: vc.tl_b,
-            end_offset: vc.tl_e,
-            start: vc.tl_b,
-            end: vc.tl_e,
-            path: vc.path,
+            filename: path.basename(pth),
+            duration: dur,
+            start_offset: 0,
+            end_offset: dur,
+            start,
+            end: start + dur,
+            path: pth,
           });
         }
-        voPath = voClipsRaw[0].path;
+        voPath = uniqueVoPaths[0];
       }
     }
 
@@ -8472,6 +8744,13 @@ async function handleOpenProjectFile(tempPath, origName, opts = {}) {
       logo_path: logoPath,
       logo_enabled: Boolean(logoPath),
       language: 'en',
+      // A Filmora import is narration-only until a real Poem VO / poem script is added.
+      // Leaving has_poem unset let later passes invent a 0→VO-end poem window and mute audio.
+      has_poem: false,
+      poem_start_time: 0,
+      poem_end_time: 0,
+      poem_lyric_start: 0,
+      poem_voiceover_path: null,
       srt_cues: finalSrtCues,
       qa_issues: [],
       qa_summary: `Imported from Filmora 15 (${clips.length} scenes, ${finalSrtCues.length} captions)`,
@@ -8871,6 +9150,35 @@ if (process.env.DGS_DESKTOP === '1') {
   });
 }
 
+// Version feed + missing card/hearing assets (desktop + live Updates ping)
+try {
+  const appUpdate = require('./appUpdate');
+  appUpdate.init({
+    dataDir: DATA_DIR,
+    python: process.env.DGS_PYTHON || '',
+    hearScript: path.join(ROOT, 'native_hear.py'),
+  });
+  app.get('/api/app/version', async (_req, res) => {
+    try {
+      res.json(await appUpdate.checkRemote());
+    } catch (e) {
+      res.status(500).json({ detail: String(e && e.message ? e.message : e) });
+    }
+  });
+  app.get('/api/app/assets', (_req, res) => {
+    res.json(appUpdate.assetStatus());
+  });
+  app.post('/api/app/assets/ensure', async (_req, res) => {
+    try {
+      res.json(await appUpdate.ensureAssets());
+    } catch (e) {
+      res.status(500).json({ detail: String(e && e.message ? e.message : e) });
+    }
+  });
+} catch (e) {
+  console.warn('appUpdate unavailable:', e && e.message ? e.message : e);
+}
+
 // Serve built React frontend
 const PUBLIC_DIR = path.join(ROOT, 'public');
 if (fs.existsSync(PUBLIC_DIR)) {
@@ -8888,6 +9196,10 @@ if (fs.existsSync(PUBLIC_DIR)) {
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api/')) return next();
     if (req.path.startsWith('/assets/')) return res.status(404).end();
+    // Never fall through to the SPA shell for published JSON feeds.
+    if (/\.json$/i.test(req.path)) {
+      return res.status(404).json({ detail: `Missing ${req.path}` });
+    }
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');

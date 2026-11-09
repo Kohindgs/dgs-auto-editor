@@ -3,7 +3,7 @@
   "released": "2026-11-03",
   "notes": [
     "One Windows EXE for Windows 10 and 11, and one Mac DMG for macOS 11 and newer.",
-    "The Updates button shows this version and the change log. A newer published version shows a download link.",
+    "When a newer build is published, the app pings Updates · new and offers Download.",
     "English and Marathi (Devanagari) card-reading files download into the app when they are missing.",
     "The hearing model downloads on the first Auto-align."
   ],
