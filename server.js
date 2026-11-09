@@ -3481,6 +3481,41 @@ app.delete('/api/projects/:id/poem-voiceover/:slot', (req, res) => {
   }
 });
 
+function findAudioOnDisk(id, kind) {
+  const root = projectRoot(id);
+  const dirs =
+    kind === 'poem'
+      ? [path.join(root, 'poem'), path.join(root, 'voiceover'), path.join(root, 'audio')]
+      : [path.join(root, 'voiceover'), path.join(root, 'audio'), root];
+  const preferred =
+    kind === 'poem'
+      ? [/poem/i, /suno/i, /song/i, /music/i]
+      : [/merged_narration/i, /^vo[\s._-]/i, /narration/i, /voiceover/i, /voice[\s._-]?over/i];
+  const found = [];
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const ext = path.extname(name).toLowerCase();
+      if (!AUDIO_EXT.has(ext)) continue;
+      if (kind !== 'poem' && /poem|suno|song/i.test(name) && !/merged_narration/i.test(name)) continue;
+      if (kind === 'poem' && /merged_narration|slot_\d+/i.test(name)) continue;
+      found.push(path.join(dir, name));
+    }
+  }
+  if (!found.length) return null;
+  for (const re of preferred) {
+    const hit = found.find((p) => re.test(path.basename(p)));
+    if (hit) return hit;
+  }
+  return found[0];
+}
+
 async function serveProjectAudio(id, kind, res) {
   let meta = loadJson(id, kind === 'poem' ? 'poem_voiceover.json' : 'voiceover.json');
   if (kind !== 'poem' && (!meta || !meta.path || !fs.existsSync(meta.path)) && Array.isArray(meta?.slots)) {
@@ -3492,9 +3527,15 @@ async function serveProjectAudio(id, kind, res) {
       meta = await rebuildMergedVo(id, meta.slots);
     }
   }
-  if (!meta || !meta.path || !fs.existsSync(meta.path)) return res.status(404).end();
+  let audioPath = meta && meta.path && fs.existsSync(meta.path) ? meta.path : null;
+  if (!audioPath && Array.isArray(meta?.slots)) {
+    const slotHit = meta.slots.find((s) => s && s.path && fs.existsSync(s.path));
+    if (slotHit) audioPath = slotHit.path;
+  }
+  if (!audioPath) audioPath = findAudioOnDisk(id, kind);
+  if (!audioPath || !fs.existsSync(audioPath)) return res.status(404).end();
   res.setHeader('Cache-Control', 'public, max-age=3600');
-  res.sendFile(path.resolve(meta.path));
+  res.sendFile(path.resolve(audioPath));
 }
 
 app.get('/api/projects/:id/audio/:kind', async (req, res) => {
