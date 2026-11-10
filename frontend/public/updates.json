@@ -1,0 +1,41 @@
+{
+  "version": "0.10.1-native.3",
+  "latest": "0.10.1-native.3",
+  "released": "2026-11-11",
+  "notes": [
+    "D'Auto Aline (D'AA) Cosmic Neon Studio UI for Windows & Mac: minimalist neon line D'AA capsule logo, razor-sharp 16x16 neon line icons & ClearType/CoreText fonts, unclipped Brand Logo preview, Filmora 16:9 media preview grid, responsive 4K-to-laptop layout, and live Update button auto-trigger.",
+    "Automatic code sync enabled for both Windows PCs and Mac PCs."
+  ],
+  "code_zip": "https://raw.githubusercontent.com/Kohindgs/dgs-auto-editor/main/public/dgs-desktop-code.zip",
+  "downloads": {
+    "win": "https://raw.githubusercontent.com/Kohindgs/dgs-auto-editor/main/public/dgs-desktop-code.zip",
+    "mac": "https://raw.githubusercontent.com/Kohindgs/dgs-auto-editor/main/public/dgs-desktop-code.zip",
+    "code_zip": "https://raw.githubusercontent.com/Kohindgs/dgs-auto-editor/main/public/dgs-desktop-code.zip"
+  },
+  "history": [
+    {
+      "version": "0.10.1-native.3",
+      "date": "2026-11-11",
+      "notes": [
+        "D'Auto Aline (D'AA) Cosmic Neon Studio UI for Windows & Mac: minimalist neon line D'AA capsule logo, razor-sharp 16x16 neon line icons & ClearType/CoreText fonts, unclipped Brand Logo preview, Filmora 16:9 media preview grid, responsive 4K-to-laptop layout, and live Update button auto-trigger."
+      ]
+    },
+    {
+      "version": "0.10.0-native.2",
+      "date": "2026-11-10",
+      "notes": [
+        "D'Auto Aline (D'AA) Cosmic Neon Studio UI: minimalist neon line D'AA capsule logo, razor-sharp 16x16 neon line icons & ClearType fonts, unclipped Brand Logo preview, Filmora 16:9 media preview grid, responsive 4K-to-laptop layout, silent + New Project, and completion notifications."
+      ]
+    },
+    {
+      "version": "0.9.0-beta.1",
+      "date": "2026-11-03",
+      "notes": [
+        "One Windows EXE for Windows 10 and 11, and one Mac DMG for macOS 11 and newer.",
+        "The Updates button shows this version and the change log. A newer published version shows a download link.",
+        "English and Marathi (Devanagari) card-reading files download into the app when they are missing.",
+        "The hearing model downloads on the first Auto-align."
+      ]
+    }
+  ]
+}

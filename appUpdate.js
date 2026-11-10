@@ -11,8 +11,9 @@ const { spawn } = require('child_process');
 
 const FEED_URLS = [
   process.env.DGS_UPDATE_URL,
-  'https://editor.dgeniussolutions.com/updates.json',
+  'https://raw.githubusercontent.com/Kohindgs/dgs-auto-editor/main/public/updates.json',
   'https://raw.githubusercontent.com/Kohindgs/dgs-auto-editor/main/frontend/public/updates.json',
+  'https://editor.dgeniussolutions.com/updates.json',
 ].filter(Boolean);
 
 const CARD_FILES = [
@@ -80,20 +81,31 @@ function localFeed() {
 }
 
 function versionParts(value) {
-  const match = String(value || '').match(/(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?/);
-  if (!match) return [0, 0, 0, 0];
+  const raw = String(value || '').toLowerCase();
+  const match = raw.match(/(\d+)\.(\d+)\.(\d+)(?:-(?:beta|native)\.(\d+))?/);
+  if (!match) return [0, 0, 0, 0, 0];
+  let channel = 2;
+  let build = 1000;
+  if (raw.includes('-beta.')) {
+    channel = 0;
+    build = Number(match[4] || 0);
+  } else if (raw.includes('-native.')) {
+    channel = 1;
+    build = Number(match[4] || 0);
+  }
   return [
     Number(match[1]),
     Number(match[2]),
     Number(match[3]),
-    match[4] ? Number(match[4]) : 1000,
+    channel,
+    build,
   ];
 }
 
 function versionCompare(a, b) {
   const left = versionParts(a);
   const right = versionParts(b);
-  for (let i = 0; i < 4; i += 1) {
+  for (let i = 0; i < 5; i += 1) {
     if (left[i] !== right[i]) return left[i] - right[i];
   }
   return 0;
