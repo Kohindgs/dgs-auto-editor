@@ -1,0 +1,25 @@
+/* V168 read-only integrity gate inside the existing Smart Match popup. */
+#dgs140d-list .dgs168-integrity-panel{
+ border:1px solid #966269;border-radius:10px;background:#172033;
+ padding:13px;margin:0 0 12px;display:flex;flex-direction:column;gap:6px;
+ color:#eff2f7;font-family:Manrope,Arial,sans-serif
+}
+#dgs140d-list .dgs168-integrity-panel h4{
+ font-size:14px;font-weight:800;margin:0 0 4px;color:#fff
+}
+#dgs140d-list .dgs168-integrity-panel strong{
+ font-size:13px;font-weight:850
+}
+#dgs140d-list .dgs168-integrity-panel strong.dgs168-fail{color:#ffb8be}
+#dgs140d-list .dgs168-integrity-panel strong.dgs168-pending{color:#ffe2b0}
+#dgs140d-list .dgs168-integrity-panel p{
+ font-size:12px;line-height:1.5;margin:0;overflow-wrap:anywhere
+}
+#dgs140d-list .dgs168-integrity-panel .dgs168-note{
+ color:#d6e1f1;font-weight:500
+}
+#dgs140d-list .dgs168-integrity-panel .dgs168-samples{
+ color:#c5ceda;font-size:11px
+}
+#dgs140d-list .dgs168-integrity-panel small{font-size:10px;color:#c0cada}
+
